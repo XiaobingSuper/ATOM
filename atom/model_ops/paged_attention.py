@@ -3,7 +3,7 @@
 
 # from flash_attn import flash_attn_with_kvcache
 from typing import Optional
-
+import os
 import torch
 from torch import nn
 
@@ -19,7 +19,6 @@ class PagedAttention(BaseAttention):
     """
     Attention paged implementation
     """
-
     def __init__(
         self,
         num_heads,
@@ -63,8 +62,8 @@ class PagedAttention(BaseAttention):
         # for plugin mode
         if is_vllm():
             self.use_mla = use_mla
-            self.rotary_emb = rotary_emb
-            from vllm.attention.layer import Attention, AttentionType
+            self.rotary_emb = mla_modules.rotary_emb
+            from vllm.attention.layer import Attention, AttentionType, MLAAttention
 
             atom_config = get_current_atom_config()
             assert (
@@ -84,21 +83,57 @@ class PagedAttention(BaseAttention):
                 extra_impl_args["q_norm"] = q_norm
                 extra_impl_args["k_norm"] = k_norm
 
-            self.attn = Attention(
-                num_heads=num_heads,
-                head_size=head_dim,
-                scale=scale,
-                num_kv_heads=num_kv_heads,
-                alibi_slopes=alibi_slopes,
-                cache_config=cache_config,
-                quant_config=quant_config,
-                logits_soft_cap=None,
-                per_layer_sliding_window=per_layer_sliding_window,
-                prefix=f"{prefix}",
-                attn_type=AttentionType.DECODER,
-                kv_sharing_target_layer_name=None,
-                **extra_impl_args,
-            )
+            if use_mla:
+                self.num_heads = num_heads
+                self.v_head_dim = mla_modules.v_head_dim
+                self.qk_head_dim = mla_modules.qk_head_dim
+                self.qk_nope_head_dim = mla_modules.qk_nope_head_dim
+                self.q_proj = mla_modules.q_proj
+                self.o_proj = mla_modules.o_proj
+                self.attn = MLAAttention(
+                    num_heads=num_heads,
+                    scale=scale,
+                    qk_nope_head_dim=mla_modules.qk_nope_head_dim,
+                    qk_rope_head_dim=mla_modules.qk_rope_head_dim,
+                    v_head_dim=mla_modules.v_head_dim,
+                    q_lora_rank=mla_modules.q_lora_rank,
+                    kv_lora_rank=mla_modules.kv_lora_rank,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.attn",
+                    kv_b_proj=mla_modules.kv_b_proj,
+                    use_sparse=False,
+                    indexer=mla_modules.indexer,
+                )
+                def wrap_kv_b_proj(module_instance):
+                    orig_impl = module_instance.forward
+
+                    def new_forward(*args, **kwargs):
+                        out = orig_impl(*args, **kwargs)
+                        # vLLM does kv_b_proj(...)[0], so return tuple when original returns single value
+                        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "0":
+                            return out
+                        return out, None
+                    module_instance.forward = new_forward
+                    return module_instance
+                # vllm kv_b_proj return two values (output, bias), so we need to wrap it.
+                self.attn.impl.kv_b_proj = wrap_kv_b_proj(self.attn.impl.kv_b_proj)
+            else:
+                self.attn = Attention(
+                    num_heads=num_heads,
+                    head_size=head_dim,
+                    scale=scale,
+                    num_kv_heads=num_kv_heads,
+                    alibi_slopes=alibi_slopes,
+                    cache_config=cache_config,
+                    quant_config=quant_config,
+                    logits_soft_cap=None,
+                    per_layer_sliding_window=per_layer_sliding_window,
+                    prefix=f"{prefix}",
+                    attn_type=AttentionType.DECODER,
+                    kv_sharing_target_layer_name=None,
+                    **extra_impl_args,
+                )
 
             compilation_config = atom_config.compilation_config
             self.layer_name = prefix

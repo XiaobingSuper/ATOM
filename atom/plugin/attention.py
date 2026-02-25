@@ -599,7 +599,22 @@ def unified_attention_with_output_base_for_plugin_mode(
 
     atom_config = get_current_atom_config()
     if use_mla:
-        raise NotImplementedError("MLA is not supported for plugin mode for now")
+        # raise NotImplementedError("MLA is not supported for plugin mode for now")
+        kv_c_normed = k
+        k_pe = v
+        self = atom_config.compilation_config.static_forward_context[layer_name]
+        q = self.q_proj(q)
+        q = q.view(-1, self.num_heads, self.qk_head_dim)
+        # # Add head dim of 1 to k_pe
+        k_pe = k_pe.unsqueeze(1)
+        if self.rotary_emb is not None:
+            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                positions, q[..., self.qk_nope_head_dim :], k_pe
+            )
+        if q_scale is not None:
+            q *= q_scale
+        output = self.attn(q, kv_c_normed, k_pe, output_shape=(q.shape[0], self.num_heads * self.v_head_dim))
+        return self.o_proj(output)
     else:
         self = atom_config.compilation_config.static_forward_context[layer_name]
         # here is the standard vllm attention impl interface

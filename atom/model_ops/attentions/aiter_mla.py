@@ -20,13 +20,15 @@ from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
+from atom.plugin.attention import AiterBackendDecoratorForPluginMode
+
 logger = logging.getLogger("atom")
 
 
 def cdiv(a, b):
     return (a + b - 1) // b
 
-
+@AiterBackendDecoratorForPluginMode
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
@@ -40,7 +42,9 @@ class AiterMLABackend(AttentionBackend):
     def get_impl_cls() -> Type["MLAAttention"]:
         return MLAAttention
 
-
+# @AiterAttentionMetadataBuilderDecoratorForPluginMode(
+#     default_base_class=CommonAttentionBuilder
+# )
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
