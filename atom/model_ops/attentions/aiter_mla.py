@@ -20,6 +20,8 @@ from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
 
+from atom.plugin.prepare import is_plugin_mode
+from atom.plugin.attention import AiterMLAAttentionMetadataBuilderDecoratorForPluginMode
 from atom.plugin.attention import AiterBackendDecoratorForPluginMode
 
 logger = logging.getLogger("atom")
@@ -32,7 +34,7 @@ def cdiv(a, b):
 class AiterMLABackend(AttentionBackend):
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA"
+        return "ROCM_AITER_MLA" if not is_plugin_mode() else "CUSTOM"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLAMetadataBuilder"]:
@@ -42,14 +44,14 @@ class AiterMLABackend(AttentionBackend):
     def get_impl_cls() -> Type["MLAAttention"]:
         return MLAAttention
 
-# @AiterAttentionMetadataBuilderDecoratorForPluginMode(
-#     default_base_class=CommonAttentionBuilder
-# )
+@AiterMLAAttentionMetadataBuilderDecoratorForPluginMode(
+    default_base_class=CommonAttentionBuilder
+)
 class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
     def __init__(self, model_runner):
         self.block_size = 1
-        super().__init__(model_runner)
+        CommonAttentionBuilder.__init__(self, model_runner)
         config = model_runner.config
         hf_config = config.hf_config
         self.num_attention_heads = (
@@ -181,7 +183,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         }
 
     def prepare_prefill(self, batch: ScheduledBatch):
-        attn_metadata, positions = super().prepare_prefill(batch)
+        attn_metadata, positions = CommonAttentionBuilder.prepare_prefill(self, batch)
         bs = batch.total_seqs_num_prefill
         sum_scheduled_tokens = batch.total_tokens_num_prefill
         var = self.model_runner.forward_vars

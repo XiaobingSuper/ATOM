@@ -59,9 +59,11 @@ class PagedAttention(BaseAttention):
             **kwargs,
         )
 
+
+        self.use_mla = use_mla
+
         # for plugin mode
         if is_vllm():
-            self.use_mla = use_mla
             self.rotary_emb = mla_modules.rotary_emb
             from vllm.attention.layer import Attention, AttentionType, MLAAttention
 
@@ -82,6 +84,9 @@ class PagedAttention(BaseAttention):
                 extra_impl_args["rotary_emb"] = rotary_emb
                 extra_impl_args["q_norm"] = q_norm
                 extra_impl_args["k_norm"] = k_norm
+                extra_impl_args["layer_num"] = layer_num
+                if use_mla:
+                    extra_impl_args["mla_modules"] = mla_modules
 
             if use_mla:
                 self.num_heads = num_heads
@@ -90,6 +95,7 @@ class PagedAttention(BaseAttention):
                 self.qk_nope_head_dim = mla_modules.qk_nope_head_dim
                 self.q_proj = mla_modules.q_proj
                 self.o_proj = mla_modules.o_proj
+
                 self.attn = MLAAttention(
                     num_heads=num_heads,
                     scale=scale,
@@ -104,15 +110,13 @@ class PagedAttention(BaseAttention):
                     kv_b_proj=mla_modules.kv_b_proj,
                     use_sparse=False,
                     indexer=mla_modules.indexer,
+                    **extra_impl_args,
                 )
                 def wrap_kv_b_proj(module_instance):
                     orig_impl = module_instance.forward
 
                     def new_forward(*args, **kwargs):
                         out = orig_impl(*args, **kwargs)
-                        # vLLM does kv_b_proj(...)[0], so return tuple when original returns single value
-                        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "0":
-                            return out
                         return out, None
                     module_instance.forward = new_forward
                     return module_instance
@@ -152,7 +156,6 @@ class PagedAttention(BaseAttention):
         self.k_scale = self.v_scale = None
         self.layer_num = layer_num
         self.mla_modules = mla_modules
-        self.use_mla = use_mla
         self.base_attention = None
         self.kv_cache = torch.tensor([])
         self.indexer = mla_modules.indexer if mla_modules is not None else None
@@ -166,9 +169,8 @@ class PagedAttention(BaseAttention):
             use_mla=self.use_mla,
         )
         impl_cls = self.attn_backend.get_impl_cls()
-        self.impl = impl_cls(
+        impl_args = dict(
             num_heads=num_heads,
-            head_dim=head_dim,
             scale=scale,
             num_kv_heads=num_kv_heads,
             alibi_slopes=alibi_slopes,
@@ -183,7 +185,8 @@ class PagedAttention(BaseAttention):
             k_norm=k_norm,
             **kwargs,
         )
-
+        impl_args["head_dim" if self.use_mla else "head_size"] = head_dim
+        self.impl = impl_cls(**impl_args)
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
         self.layer_name = prefix if prefix is not None else default_name

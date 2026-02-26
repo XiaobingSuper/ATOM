@@ -12,7 +12,10 @@ from torch import nn
 from atom.utils import mark_spliting_op
 from .attention_mla import MLAModules
 from atom.config import get_current_atom_config
-
+from atom.utils.forward_context import (
+    ForwardContext,
+    get_forward_context,
+)
 
 def fake_(
     q: torch.Tensor,
@@ -52,7 +55,15 @@ def unified_attention_with_output_base(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     if use_mla:
-        return self.impl.forward(q, k, v, positions, q_scale, qkv)
+        output = self.impl.forward(
+            layer=self,
+            query=q,
+            k_nope=k,
+            k_rope=v,
+            positions=positions,
+            q_scale=q_scale)
+        return self.impl.o_proj(output)
+        # return output
     else:
         return self.impl.forward(
             layer=self,
