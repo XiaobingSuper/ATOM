@@ -561,8 +561,6 @@ def AiterAttentionMetadataBuilderDecoratorForPluginMode(default_base_class):
 
 
 
-
-
 # for MLA attention metadata for plugin mode
 if _MLA_ATTENTION_FOR_PLUGIN_MODE:
 
@@ -622,16 +620,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
         q_data_type: torch.dtype | None = None
 
 
-    # @dataclass
-    # class AiterFlashInferPrefillMetadataForPluginMode(AiterMLACommonPrefillMetadataForPluginMode):
-    #     prefill_main: Optional[torch.Tensor] = None
-    #     prefill_chunks: list[torch.Tensor] = field(default_factory=list)
-    #     # prefill_main: BatchPrefillWithRaggedKVCacheWrapper | None = None
-    #     # prefill_chunks: list[BatchPrefillWithRaggedKVCacheWrapper] = field(
-    #     #     default_factory=list
-    #     # )
-
-
     D = TypeVar("D", bound=AiterMLACommonDecodeMetadataForPluginMode)
 
 
@@ -671,7 +659,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
         decode: D | None = None
         prefill: (
             AiterMLACommonPrefillMetadataForPluginMode
-            # | AiterFlashInferPrefillMetadataForPluginMode
             | None
         ) = None
 
@@ -681,10 +668,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
             #     self.head_dim
             # ):
             #     raise ValueError(f"Head dimension {self.head_dim} is not supported by MLA.")
-
-    class AiterMLAMetadataForPluginMode(AiterMLACommonMetadataForPluginMode[AiterMLADecodeMetadataForPluginMode]):
-        pass
-
 
 
     class vllmMLAAttentionMetadataBuilderMethods:
@@ -769,7 +752,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
             )
 
             return attn_metadata
-
 
 
         def build_for_cudagraph_capture(
@@ -1008,19 +990,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
                     chunked_context=chunked_context_metadata,
                 )
 
-                # if self._use_cudnn_prefill:
-                #     assert isinstance(prefill_metadata, CudnnPrefillMetadata)
-                #     prefill_metadata.query_seq_lens = (
-                #         prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
-                #     )
-                #     prefill_metadata.cudnn_workspace = self.cudnn_workspace
-
-                # if self._use_trtllm_ragged_prefill:
-                #     prefill_metadata.query_seq_lens = (
-                #         prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
-                #     )
-                #     prefill_metadata.workspace_buffer = self._workspace_buffer
-
             decode_metadata = None
             if num_decodes > 0:
                 dcp_tot_seq_lens_device = None
@@ -1063,11 +1032,6 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
                 prefill=prefill_metadata,
                 decode=decode_metadata,
             )
-
-            # if self._use_fi_prefill and num_prefills > 0:
-            #     assert isinstance(attn_metadata.prefill, FlashInferPrefillMetadata)
-            #     self._build_fi_prefill_wrappers(attn_metadata.prefill)
-
 
             attn_metadata = AttentionMetaData(
                     max_seqlen_q=common_attn_metadata.max_query_len,
@@ -1285,37 +1249,37 @@ def AiterBackendDecoratorForPluginMode(cls):
 
     if is_vllm_mode:
         # for vllm, add the required methods
-        # if not issubclass(cls.get_impl_cls(), MLAAttention):
-        #     assert False, "vllm attention is not supported for plugin mode for now"
-        #     cls.full_cls_name = vllmAiterAttentionBackendMethods.full_cls_name
-        #     cls.accept_output_buffer = vllmAiterAttentionBackendMethods.accept_output_buffer
-        #     cls.supported_dtypes = vllmAiterAttentionBackendMethods.supported_dtypes
-        #     cls.get_supported_kernel_block_sizes = (
-        #         vllmAiterAttentionBackendMethods.get_supported_kernel_block_sizes
-        #     )
-        #     cls.get_kv_cache_shape = vllmAiterAttentionBackendMethods.get_kv_cache_shape
-        #     cls.is_mla = vllmAiterAttentionBackendMethods.is_mla
-        #     cls.get_required_kv_cache_layout = (
-        #         vllmAiterAttentionBackendMethods.get_required_kv_cache_layout
-        #     )
-        #     cls.get_supported_head_sizes = vllmAiterAttentionBackendMethods.get_supported_head_sizes
-        #     cls.supports_alibi_sqrt = vllmAiterAttentionBackendMethods.supports_alibi_sqrt
-        # else:
+        if not issubclass(cls.get_impl_cls(), MLAAttention):
+            assert False, "vllm attention is not supported for plugin mode for now"
+            cls.full_cls_name = vllmAiterAttentionBackendMethods.full_cls_name
+            cls.accept_output_buffer = vllmAiterAttentionBackendMethods.accept_output_buffer
+            cls.supported_dtypes = vllmAiterAttentionBackendMethods.supported_dtypes
+            cls.get_supported_kernel_block_sizes = (
+                vllmAiterAttentionBackendMethods.get_supported_kernel_block_sizes
+            )
+            cls.get_kv_cache_shape = vllmAiterAttentionBackendMethods.get_kv_cache_shape
+            cls.is_mla = vllmAiterAttentionBackendMethods.is_mla
+            cls.get_required_kv_cache_layout = (
+                vllmAiterAttentionBackendMethods.get_required_kv_cache_layout
+            )
+            cls.get_supported_head_sizes = vllmAiterAttentionBackendMethods.get_supported_head_sizes
+            cls.supports_alibi_sqrt = vllmAiterAttentionBackendMethods.supports_alibi_sqrt
+        else:
            # for mla, add the required methods
-        cls.full_cls_name = vllmAiterMLABackendMethods.full_cls_name
-        cls.accept_output_buffer = vllmAiterMLABackendMethods.accept_output_buffer
-        cls.supported_dtypes = vllmAiterMLABackendMethods.supported_dtypes
-        cls.get_supported_kernel_block_sizes = (
-            vllmAiterMLABackendMethods.get_supported_kernel_block_sizes
-        )
-        cls.get_kv_cache_shape = vllmAiterMLABackendMethods.get_kv_cache_shape
-        cls.is_mla = vllmAiterMLABackendMethods.is_mla
-        cls.get_required_kv_cache_layout = (
-            vllmAiterMLABackendMethods.get_required_kv_cache_layout
-        )
-        cls.get_supported_head_sizes = vllmAiterMLABackendMethods.get_supported_head_sizes
-        cls.supports_alibi_sqrt = vllmAiterMLABackendMethods.supports_alibi_sqrt
-        cls.get_kv_cache_stride_order = vllmAiterMLABackendMethods.get_kv_cache_stride_order
+            cls.full_cls_name = vllmAiterMLABackendMethods.full_cls_name
+            cls.accept_output_buffer = vllmAiterMLABackendMethods.accept_output_buffer
+            cls.supported_dtypes = vllmAiterMLABackendMethods.supported_dtypes
+            cls.get_supported_kernel_block_sizes = (
+                vllmAiterMLABackendMethods.get_supported_kernel_block_sizes
+            )
+            cls.get_kv_cache_shape = vllmAiterMLABackendMethods.get_kv_cache_shape
+            cls.is_mla = vllmAiterMLABackendMethods.is_mla
+            cls.get_required_kv_cache_layout = (
+                vllmAiterMLABackendMethods.get_required_kv_cache_layout
+            )
+            cls.get_supported_head_sizes = vllmAiterMLABackendMethods.get_supported_head_sizes
+            cls.supports_alibi_sqrt = vllmAiterMLABackendMethods.supports_alibi_sqrt
+            cls.get_kv_cache_stride_order = vllmAiterMLABackendMethods.get_kv_cache_stride_order
     return cls
 
 

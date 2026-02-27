@@ -94,29 +94,6 @@ def dynamic_per_batched_tensor_quant(
     return x_scl_sat.to(dtype).contiguous(), scale.float().reciprocal()
 
 
-#   self.impl = impl_cls(
-#             num_heads=self.num_heads,
-#             head_size=self.head_size,
-#             scale=self.scale,
-#             num_kv_heads=1,
-#             alibi_slopes=None,
-#             sliding_window=None,
-#             kv_cache_dtype=self.kv_cache_dtype,
-#             logits_soft_cap=None,
-#             attn_type=AttentionType.DECODER,
-#             kv_sharing_target_layer_name=None,
-#             # MLA Args
-#             q_lora_rank=self.q_lora_rank,
-#             kv_lora_rank=self.kv_lora_rank,
-#             qk_nope_head_dim=self.qk_nope_head_dim,
-#             qk_rope_head_dim=self.qk_rope_head_dim,
-#             qk_head_dim=self.qk_nope_head_dim + self.qk_rope_head_dim,
-#             v_head_dim=self.v_head_dim,
-#             kv_b_proj=kv_b_proj,
-#             indexer=indexer,
-#             **extra_impl_args,
-#         )
-
 @MLAAttentionImplDecoratorForPluginMode
 class MLAAttention(nn.Module):
     def __init__(
@@ -259,7 +236,6 @@ class MLAAttention(nn.Module):
             # Convert from (B, N, V) to (B, N * V)
             x = x.reshape(-1, self.num_heads * self.v_head_dim)
         return x
-        # return self.o_proj(x)
 
     def _q_proj_and_k_up_proj(self, x, x_scale=None):
         q_nope, q_pe = (
@@ -465,7 +441,6 @@ class MLAAttention(nn.Module):
             causal=True,
         )
         return output.flatten(start_dim=-2)
-        # return self.o_proj(output.flatten(start_dim=-2))
 
     def _forward_prefill_mla(
         self,
