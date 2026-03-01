@@ -1357,6 +1357,7 @@ class DeepseekV2MLAAttention(nn.Module):
         self.is_v32 = hasattr(config, "index_topk")
 
         if self.is_v32:
+            assert False, "This code is not used"
             self.indexer_rope_emb = get_rope(
                 qk_rope_head_dim,
                 rotary_dim=qk_rope_head_dim,
@@ -1507,7 +1508,6 @@ class DeepseekV2MLAAttention(nn.Module):
                 positions,
                 self.indexer_rope_emb,
             )
-
         return self.mla_attn(
             hidden_states_or_q_c,
             kv_c_normed,

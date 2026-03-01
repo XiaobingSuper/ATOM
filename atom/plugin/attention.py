@@ -4,6 +4,7 @@ import logging
 from dataclasses import dataclass
 
 import torch
+import os
 
 from atom.plugin.prepare import is_vllm, is_sglang
 from atom.utils import CpuGpuBuffer
@@ -1058,8 +1059,7 @@ if _MLA_ATTENTION_FOR_PLUGIN_MODE:
         ):
             base_class.__init__(self, kv_cache_spec, layer_names, config, device)
             logger.info("init AiterAttentionMetadataBuilder for plugin mode")
-            from vllm.config import VllmConfig, get_layers_from_vllm_config
-            from vllm.attention.layer import Attention
+            from vllm.config import VllmConfig
 
             assert isinstance(config, VllmConfig)
 
@@ -1309,12 +1309,13 @@ def unified_attention_with_output_base_for_plugin_mode(
         q = self.q_proj(q, q_scale)
         q = q.view(-1, self.num_heads, self.qk_head_dim)
         # # Add head dim of 1 to k_pe
-        # if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
-        k_pe = k_pe.unsqueeze(1)
-        if self.rotary_emb is not None:
-            q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
-                positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "1":
+            k_pe = k_pe.unsqueeze(1)
+            if self.rotary_emb is not None:
+                q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
+        atom_config.compilation_config.static_forward_context["positions"][:positions.numel()] = positions
         output = self.attn(q, kv_c_normed, k_pe, output_shape=(q.shape[0], self.num_heads * self.v_head_dim))
         return self.o_proj(output)
     else:

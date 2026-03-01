@@ -15,6 +15,8 @@ import triton
 import triton.language as tl
 from typing import TYPE_CHECKING
 from atom.utils import envs
+from functools import partial as functools_partial
+from atom.config import get_current_atom_config
 
 import logging
 
@@ -22,6 +24,21 @@ logger = logging.getLogger("atom")
 
 if TYPE_CHECKING:
     from atom.utils.forward_context import AttentionMetaData
+
+from atom.model_ops.linear import use_triton_gemm
+
+if use_triton_gemm():
+    try:
+        from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
+            fused_gemm_a8w8_blockscale_preshuffle_split_cat,
+        )
+        from aiter.ops.triton.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_preshuffle_split_cat,
+        )
+    except ImportError as e:
+        logger.warning(f"Triton fused GEMM split_cat not available: {e}")
+        fused_gemm_afp4wfp4_preshuffle_split_cat = None
+        fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
 def reorg_kvcache(
@@ -380,11 +397,96 @@ class MLAAttentionImplPluginModeMethods:
         assert self.dcp_world_size != -1
 
         has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
-        kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-            -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+        # kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+        #     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        # )
+        # k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        # k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+
+
+        if use_triton_gemm():
+            weight = self.kv_b_proj.weight
+            weight_scale = self.kv_b_proj.weight_scale
+            if (
+                fused_gemm_afp4wfp4_preshuffle_split_cat is not None
+                and weight.dtype == dtypes.fp4x2
+            ):  # FP4 GEMM + split + cat
+                m = kv_c_normed.shape[0]
+                # from aiter.ops.triton.quant import dynamic_mxfp4_quant
+                # input = kv_c_normed
+                # input_2d = input.view(-1, input.shape[-1])
+                output_dtype = kv_c_normed.dtype
+
+                # q_input, x_scale = dynamic_mxfp4_quant(input_2d)
+                quant_func = aiter.get_hip_quant(aiter.QuantType.per_1x32)
+                q_input, x_scale = quant_func(
+                    kv_c_normed,
+                    quant_dtype=dtypes.fp4x2,
+                    shuffle=(m >= 32),
+                )
+
+                if m >= 32:
+                    x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
+                else:
+                    x_scale = x_scale[:m, ...].view(torch.uint8)
+
+                k, v = fused_gemm_afp4wfp4_preshuffle_split_cat(
+                    q_input.view(torch.uint8),
+                    weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
+                    k_pe.expand((-1, self.num_heads, -1)),
+                    x_scale,
+                    weight_scale.view(torch.uint8).view(
+                        weight_scale.shape[0] // 32, -1
+                    ),
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    output_dtype,
+                )
+            elif (
+                fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
+                and weight.dtype == dtypes.fp8
+            ):  # FP8 GEMM + split + cat
+                weight_shuffled = weight.reshape(
+                    weight.shape[0] // 16, weight.shape[1] * 16
+                )
+
+                output_dtype = kv_c_normed.dtype
+
+                quant_func = functools_partial(
+                    aiter.get_hip_quant(aiter.QuantType.per_1x128), transpose_scale=True
+                )
+                q_input, x_scale = quant_func(
+                    kv_c_normed,
+                    quant_dtype=dtypes.fp8,
+                    scale=getattr(self.kv_b_proj, "input_scale", None),
+                )
+
+                k, v = fused_gemm_a8w8_blockscale_preshuffle_split_cat(
+                    q_input,
+                    weight_shuffled,
+                    k_pe.expand((-1, self.num_heads, -1)),
+                    x_scale,
+                    weight_scale,
+                    self.qk_nope_head_dim,
+                    self.v_head_dim,
+                    output_dtype,
+                )
+            else:
+                kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                    -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+                )
+                k_nope, v = kv_nope.split(
+                    [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+                )
+
+                k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
+        else:
+            kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
+                -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+            )
+            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+            # k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
+            k = torch.cat((k_nope, k_pe.expand((*k_nope.shape[:-1], -1))), dim=-1)
 
         output_prefill = self._run_prefill_new_tokens_plugin_mode(
             prefill=attn_metadata.plugin_metadata.prefill,
@@ -520,12 +622,6 @@ class MLAAttentionImplPluginModeMethods:
         num_actual_toks = attn_metadata.plugin_metadata.num_actual_tokens
 
         # Inputs and outputs may be padded for CUDA graphs
-        output_padded = output
-        output = output[:num_actual_toks, ...]
-        q = q[:num_actual_toks, ...]
-        k_c_normed = k_c_normed[:num_actual_toks, ...]
-        k_pe = k_pe[:num_actual_toks, ...]
-
         assert (
             attn_metadata.plugin_metadata.num_decodes is not None
             and attn_metadata.plugin_metadata.num_prefills is not None
@@ -536,22 +632,38 @@ class MLAAttentionImplPluginModeMethods:
         has_prefill = attn_metadata.plugin_metadata.num_prefills > 0
         num_decode_tokens = attn_metadata.plugin_metadata.num_decode_tokens
 
-        decode_q = q[:num_decode_tokens]
+        atom_config = get_current_atom_config()
+        positions = atom_config.compilation_config.static_forward_context["positions"][:num_actual_toks] if positions is None else positions
+        k_pe = k_pe.unsqueeze(1)
+        output_padded = output
+        output = output[:num_actual_toks, ...]
+        q = q[:num_actual_toks, ...]
+        k_c_normed = k_c_normed[:num_actual_toks, ...]
+        k_pe = k_pe[:num_actual_toks, ...]
 
+        decode_q = q[:num_decode_tokens]
         prefill_q = q[num_decode_tokens:]
         prefill_k_pe = k_pe[num_decode_tokens:]
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
-        # write the latent and rope to kv cache
-        if kv_cache.numel() > 0:
-            ops.concat_and_cache_mla(
-                k_c_normed,
-                k_pe.squeeze(1),
-                kv_cache,
-                attn_metadata.plugin_metadata.slot_mapping.flatten(),
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=layer._k_scale,
-            )
+        # decode_only = has_decode and not has_prefill
+        decode_only = False
+        if not decode_only:
+            if self.rotary_emb is not None:
+                self.rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
+
+            # write the latent and rope to kv cache
+            if kv_cache.numel() > 0:
+                ops.concat_and_cache_mla(
+                    k_c_normed,
+                    k_pe.squeeze(1),
+                    kv_cache,
+                    attn_metadata.plugin_metadata.slot_mapping.flatten(),
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=layer._k_scale,
+                )
 
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
@@ -605,24 +717,38 @@ class MLAAttentionImplPluginModeMethods:
                     group_size=128,
                     transpose_bm=True,
                 )
-            # else:
-            #     # Pads the head_dim if necessary (for the underlying kernel)
-            #     N, B, P = decode_q_nope.shape
-            #     _, _, L = self.W_UK_T.shape
-
-            #     if self.q_pad_num_heads is not None:
-            #         decode_ql_nope = decode_q_nope.new_empty(
-            #             (self.q_pad_num_heads, B, L)
-            #         )
-            #         decode_ql_nope.resize_((N, B, L))
-            #     else:
-            #         decode_ql_nope = decode_q_nope.new_empty((N, B, L))
-
-            #     # Multiply (N, B, P) x (N, P, L) -> (N, B, L)
-            #     torch.bmm(decode_q_nope, self.W_UK_T, out=decode_ql_nope)
-
-            #     # Convert from (N, B, L) to (B, N, L)
-            #     decode_ql_nope = decode_ql_nope.transpose(0, 1)
+            
+            # if decode_only:
+            #     q_out = torch.empty(
+            #         (
+            #             decode_ql_nope.shape[0],
+            #             self.num_heads,
+            #             self.kv_lora_rank + self.qk_rope_head_dim,
+            #         ),
+            #         dtype=(
+            #             dtypes.fp8 if self.kv_cache_dtype.startswith("fp8") else self.dtype
+            #         ),
+            #         device=decode_ql_nope.device,
+            #     )
+            #     aiter.fused_qk_rope_concat_and_cache_mla(
+            #         decode_ql_nope,
+            #         decode_q_pe,
+            #         k_c_normed,
+            #         k_pe.squeeze(1),
+            #         kv_cache.view(
+            #             kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            #         ),
+            #         q_out,
+            #         attn_metadata.plugin_metadata.slot_mapping,
+            #         self._k_scale,
+            #         self._q_scale,
+            #         positions,
+            #         self.rotary_emb.cos_cache,
+            #         self.rotary_emb.sin_cache,
+            #         is_neox=self.rotary_emb.is_neox_style,
+            #         is_nope_first=True,
+            #     )
+            #     decode_ql_nope = q_out
 
             if fp8_attention:
                 ql_nope_shape = decode_ql_nope.shape
