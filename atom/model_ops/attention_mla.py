@@ -507,7 +507,7 @@ class MLAAttention(nn.Module):
                     None,
                 )
 
-        return self._v_up_proj(o)
+        return o
 
     def _forward_decode(
         self,
@@ -580,8 +580,7 @@ class MLAAttention(nn.Module):
             q_scale=self._q_scale,
             kv_scale=self._k_scale,
         )
-
-        return self._v_up_proj(o)
+        return o
 
 
     def forward_impl_server_mode(
@@ -677,9 +676,10 @@ class MLAAttention(nn.Module):
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
-                output = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
+                o = self._forward_prefill_mla(q_out, kv_cache, attn_metadata)
             else:
-                output = self._forward_decode(q_out, kv_cache, attn_metadata)
+                o = self._forward_decode(q_out, kv_cache, attn_metadata)
+            output = self._v_up_proj(o)
 
         return output
 
