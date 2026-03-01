@@ -11,6 +11,12 @@ import aiter
 from aiter import dtypes, fused_qk_norm_rope_cache_quant_shuffle
 from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
+from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
+
+from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
+    batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
+)
+
 import triton
 import triton.language as tl
 from typing import TYPE_CHECKING
@@ -656,7 +662,7 @@ class MLAAttentionImplPluginModeMethods:
 
             # write the latent and rope to kv cache
             if kv_cache.numel() > 0:
-                ops.concat_and_cache_mla(
+                aiter.concat_and_cache_mla(
                     k_c_normed,
                     k_pe.squeeze(1),
                     kv_cache,
@@ -697,8 +703,6 @@ class MLAAttentionImplPluginModeMethods:
                 decode_q_pe = decode_pe_padded
 
             if self.is_aiter_triton_fp4_bmm_enabled:
-                from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
-
                 decode_ql_nope = batched_gemm_a16wfp4(
                     decode_q_nope,
                     self.W_K,
@@ -710,7 +714,7 @@ class MLAAttentionImplPluginModeMethods:
             # elif self.is_aiter_triton_fp8_bmm_enabled:
             else:
                 # Multiply+Transpose (N, B, P)x(N, P, L)->(N, B, L)->(B, N, L)
-                decode_ql_nope = rocm_aiter_ops.triton_fp8_bmm(
+                decode_ql_nope = _aiter_triton_fp8_bmm(
                     decode_q_nope,
                     self.W_K,
                     self.W_K_scale,

@@ -1315,7 +1315,7 @@ def unified_attention_with_output_base_for_plugin_mode(
                 q[..., self.qk_nope_head_dim :], k_pe = self.rotary_emb(
                     positions, q[..., self.qk_nope_head_dim :], k_pe
                 )
-        atom_config.compilation_config.static_forward_context["positions"][:positions.numel()] = positions
+        # positions written at model entry (model_wrapper.forward)
         output = self.attn(q, kv_c_normed, k_pe, output_shape=(q.shape[0], self.num_heads * self.v_head_dim))
         return self.o_proj(output)
     else:

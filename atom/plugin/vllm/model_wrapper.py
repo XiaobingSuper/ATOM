@@ -109,6 +109,12 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             input_ids = None
             inputs_embeds = intermediate_tensors["hidden_states"]
 
+        # Write positions to global buffer once at model entry, before any graph
+        # capture. This ensures attention_mla reads correct positions in graph mode.
+        if "positions" in self.atom_config.compilation_config.static_forward_context:
+            buf = self.atom_config.compilation_config.static_forward_context["positions"]
+            buf[: positions.numel()].copy_(positions)
+
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
