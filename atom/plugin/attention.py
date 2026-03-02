@@ -1250,7 +1250,6 @@ def AiterBackendDecoratorForPluginMode(cls):
     if is_vllm_mode:
         # for vllm, add the required methods
         if not issubclass(cls.get_impl_cls(), MLAAttention):
-            assert False, "vllm attention is not supported for plugin mode for now"
             cls.full_cls_name = vllmAiterAttentionBackendMethods.full_cls_name
             cls.accept_output_buffer = vllmAiterAttentionBackendMethods.accept_output_buffer
             cls.supported_dtypes = vllmAiterAttentionBackendMethods.supported_dtypes

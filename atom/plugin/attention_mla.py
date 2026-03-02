@@ -16,6 +16,7 @@ from aiter.ops.triton.batched_gemm_a16wfp4 import batched_gemm_a16wfp4
 from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (  # noqa: E501 # isort: skip
     batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant as _aiter_triton_fp8_bmm,
 )
+from aiter.mla import mla_decode_fwd
 
 import triton
 import triton.language as tl
@@ -403,12 +404,6 @@ class MLAAttentionImplPluginModeMethods:
         assert self.dcp_world_size != -1
 
         has_context = attn_metadata.plugin_metadata.prefill.chunked_context is not None
-        # kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
-        #     -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
-        # )
-        # k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-        # k = self._concat_k_nope_k_pe_plugin_mode(k_nope, k_pe)
-
 
         if use_triton_gemm():
             weight = self.kv_b_proj.weight
@@ -539,7 +534,6 @@ class MLAAttentionImplPluginModeMethods:
             output.copy_(output_prefill)
 
 
-
     def _forward_decode_plugin_mode(
         self,
         q,
@@ -551,8 +545,8 @@ class MLAAttentionImplPluginModeMethods:
         assert attn_metadata.plugin_metadata.decode is not None
         assert attn_metadata.plugin_metadata.decode.max_qo_len is not None
 
-        if type(q) is tuple:
-            q = torch.cat(q, dim=-1)
+        # if type(q) is tuple:
+        #     q = torch.cat(q, dim=-1)
 
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
@@ -565,21 +559,67 @@ class MLAAttentionImplPluginModeMethods:
         )
 
         kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
-        from vllm._aiter_ops import rocm_aiter_ops
-        rocm_aiter_ops.mla_decode_fwd(
+        # from vllm._aiter_ops import rocm_aiter_ops
+        # rocm_aiter_ops.mla_decode_fwd(
+        #     q,
+        #     kv_buffer,
+        #     o,
+        #     self.scale,
+        #     attn_metadata.plugin_metadata.decode.qo_indptr,
+        #     attn_metadata.plugin_metadata.decode.max_qo_len,
+        #     attn_metadata.plugin_metadata.decode.paged_kv_indptr,
+        #     attn_metadata.plugin_metadata.decode.paged_kv_indices,
+        #     attn_metadata.plugin_metadata.decode.paged_kv_last_page_len,
+        #     q_scale=layer._q_scale,
+        #     kv_scale=layer._k_scale,
+        # )
+
+        use_persistent_mode = not (self.dcp_world_size > 1 and self.kv_cache_dtype == "fp8")
+        if not use_persistent_mode:
+            # DP : disable persistent mode to avoid overflow
+            work_meta_data = None
+            work_indptr = None
+            work_info_set = None
+            reduce_indptr = None
+            reduce_final_map = None
+            reduce_partial_map = None
+        else:
+            # assert False, "Persistent mode is not supported yet."
+            work_meta_data = attn_metadata.work_meta_data
+            work_indptr = attn_metadata.work_indptr
+            work_info_set = attn_metadata.work_info_set
+            reduce_indptr = attn_metadata.reduce_indptr
+            reduce_final_map = attn_metadata.reduce_final_map
+            reduce_partial_map = attn_metadata.reduce_partial_map
+            # assert work_meta_data is not None, "work_meta_data is not supported yet."
+            # assert work_indptr is not None, "work_indptr is not supported yet."
+            # assert work_info_set is not None, "work_info_set is not supported yet."
+            # assert reduce_indptr is not None, "reduce_indptr is not supported yet."
+            # assert reduce_final_map is not None, "reduce_final_map is not supported yet."
+            # assert reduce_partial_map is not None, "reduce_partial_map is not supported yet."
+
+        paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
+        paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
+
+        mla_decode_fwd(
             q,
-            kv_buffer,
+            kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
-            self.scale,
             attn_metadata.plugin_metadata.decode.qo_indptr,
-            attn_metadata.plugin_metadata.decode.max_qo_len,
-            attn_metadata.plugin_metadata.decode.paged_kv_indptr,
-            attn_metadata.plugin_metadata.decode.paged_kv_indices,
+            paged_kv_indptr,
+            paged_kv_indices,
             attn_metadata.plugin_metadata.decode.paged_kv_last_page_len,
+            attn_metadata.plugin_metadata.decode.max_qo_len,
+            sm_scale=self.scale,
+            work_meta_data=work_meta_data,
+            work_indptr=work_indptr,
+            work_info_set=work_info_set,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
         )
-
         return o, None
 
 
@@ -653,7 +693,6 @@ class MLAAttentionImplPluginModeMethods:
         prefill_k_c_normed = k_c_normed[num_decode_tokens:]
 
         decode_only = has_decode and not has_prefill
-        # decode_only = False
         if not decode_only:
             if self.rotary_emb is not None:
                 self.rotary_emb(
@@ -779,11 +818,9 @@ class MLAAttentionImplPluginModeMethods:
                     decode_q = decode_q.view(decode_q_shape)
                 else:
                     decode_q = (decode_ql_nope, decode_q_pe)
+                    decode_q = torch.cat(decode_q, dim=-1)
             if self.dcp_world_size > 1:
                 assert not fp8_attention, "DCP not support fp8 kvcache now."
-                # concatenate decode_ql_nope and decode_q_pe -> (B, N, L + P)
-                if not decode_only:
-                    decode_q = torch.cat(decode_q, dim=-1)
                 # decode_q do allgather in head dim.
                 decode_q = get_dcp_group().all_gather(decode_q, dim=1)
 
