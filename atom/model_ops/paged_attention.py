@@ -188,7 +188,7 @@ class PagedAttention(BaseAttention):
             k_norm=k_norm,
             **kwargs,
         )
-        impl_args["head_dim" if self.use_mla else "head_size"] = head_dim
+        impl_args["head_size" if self.use_mla else "head_dim"] = head_dim
         self.impl = impl_cls(**impl_args)
         compilation_config = atom_config.compilation_config
         default_name = f"MLA_{layer_num}" if self.use_mla else f"MHA_{layer_num}"
