@@ -117,6 +117,8 @@ class PagedAttention(BaseAttention):
 
                     def new_forward(*args, **kwargs):
                         out = orig_impl(*args, **kwargs)
+                        if os.getenv("ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0").lower() == "0":
+                            return out
                         return out, None
                     module_instance.forward = new_forward
                     return module_instance
