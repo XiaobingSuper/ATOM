@@ -254,10 +254,13 @@ def load_model(
     for _, module in model.named_modules():
         if hasattr(module, "process_weights_after_loading"):
             if is_vllm():
-                from vllm.attention.layer import Attention
+                from vllm.attention.layer import Attention, MLAAttention
 
                 # call vLLM attn weights post processing with act_dtype if using vLLM attention module
-                if isinstance(module, Attention):
+                if isinstance(module, Attention) or isinstance(module, MLAAttention):
+                    if isinstance(module, MLAAttention):
+                        # set model.kv_b_proj.quant_method to None
+                        module.impl.kv_b_proj.quant_method = None
                     module.process_weights_after_loading(act_dtype=act_dtype)
                 else:
                     module.process_weights_after_loading()

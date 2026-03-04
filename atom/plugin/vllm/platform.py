@@ -35,4 +35,6 @@ class ATOMPlatform(RocmPlatform):
 
         # Return ATOM attention backend.
         logger.info("Use atom attention backend")
+        if attn_selector_config.use_mla:
+            return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"
         return "atom.model_ops.attentions.aiter_attention.AiterBackend"
