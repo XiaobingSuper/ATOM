@@ -153,6 +153,7 @@ class Glm4MoE(nn.Module):
             prefix=f"{prefix}.experts",
             scoring_func="sigmoid",
             e_score_correction_bias=self.gate.e_score_correction_bias,
+            has_bias=getattr(config, "moe_ffn_bias", False),
             config=config,
         )
 
