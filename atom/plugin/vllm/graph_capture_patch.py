@@ -73,9 +73,7 @@ def apply_graph_capture_patch() -> None:
 
         GroupCoordinator = getattr(parallel_state, "GroupCoordinator", None)
         if GroupCoordinator is None:
-            logger.debug(
-                "ATOM graph_capture patch: GroupCoordinator not found, skip"
-            )
+            logger.debug("ATOM graph_capture patch: GroupCoordinator not found, skip")
             return
 
         original = getattr(GroupCoordinator, "graph_capture", None)
@@ -90,9 +88,7 @@ def apply_graph_capture_patch() -> None:
             "(avoids hipMemcpyAsync in fused_allreduce_rmsnorm)"
         )
     except ImportError as e:
-        logger.debug(
-            "ATOM graph_capture patch: vllm not available (%s), skip", e
-        )
+        logger.debug("ATOM graph_capture patch: vllm not available (%s), skip", e)
     except Exception as e:
         logger.warning(
             "ATOM graph_capture patch failed: %s. "

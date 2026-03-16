@@ -14,14 +14,11 @@ This module creates an aiter-compatible TP group adapter that:
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 
 logger = logging.getLogger("atom")
-
-if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
 
 
 def _create_aiter_tp_adapter_from_vllm() -> Any:
@@ -47,7 +44,8 @@ def _create_aiter_tp_adapter_from_vllm() -> Any:
     if device_communicator.ca_comm is None or device_communicator.ca_comm.disabled:
         logger.warning(
             "ATOM tp_group_reuse: aiter ca_comm not available on vLLM's TP group, "
-            "fallback to init_aiter_dist"
+            "caller will fall back to standard aiter distributed initialization "
+            "(e.g., via aiter.init_dist_env(...))"
         )
         return None
 
@@ -84,7 +82,6 @@ def _setup_ca_comm_signal(adapter: Any, tensor_model_parallel_size: int) -> None
     ca_comm = adapter.device_communicator.ca_comm
     if ca_comm is None:
         return
-    rank = adapter.rank_in_group
     signal = torch.zeros(
         tensor_model_parallel_size * 64, dtype=torch.int64, device=adapter.device
     )
@@ -112,7 +109,9 @@ def init_aiter_tp_from_vllm(tensor_model_parallel_size: int) -> bool:
         aiter_ps._TP = adapter  # type: ignore[attr-defined]
         aiter_ps._PP = vllm_ps.get_pp_group()  # type: ignore[attr-defined]
         aiter_ps._DP = vllm_ps.get_dp_group()  # type: ignore[attr-defined]
-        aiter_ps._EP = getattr(vllm_ps, "_EP", None)  # EP may not exist in all vLLM configs
+        aiter_ps._EP = getattr(
+            vllm_ps, "_EP", None
+        )  # EP may not exist in all vLLM configs
         _setup_ca_comm_signal(adapter, tensor_model_parallel_size)
 
         from aiter.dist.parallel_state import set_custom_all_reduce
@@ -126,6 +125,8 @@ def init_aiter_tp_from_vllm(tensor_model_parallel_size: int) -> bool:
         return True
     except Exception as e:
         logger.warning(
-            "ATOM tp_group_reuse failed (%s), will use init_aiter_dist", e
+            "ATOM tp_group_reuse failed (%s), caller will fall back to standard "
+            "aiter distributed initialization (e.g., via aiter.init_dist_env(...))",
+            e,
         )
         return False
