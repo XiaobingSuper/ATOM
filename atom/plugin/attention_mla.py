@@ -694,7 +694,8 @@ class MLAAttentionImplPluginModeMethods:
 
         if not decode_only:
             # write the latent and rope to kv cache
-            if kv_cache.numel() > 0:
+            # make sure ops has concat_and_cache_mla_rope_fused
+            if kv_cache.numel() > 0 and hasattr(ops, "concat_and_cache_mla_rope_fused"):
                 ops.concat_and_cache_mla_rope_fused(
                     positions,
                     q[..., self.qk_nope_head_dim :],
@@ -709,6 +710,15 @@ class MLAAttentionImplPluginModeMethods:
                 )
             else:
                 self.rotary_emb(positions, q[..., self.qk_nope_head_dim :], k_pe)
+                if kv_cache.numel() > 0:
+                    aiter.concat_and_cache_mla(
+                        k_c_normed,
+                        k_pe.squeeze(1),
+                        kv_cache,
+                        attn_metadata.plugin_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=layer._k_scale,
+                    )
 
         if fp8_attention:
             kv_cache = kv_cache.view(current_platform.fp8_dtype())
@@ -797,9 +807,32 @@ class MLAAttentionImplPluginModeMethods:
                 if fp8_attention:
                     assert decode_ql_nope.shape[0] == decode_q_pe.shape[0]
                     assert decode_ql_nope.shape[1] == decode_q_pe.shape[1]
-                    decode_q = layer._decode_concat_quant_fp8_op(
-                        decode_ql_nope, decode_q_pe, layer._q_scale
-                    )
+                    if hasattr(layer, "_decode_concat_quant_fp8_op"):
+                        decode_q = layer._decode_concat_quant_fp8_op(
+                            decode_ql_nope, decode_q_pe, layer._q_scale
+                        )
+                    else:
+                        ql_nope_shape = decode_ql_nope.shape
+                        q_pe_shape = decode_q_pe.shape
+                        decode_q_shape = (
+                            ql_nope_shape[0],
+                            ql_nope_shape[1],
+                            ql_nope_shape[2] + q_pe_shape[2],
+                        )
+                        # Using empty and copy since torch.cat introduces significant overhead.
+                        decode_q0 = torch.empty(
+                            decode_q_shape,
+                            device=decode_ql_nope.device,
+                            dtype=decode_ql_nope.dtype,
+                        )
+                        decode_q0[..., : ql_nope_shape[2]].copy_(decode_ql_nope)
+                        decode_q0[..., ql_nope_shape[2] :].copy_(decode_q_pe)
+
+                        decode_q, _ = ops.scaled_fp8_quant(
+                            decode_q0.view(decode_q_shape[0], -1),
+                            layer._q_scale,
+                        )
+                        decode_q = decode_q.view(decode_q_shape)
                 else:
                     decode_q = (decode_ql_nope, decode_q_pe)
                     decode_q = torch.cat(decode_q, dim=-1)
