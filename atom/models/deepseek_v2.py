@@ -797,9 +797,6 @@ class DeepseekV2MoE(nn.Module):
         if config.n_shared_experts is not None:
             if (
                 not is_rocm_aiter_fusion_shared_expert_enabled()
-                and _has_module("mori")
-                and get_current_atom_config().compilation_config.level
-                != CompilationLevel.PIECEWISE
             ):
                 self._use_dual_stream = True
                 self.alt_stream = DeepseekV2MoE._get_shared_stream()
