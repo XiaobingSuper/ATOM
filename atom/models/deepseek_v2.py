@@ -24,6 +24,7 @@
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
 import logging
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -706,6 +707,14 @@ class DeepseekV2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
+        # print("hidden_size.........................................")
+        # print(hidden_size)
+        # print("intermediate_size.........................................")
+        # print(intermediate_size)
+        # print("hidden_size end .........................................")
+        # print("quant_config.........................................")
+        # print(quant_config)
+        # print("quant_config end .........................................")
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -722,21 +731,31 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        gate_up = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x = self.down_proj(x)
+        # Debug: test each step individually to find which GEMM deadlocks on alt_stream
+        # print(f"x.shape={x.shape}, x.dtype={x.dtype}, x.device={x.device}")
+        # gate_up = self.gate_up_proj(x)  # MergedColumnParallelLinear (MXFP4 GEMM)
+        # using torch.mm instead of MergedColumnParallelLinear
+        # gate_up = torch.mm(x, self.gate_up_proj.weight.T)
+        gate_up = torch.matmul(x, self.gate_up_proj.weight.T)
+        # x = self.act_fn(gate_up)        # SiluAndMul (elementwise)
+        # x = self.down_proj(x)         # RowParallelLinear (MXFP4 GEMM)
         return x
 
 
 class DeepseekV2MoE(nn.Module):
-    # Using a single shared stream avoids exhausting GPU/HSA resources
-    _shared_alt_stream: Optional[torch.cuda.Stream] = None
+    # Global aux stream (like vLLM aux_stream / test_multi_stream_torch_compile.py).
+    _alt_stream: Optional[torch.cuda.Stream] = None
+    _dual_stream_call_count = 0
 
-    @staticmethod
-    def _get_shared_stream() -> torch.cuda.Stream:
-        if DeepseekV2MoE._shared_alt_stream is None:
-            DeepseekV2MoE._shared_alt_stream = torch.cuda.Stream()
-        return DeepseekV2MoE._shared_alt_stream
+    @classmethod
+    def _get_alt_stream(cls) -> torch.cuda.Stream:
+        if cls._alt_stream is None:
+            cls._alt_stream = torch.cuda.Stream()
+        return cls._alt_stream
+
+    @classmethod
+    def reset_dual_stream_count(cls):
+        cls._dual_stream_call_count = 0
 
     def __init__(
         self,
@@ -789,20 +808,15 @@ class DeepseekV2MoE(nn.Module):
             config=config,
         )
 
-        # Dual-stream support: when mori is enabled,
-        # parallelize shared expert and routed expert computation
+        # Dual-stream support: parallelize shared expert and routed expert.
         self._use_dual_stream = False
-        self.alt_stream: Optional[torch.cuda.Stream] = None
 
         if config.n_shared_experts is not None:
             if (
                 not is_rocm_aiter_fusion_shared_expert_enabled()
-                and _has_module("mori")
-                and get_current_atom_config().compilation_config.level
-                != CompilationLevel.PIECEWISE
+                and not envs.ATOM_DISABLE_DUAL_STREAM_MOE
             ):
                 self._use_dual_stream = True
-                self.alt_stream = DeepseekV2MoE._get_shared_stream()
 
             if not is_rocm_aiter_fusion_shared_expert_enabled():
                 intermediate_size = (
@@ -817,44 +831,55 @@ class DeepseekV2MoE(nn.Module):
                     prefix=f"{prefix}.shared_experts",
                 )
 
+        # Register for custom op (moe_dual_stream_forward) when dual-stream enabled.
+        # Custom op keeps dual-stream opaque to torch.compile so shared/routed stay on
+        # separate streams.
+        self._moe_dual_stream_layer_name = ""
+        if self._use_dual_stream:
+            self._moe_dual_stream_layer_name = prefix
+            atom_config = get_current_atom_config()
+            ctx = atom_config.compilation_config.static_forward_context
+            if prefix in ctx:
+                raise ValueError(f"Duplicate layer name for moe_dual_stream: {prefix}")
+            ctx[prefix] = self
+
     def _forward_dual_stream(
         self,
         hidden_states: torch.Tensor,
         num_tokens: int,
         hidden_dim: int,
     ) -> torch.Tensor:
-        current_stream = torch.cuda.current_stream()
-        alt_stream = self.alt_stream
+        current = torch.cuda.current_stream()
+        alt_stream = DeepseekV2MoE._get_alt_stream()
 
-        alt_stream.wait_stream(current_stream)
+        alt_stream.wait_stream(current)
+        hidden_states.record_stream(alt_stream)
 
-        # Execute shared experts on current_stream
-        shared_output = self.shared_experts(hidden_states)
-
-        # Execute routed experts on alt_stream
         with torch.cuda.stream(alt_stream):
-            router_logits = self.gate(hidden_states)
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states, router_logits=router_logits
-                )
-                if not is_rocm_aiter_fuse_routed_scaling_factor():
-                    final_hidden_states = (
-                        final_hidden_states * self.routed_scaling_factor
-                    )
-            else:
-                final_hidden_states = self.experts(
-                    hidden_states=hidden_states, router_logits=router_logits
-                )
+            shared_output = self.shared_experts(hidden_states)
 
-        current_stream.wait_stream(alt_stream)
-
+        router_logits = self.gate(hidden_states)
         if hidden_states.dtype != torch.float16:
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            final_hidden_states = final_hidden_states + shared_output * (
-                1.0 / self.routed_scaling_factor
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
             )
+            if not is_rocm_aiter_fuse_routed_scaling_factor():
+                final_hidden_states = (
+                    final_hidden_states * self.routed_scaling_factor
+                )
+        else:
+            final_hidden_states = self.experts(
+                hidden_states=hidden_states, router_logits=router_logits
+            )
+
+        current.wait_stream(alt_stream)
+
+        # if hidden_states.dtype != torch.float16:
+        #     final_hidden_states = final_hidden_states + shared_output
+        # else:
+        #     final_hidden_states = final_hidden_states + shared_output * (
+        #         1.0 / self.routed_scaling_factor
+        #     )
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -865,15 +890,21 @@ class DeepseekV2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         shared_output = None
-        # Use dual-stream forward when mori is enabled
-        DUAL_STREAM_TOKEN_THRESHOLD = 1024
-        if (
+        DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_TOKEN_THRESHOLD
+        # Track per-forward layer count; use dual-stream only for first N layers
+        # Set ATOM_DUAL_STREAM_MAX_LAYERS=0 to disable, =61 for all, =1 to test single layer
+        max_ds_layers = int(os.environ.get("ATOM_DUAL_STREAM_MAX_LAYERS", "61"))
+        DeepseekV2MoE._dual_stream_call_count += 1
+        use_ds = (
             self._use_dual_stream
-            and self.alt_stream is not None
-            and num_tokens > 0
+            and num_tokens > 1
             and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        ):
-            return self._forward_dual_stream(hidden_states, num_tokens, hidden_dim)
+            and DeepseekV2MoE._dual_stream_call_count <= max_ds_layers
+        )
+        if use_ds:
+            return torch.ops.aiter.moe_dual_stream_forward(
+                hidden_states, num_tokens, hidden_dim, self._moe_dual_stream_layer_name
+            )
 
         if (
             self.n_shared_experts is not None
@@ -894,19 +925,51 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
-        if shared_output is not None:
-            if hidden_states.dtype != torch.float16:
-                final_hidden_states = final_hidden_states + shared_output
-            else:
-                # Fix FP16 overflow
-                # See DeepseekV2DecoderLayer for more details.
-                final_hidden_states = final_hidden_states + shared_output * (
-                    1.0 / self.routed_scaling_factor
-                )
+        # if shared_output is not None:
+        #     if hidden_states.dtype != torch.float16:
+        #         final_hidden_states = final_hidden_states + shared_output
+        #     else:
+        #         # Fix FP16 overflow
+        #         # See DeepseekV2DecoderLayer for more details.
+        #         final_hidden_states = final_hidden_states + shared_output * (
+        #             1.0 / self.routed_scaling_factor
+        #         )
         if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
+
+
+def _moe_dual_stream_forward_impl(
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    hidden_dim: int,
+    layer_name: str,
+) -> torch.Tensor:
+    """Custom op impl: look up layer and run dual-stream forward (opaque to torch.compile)."""
+    atom_config = get_current_atom_config()
+    layer = atom_config.compilation_config.static_forward_context[layer_name]
+    return layer._forward_dual_stream(hidden_states, num_tokens, hidden_dim)
+
+
+def _moe_dual_stream_forward_fake(
+    hidden_states: torch.Tensor,
+    num_tokens: int,
+    hidden_dim: int,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty(
+        num_tokens, hidden_dim, device=hidden_states.device, dtype=hidden_states.dtype
+    )
+
+
+direct_register_custom_op(
+    op_name="moe_dual_stream_forward",
+    op_func=_moe_dual_stream_forward_impl,
+    mutates_args=[],
+    fake_impl=_moe_dual_stream_forward_fake,
+    tags=(torch.Tag.needs_fixed_stride_order,),
+)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

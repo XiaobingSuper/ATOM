@@ -1674,8 +1674,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        logger.warning(f"[FWD] prepare_model bs={batch.total_seqs_num} tok={batch.total_tokens_num}")
         input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
+        logger.warning("[FWD] run_model")
         logits, hidden_states = self.run_model(input_ids, batch)
+        logger.warning("[FWD] postprocess")
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -1685,6 +1688,7 @@ class ModelRunner:
             all_greedy,
             hidden_states,
         )
+        logger.warning("[FWD] done")
         reset_forward_context()
         return fwd_output
 

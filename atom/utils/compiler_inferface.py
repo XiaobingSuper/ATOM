@@ -4,12 +4,15 @@
 import contextlib
 import copy
 import hashlib
+import logging
 import os
 from contextlib import ExitStack
 from typing import Any, Callable, Optional
 from unittest.mock import patch
 
 import torch
+
+logger = logging.getLogger("atom")
 import torch._inductor.compile_fx
 import torch.fx as fx
 from atom.config import Config
@@ -572,30 +575,47 @@ class InductorStandaloneAdaptor(CompilerInterface):
             options={"config_patches": current_config},
         )
 
-        # Save the compiled artifact to disk in the specified path
+        # Check if artifact is serializable (e.g. subgraphs with torch.cuda.stream
+        # have empty aot_autograd_artifacts and cannot be saved in unpacked format).
+        def _is_saveable(artifact: Any) -> bool:
+            try:
+                raw = getattr(artifact, "_artifacts", None)
+                if raw is None:
+                    return False
+                _, cache_info = raw
+                aot = getattr(cache_info, "aot_autograd_artifacts", [])
+                if not aot and hasattr(cache_info, "artifacts"):
+                    aot = cache_info.artifacts.get("aot_autograd", [])
+                return len(aot) == 1
+            except Exception:
+                return False
+
         assert key is not None
         path = os.path.join(self.cache_dir, key)
-        compiled_graph.save(path=path, format="unpacked")
-        compilation_counter.num_compiled_artifacts_saved += 1
 
-        # Post-process generated wrapper Python files: wrap regions between
-        # <prefix>_start / <prefix>_end graph markers with record_function("<prefix>").
-        try:
-            # Only run post-processing when mark-trace is enabled (to avoid any
-            # overhead / file churn in default runs).
-            from atom.utils.graph_marker import is_graph_marker_enabled
+        if _is_saveable(compiled_graph):
+            compiled_graph.save(path=path, format="unpacked")
+            compilation_counter.num_compiled_artifacts_saved += 1
+            try:
+                from atom.utils.graph_marker import is_graph_marker_enabled
 
-            if is_graph_marker_enabled():
-                # Local import to avoid extra package-level side effects.
-                from .graph_marker_instrumentation import (
-                    instrument_record_functions_in_dir,
-                )
+                if is_graph_marker_enabled():
+                    from .graph_marker_instrumentation import (
+                        instrument_record_functions_in_dir,
+                    )
 
-                instrument_record_functions_in_dir(path, strip_markers=False)
-        except Exception:
-            # Best-effort: never fail compilation due to instrumentation.
-            pass
-        return compiled_graph, (key, path)
+                    instrument_record_functions_in_dir(path, strip_markers=False)
+            except Exception:
+                pass
+            return compiled_graph, (key, path)
+        else:
+            # Not serializable (e.g. contains torch.cuda.stream for dual stream).
+            # Use in-memory only; will recompile on next process start.
+            logger.debug(
+                "Subgraph %s not serializable (e.g. dual stream), skipping cache",
+                key,
+            )
+            return compiled_graph, None
 
     def load(
         self,

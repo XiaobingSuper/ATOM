@@ -75,6 +75,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_DISABLE_VLLM_PLUGIN_ATTENTION", "0"
     ).lower()
     == "1",
+    # --- MoE Dual-Stream (shared/routed overlap) ---
+    # Token threshold: dual-stream only when 1 < num_tokens <= threshold.
+    # Single-token decode has no overlap benefit.
+    "ATOM_DUAL_STREAM_TOKEN_THRESHOLD": lambda: int(
+        os.getenv("ATOM_DUAL_STREAM_TOKEN_THRESHOLD", "1024")
+    ),
+    "ATOM_DISABLE_DUAL_STREAM_MOE": lambda: os.getenv(
+        "ATOM_DISABLE_DUAL_STREAM_MOE", "0"
+    ).lower()
+    == "1",
 }
 
 
