@@ -813,17 +813,15 @@ class DeepseekV2MoE(nn.Module):
                     prefix=f"{prefix}.shared_experts",
                 )
 
-        # Register for custom op (moe_dual_stream_forward) when dual-stream enabled.
-        # Custom op keeps dual-stream opaque to torch.compile so shared/routed stay on
-        # separate streams.
-        self._moe_dual_stream_layer_name = ""
-        if self._use_dual_stream:
-            self._moe_dual_stream_layer_name = prefix
-            atom_config = get_current_atom_config()
-            ctx = atom_config.compilation_config.static_forward_context
-            if prefix in ctx:
-                raise ValueError(f"Duplicate layer name for moe_dual_stream: {prefix}")
-            ctx[prefix] = self
+        # Single custom op for the whole MoE block (vLLM-style): dual-stream vs sequential
+        # is decided inside the op impl, not via a separate torch.ops in forward(), so
+        # torch.compile sees one stable graph regardless of num_tokens.
+        self._deepseek_moe_layer_name = prefix
+        atom_config = get_current_atom_config()
+        ctx = atom_config.compilation_config.static_forward_context
+        if prefix in ctx:
+            raise ValueError(f"Duplicate layer name for DeepseekV2MoE: {prefix}")
+        ctx[prefix] = self
 
     def _forward_dual_stream(
         self,
@@ -868,29 +866,28 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        num_tokens, hidden_dim = hidden_states.shape
-        hidden_states = hidden_states.view(-1, hidden_dim)
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        num_tokens: int,
+        hidden_dim: int,
+    ) -> torch.Tensor:
+        """Full MoE forward; dual-stream branch runs inside this (opaque to compile)."""
         shared_output = None
-        DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_TOKEN_THRESHOLD
-        # Track per-forward layer count; use dual-stream only for first N layers
-        # Set ATOM_DUAL_STREAM_MAX_LAYERS=0 to disable, =61 for all, =1 to test single layer
+        threshold = envs.ATOM_DUAL_STREAM_TOKEN_THRESHOLD
         use_ds = (
             self._use_dual_stream
             and num_tokens > 0
-            and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
+            and num_tokens <= threshold
         )
         if use_ds:
-            return torch.ops.aiter.moe_dual_stream_forward(
-                hidden_states, num_tokens, hidden_dim, self._moe_dual_stream_layer_name
-            )
+            return self._forward_dual_stream(hidden_states, num_tokens, hidden_dim)
 
         if (
             self.n_shared_experts is not None
             and not is_rocm_aiter_fusion_shared_expert_enabled()
         ):
             shared_output = self.shared_experts(hidden_states)
-        # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
         if hidden_states.dtype != torch.float16:
             final_hidden_states = self.experts(
@@ -899,8 +896,6 @@ class DeepseekV2MoE(nn.Module):
             if not is_rocm_aiter_fuse_routed_scaling_factor():
                 final_hidden_states = final_hidden_states * self.routed_scaling_factor
         else:
-            # Fix FP16 overflow
-            # See DeepseekV2DecoderLayer for more details.
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
@@ -908,8 +903,6 @@ class DeepseekV2MoE(nn.Module):
             if hidden_states.dtype != torch.float16:
                 final_hidden_states = final_hidden_states + shared_output
             else:
-                # Fix FP16 overflow
-                # See DeepseekV2DecoderLayer for more details.
                 final_hidden_states = final_hidden_states + shared_output * (
                     1.0 / self.routed_scaling_factor
                 )
@@ -918,35 +911,42 @@ class DeepseekV2MoE(nn.Module):
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+        return torch.ops.aiter.deepseek_v2_moe_forward(
+            hidden_states,
+            num_tokens,
+            hidden_dim,
+            self._deepseek_moe_layer_name,
+        )
 
-def _moe_dual_stream_forward_impl(
+
+def deepseek_v2_moe_forward_impl(
     hidden_states: torch.Tensor,
     num_tokens: int,
     hidden_dim: int,
     layer_name: str,
 ) -> torch.Tensor:
-    """Custom op impl: look up layer and run dual-stream forward (opaque to torch.compile)."""
     atom_config = get_current_atom_config()
     layer = atom_config.compilation_config.static_forward_context[layer_name]
-    return layer._forward_dual_stream(hidden_states, num_tokens, hidden_dim)
+    return layer._forward_impl(hidden_states, num_tokens, hidden_dim)
 
 
-def _moe_dual_stream_forward_fake(
+def deepseek_v2_moe_forward_fake(
     hidden_states: torch.Tensor,
     num_tokens: int,
     hidden_dim: int,
     layer_name: str,
 ) -> torch.Tensor:
-    return torch.empty(
-        num_tokens, hidden_dim, device=hidden_states.device, dtype=hidden_states.dtype
-    )
+    return torch.empty_like(hidden_states)
 
 
 direct_register_custom_op(
-    op_name="moe_dual_stream_forward",
-    op_func=_moe_dual_stream_forward_impl,
+    op_name="deepseek_v2_moe_forward",
+    op_func=deepseek_v2_moe_forward_impl,
     mutates_args=[],
-    fake_impl=_moe_dual_stream_forward_fake,
+    fake_impl=deepseek_v2_moe_forward_fake,
     tags=(torch.Tag.needs_fixed_stride_order,),
 )
 
