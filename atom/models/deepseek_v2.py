@@ -707,14 +707,6 @@ class DeepseekV2MLP(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
-        # print("hidden_size.........................................")
-        # print(hidden_size)
-        # print("intermediate_size.........................................")
-        # print(intermediate_size)
-        # print("hidden_size end .........................................")
-        # print("quant_config.........................................")
-        # print(quant_config)
-        # print("quant_config end .........................................")
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
@@ -731,31 +723,21 @@ class DeepseekV2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        # Debug: test each step individually to find which GEMM deadlocks on alt_stream
-        # print(f"x.shape={x.shape}, x.dtype={x.dtype}, x.device={x.device}")
-        # gate_up = self.gate_up_proj(x)  # MergedColumnParallelLinear (MXFP4 GEMM)
-        # using torch.mm instead of MergedColumnParallelLinear
-        # gate_up = torch.mm(x, self.gate_up_proj.weight.T)
-        gate_up = torch.matmul(x, self.gate_up_proj.weight.T)
-        # x = self.act_fn(gate_up)        # SiluAndMul (elementwise)
-        # x = self.down_proj(x)         # RowParallelLinear (MXFP4 GEMM)
+        gate_up = self.gate_up_proj(x)
+        x = self.act_fn(gate_up)
+        x = self.down_proj(x)
         return x
 
 
 class DeepseekV2MoE(nn.Module):
     # Global aux stream (like vLLM aux_stream / test_multi_stream_torch_compile.py).
     _alt_stream: Optional[torch.cuda.Stream] = None
-    _dual_stream_call_count = 0
 
     @classmethod
     def _get_alt_stream(cls) -> torch.cuda.Stream:
         if cls._alt_stream is None:
             cls._alt_stream = torch.cuda.Stream()
         return cls._alt_stream
-
-    @classmethod
-    def reset_dual_stream_count(cls):
-        cls._dual_stream_call_count = 0
 
     def __init__(
         self,
@@ -874,12 +856,12 @@ class DeepseekV2MoE(nn.Module):
 
         current.wait_stream(alt_stream)
 
-        # if hidden_states.dtype != torch.float16:
-        #     final_hidden_states = final_hidden_states + shared_output
-        # else:
-        #     final_hidden_states = final_hidden_states + shared_output * (
-        #         1.0 / self.routed_scaling_factor
-        #     )
+        if hidden_states.dtype != torch.float16:
+            final_hidden_states = final_hidden_states + shared_output
+        else:
+            final_hidden_states = final_hidden_states + shared_output * (
+                1.0 / self.routed_scaling_factor
+            )
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
@@ -893,13 +875,10 @@ class DeepseekV2MoE(nn.Module):
         DUAL_STREAM_TOKEN_THRESHOLD = envs.ATOM_DUAL_STREAM_TOKEN_THRESHOLD
         # Track per-forward layer count; use dual-stream only for first N layers
         # Set ATOM_DUAL_STREAM_MAX_LAYERS=0 to disable, =61 for all, =1 to test single layer
-        max_ds_layers = int(os.environ.get("ATOM_DUAL_STREAM_MAX_LAYERS", "61"))
-        DeepseekV2MoE._dual_stream_call_count += 1
         use_ds = (
             self._use_dual_stream
-            and num_tokens > 1
+            and num_tokens > 0
             and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-            and DeepseekV2MoE._dual_stream_call_count <= max_ds_layers
         )
         if use_ds:
             return torch.ops.aiter.moe_dual_stream_forward(
@@ -925,15 +904,15 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = self.experts(
                 hidden_states=hidden_states, router_logits=router_logits
             )
-        # if shared_output is not None:
-        #     if hidden_states.dtype != torch.float16:
-        #         final_hidden_states = final_hidden_states + shared_output
-        #     else:
-        #         # Fix FP16 overflow
-        #         # See DeepseekV2DecoderLayer for more details.
-        #         final_hidden_states = final_hidden_states + shared_output * (
-        #             1.0 / self.routed_scaling_factor
-        #         )
+        if shared_output is not None:
+            if hidden_states.dtype != torch.float16:
+                final_hidden_states = final_hidden_states + shared_output
+            else:
+                # Fix FP16 overflow
+                # See DeepseekV2DecoderLayer for more details.
+                final_hidden_states = final_hidden_states + shared_output * (
+                    1.0 / self.routed_scaling_factor
+                )
         if self.tp_size > 1 and self.reduce_results:
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 

@@ -79,7 +79,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token threshold: dual-stream only when 1 < num_tokens <= threshold.
     # Single-token decode has no overlap benefit.
     "ATOM_DUAL_STREAM_TOKEN_THRESHOLD": lambda: int(
-        os.getenv("ATOM_DUAL_STREAM_TOKEN_THRESHOLD", "1024")
+        os.getenv("ATOM_DUAL_STREAM_TOKEN_THRESHOLD", "256")
     ),
     "ATOM_DISABLE_DUAL_STREAM_MOE": lambda: os.getenv(
         "ATOM_DISABLE_DUAL_STREAM_MOE", "0"
