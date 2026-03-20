@@ -15,6 +15,12 @@ on:
     # Nightly at 00:00 Beijing time (16:00 UTC)
     - cron: '0 16 * * *'
   workflow_dispatch:
+    inputs:
+      aiter_branch:
+        description: 'ROCm/aiter branch to build inside the CI image'
+        required: false
+        default: 'main'
+        type: string
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -23,7 +29,9 @@ concurrency:
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
-  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id }}
+  GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
+  # workflow_dispatch: inputs.aiter_branch; otherwise main (matches previous default-branch shallow clone)
+  AITER_GIT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.aiter_branch || 'main' }}
 
 jobs:
   check-signal:
@@ -35,9 +43,11 @@ jobs:
       contents: read
     steps:
       - name: Checkout ATOM repo
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         uses: actions/checkout@v6
 
       - name: Download and check pre-checkin signal
+        if: ${{ github.event_name != 'workflow_dispatch' }}
         run: bash ./.github/scripts/check_signal.sh
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -70,9 +80,8 @@ jobs:
           RUN chmod +x jq
           RUN mv jq /usr/local/bin/jq
           RUN rm -rf /app/aiter-test
-          RUN git clone --depth 1 https://github.com/ROCm/aiter.git /app/aiter-test && \\
+          RUN git clone --depth 1 -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
-              git checkout HEAD && \\
               git submodule sync && git submodule update --init --recursive && \\
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
@@ -253,9 +262,8 @@ jobs:
           RUN pip install --upgrade "pybind11>=3.0.1"
           RUN pip show pybind11
           RUN rm -rf /app/aiter-test
-          RUN git clone https://github.com/ROCm/aiter.git /app/aiter-test && \\
+          RUN git clone --depth 1 -b ${{ env.AITER_GIT_REF }} https://github.com/ROCm/aiter.git /app/aiter-test && \\
               cd /app/aiter-test && \\
-              git checkout HEAD && \\
               git submodule sync && git submodule update --init --recursive && \\
               MAX_JOBS=64 PREBUILD_KERNELS=0 GPU_ARCHS=gfx950 python3 setup.py develop
           RUN echo "=== Aiter version AFTER installation ===" && pip show amd-aiter || true
