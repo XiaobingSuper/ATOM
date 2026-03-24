@@ -730,13 +730,16 @@ def maybe_dual_stream_forward(
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
     # DUAL_STREAM_TOKEN_THRESHOLD = 1024
-    num_tokens, hidden_dim = hidden_states.shape
-    if (
-        self._use_dual_stream
-        and num_tokens > 0
-        # and num_tokens <= DUAL_STREAM_TOKEN_THRESHOLD
-        and not get_forward_context().context.is_prefill
-    ):
+    num_tokens, _ = hidden_states.shape
+    fwd_ctx = get_forward_context()
+    is_prefill = getattr(getattr(fwd_ctx, "context", None), "is_prefill", None)
+    is_decode = (
+        num_tokens <= envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD
+        if is_prefill is None
+        else not is_prefill
+    )
+    use_dual_stream = self._use_dual_stream and num_tokens > 0 and is_decode
+    if use_dual_stream:
         return self.dual_stream_moe_forward(hidden_states)
     else:
         return self.single_stream_moe_forward(hidden_states)
