@@ -489,17 +489,6 @@ class QuantizationConfig:
     ) -> bool:
         """Match the target string or regular expression"""
 
-        # Replace layer name if packed_modules_mapping is offered
-        proj_name = layer_name.split(".")[-1]
-        if self.packed_modules_mapping is not None:
-            for ori_param, (
-                model_param,
-                shard_id,
-            ) in self.packed_modules_mapping.items():
-                if proj_name in model_param:
-                    layer_name = layer_name.replace(proj_name, ori_param)
-                    break
-
         if ignore_str.startswith("re:"):
             # case "re:model.layers.*self_attn.*", remove the 're:' prefix
             pattern = ignore_str[3:]
@@ -609,7 +598,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
 }
 
 
-def get_hf_config(model: str) -> PretrainedConfig:
+def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
     config_dict, _ = PretrainedConfig.get_config_dict(
         model,
     )
@@ -657,9 +646,12 @@ def get_hf_config(model: str) -> PretrainedConfig:
             # revision=revision,
             # code_revision=code_revision,
             token=_get_hf_token(),
+            trust_remote_code=trust_remote_code,
         )
     try:
-        hf_config = AutoConfig.from_pretrained(model)
+        hf_config = AutoConfig.from_pretrained(
+            model, trust_remote_code=trust_remote_code
+        )
     except ValueError as e:
         # For the unsupported model in current transformers, try vllm if in plugin mode
         if is_vllm():
@@ -668,7 +660,7 @@ def get_hf_config(model: str) -> PretrainedConfig:
                 maybe_patch_hf_config_from_gguf,
             )
 
-            hf_config = get_config(model, trust_remote_code=True)
+            hf_config = get_config(model, trust_remote_code=trust_remote_code)
             hf_config = maybe_patch_hf_config_from_gguf(model, hf_config)
         else:
             raise e
@@ -895,7 +887,9 @@ class Config:
         # assert os.path.isdir(self.model)
 
         assert 1 <= self.tensor_parallel_size <= 8
-        self.hf_config = get_hf_config(self.model)
+        self.hf_config = get_hf_config(
+            self.model, trust_remote_code=self.trust_remote_code
+        )
         if not hasattr(self.hf_config, "rope_parameters"):
             # Compatible with both transformers < 5
             rope_params = getattr(self.hf_config, "rope_scaling", {})
