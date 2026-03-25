@@ -303,6 +303,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             renormalize=getattr(config, "norm_topk_prob", True),
             quant_config=quant_config,
             use_grouped_topk=False,
+            has_bias=False,
             shared_expert_scoring_func=(
                 "sigmoid" if self.shared_expert is None else None
             ),
