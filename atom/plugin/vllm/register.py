@@ -5,6 +5,7 @@ import torch
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.mla_patch import patch_vllm_mla_attention
+from atom.plugin.vllm.deepseek_patch import patch_vllm_deepseek_dual_stream
 
 logger = logging.getLogger("atom")
 
@@ -105,6 +106,7 @@ def register_model() -> None:
         vllm_model_registry._try_inspect_model_cls.cache_clear()
 
     patch_vllm_mla_attention()
+    patch_vllm_deepseek_dual_stream()
     # patch attention process weights after loading
     # to avoid the specific handle in ATOM loader
     try:
