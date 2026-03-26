@@ -674,12 +674,17 @@
 <td><p>1 (true)</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, fuse RMSNorm with quantization.</p></td>
 </tr>
-<tr class="row-odd"><td><p><strong>ATOM_ENABLE_DS_QKNORM_QUANT_FUSION</strong></p></td>
+<tr class="row-odd"><td><p><strong>ATOM_ENABLE_DS_QKNORM_FUSION</strong></p></td>
+<td><p>bool</p></td>
+<td><p>1 (true)</p></td>
+<td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, use the fused Q/K RMSNorm path (<code class="docutils literal notranslate"><span class="pre">fused_qk_rmsnorm</span></code>) in the DeepSeek MLA attention module when Q-LoRA is enabled and QK norm+quant fusion is not used. If set to <code class="docutils literal notranslate"><span class="pre">0</span></code>, apply separate RMSNorm for the Q and KV branches instead.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>ATOM_ENABLE_DS_QKNORM_QUANT_FUSION</strong></p></td>
 <td><p>bool</p></td>
 <td><p>1 (true)</p></td>
 <td><p>If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, fuse QK norm with quantization in MLA attention module.</p></td>
 </tr>
-<tr class="row-even"><td><p><strong>ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD</strong></p></td>
+<tr class="row-odd"><td><p><strong>ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD</strong></p></td>
 <td><p>int</p></td>
 <td><p>1024</p></td>
 <td><p>Upper bound on MoE token count (<code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> in the MoE forward) for using the dual-stream path: shared experts on a secondary CUDA stream while routed experts run on the default stream. If <code class="docutils literal notranslate"><span class="pre">num_tokens</span></code> exceeds this value, that forward uses single-stream MoE instead. Set to <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable dual-stream setup entirely (no alt stream, no <code class="docutils literal notranslate"><span class="pre">maybe_dual_stream_forward</span></code> registration).</p></td>
