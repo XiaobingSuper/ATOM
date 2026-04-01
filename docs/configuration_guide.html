@@ -557,7 +557,7 @@ controls ATOM’s runtime behaviour.</p>
 <td><p>Layer-wise quantization orchestrator: global config, per-layer overrides, exclude lists, layer name remapping</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code></p></td>
-<td><p>Per-layer quantization parameters: quant type, dtype, dynamic flag, method</p></td>
+<td><p>Per-layer quantization spec (frozen dataclass): quant type, dtype, dynamic flag, method</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code></p></td>
 <td><p>Data-parallel size, rank, master IP/port</p></td>
@@ -909,17 +909,17 @@ controls ATOM’s runtime behaviour.</p>
 <hr class="docutils" />
 <section id="quantization-configuration-quantizationconfig-layerquantconfig">
 <h2>3. Quantization Configuration (<code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code> &amp; <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>)<a class="headerlink" href="#quantization-configuration-quantizationconfig-layerquantconfig" title="Link to this heading"></a></h2>
-<p>Defined in <code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code>. The quantization system uses two classes:</p>
+<p>Defined in <code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code> and <code class="docutils literal notranslate"><span class="pre">atom/quant_spec.py</span></code>. The quantization system uses two classes:</p>
 <ul class="simple">
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code></strong> – the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists. It is <strong>not</strong> a <code class="docutils literal notranslate"><span class="pre">dict</span></code> subclass.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig(dict)</span></code></strong> – a <code class="docutils literal notranslate"><span class="pre">dict</span></code> subclass that stores the concrete quantization parameters for a single layer (or as the global default).</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code></strong> – the top-level orchestrator that holds a global config, per-layer overrides, and exclusion lists.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code></strong> – a frozen dataclass (defined in <code class="docutils literal notranslate"><span class="pre">atom/quant_spec.py</span></code>) that stores the concrete quantization parameters for a single layer or as the global default. Typed, immutable, with attribute access (e.g., <code class="docutils literal notranslate"><span class="pre">spec.quant_type</span></code>).</p></li>
 </ul>
 <section id="layerquantconfig-fields">
 <h3>3.1 <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> Fields<a class="headerlink" href="#layerquantconfig-fields" title="Link to this heading"></a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> extends <code class="docutils literal notranslate"><span class="pre">dict</span></code>. Fields are stored and accessed as dictionary keys (e.g., <code class="docutils literal notranslate"><span class="pre">cfg[&quot;quant_type&quot;]</span></code>).</p>
+<p><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> is a frozen dataclass. Fields are accessed as typed attributes (e.g., <code class="docutils literal notranslate"><span class="pre">spec.quant_type</span></code>).</p>
 <table class="docutils align-default">
 <thead>
-<tr class="row-odd"><th class="head"><p>Key</p></th>
+<tr class="row-odd"><th class="head"><p>Field</p></th>
 <th class="head"><p>Type</p></th>
 <th class="head"><p>Default</p></th>
 <th class="head"><p>Description</p></th>
@@ -969,10 +969,10 @@ controls ATOM’s runtime behaviour.</p>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code></p></td>
-<td><p>Default quantization config applied to all layers</p></td>
+<td><p>Default quantization spec applied to all layers</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">layer_quant_config</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">dict[str,</span> <span class="pre">LayerQuantConfig]</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">_parsed.layer_pattern_specs</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">list[tuple[str,</span> <span class="pre">LayerQuantConfig]]</span></code></p></td>
 <td><p>Per-layer overrides keyed by layer name pattern (supports fnmatch globs like <code class="docutils literal notranslate"><span class="pre">&quot;*.mlp.*&quot;</span></code>)</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">exclude_layers</span></code></p></td>
@@ -997,19 +997,13 @@ controls ATOM’s runtime behaviour.</p>
 <td><p>Returns the quantization method name</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">get_layer_quant_config(layer_name)</span></code></p></td>
-<td><p>Returns the <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> for a layer: checks exclusions first, then per-layer overrides, then falls back to global config</p></td>
+<td><p>Returns the <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code> for a layer: checks exclusions first, then per-layer overrides, then falls back to global spec</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">should_ignore_layer_quant(layer_name)</span></code></p></td>
-<td><p>Returns <code class="docutils literal notranslate"><span class="pre">True</span></code> if the layer is in the exclusion list</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">remap_layer_name(hf_config,</span> <span class="pre">packed_modules_mapping)</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">remap_layer_name(hf_config,</span> <span class="pre">packed_modules_mapping)</span></code></p></td>
 <td><p>Remaps layer names for packed/fused modules (e.g., <code class="docutils literal notranslate"><span class="pre">q_a_proj</span></code> → <code class="docutils literal notranslate"><span class="pre">fused_qkv_a_proj</span></code> for DeepSeek)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">compute_hash()</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">compute_hash()</span></code></p></td>
 <td><p>Returns a SHA-256 hash of the quantization config for cache invalidation</p></td>
-</tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">parse_quark_config_dict(config)</span></code></p></td>
-<td><p>Parses a quark-format config dict into a <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code></p></td>
 </tr>
 </tbody>
 </table>
@@ -1080,7 +1074,7 @@ reads <code class="docutils literal notranslate"><span class="pre">hf_config.qua
 parameters:</p>
 <p><strong>For quark models</strong> (<code class="docutils literal notranslate"><span class="pre">quant_method</span> <span class="pre">==</span> <span class="pre">&quot;quark&quot;</span></code>):</p>
 <ol class="arabic simple">
-<li><p>Parses <code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code> dict via <code class="docutils literal notranslate"><span class="pre">parse_quark_config_dict()</span></code> to produce the global <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>.</p></li>
+<li><p>Parses <code class="docutils literal notranslate"><span class="pre">global_quant_config</span></code> dict via <code class="docutils literal notranslate"><span class="pre">QuarkParser</span></code> to produce the global <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>.</p></li>
 <li><p>Parses each entry in <code class="docutils literal notranslate"><span class="pre">layer_quant_config</span></code> dict to produce per-layer overrides.</p></li>
 <li><p>Reads the <code class="docutils literal notranslate"><span class="pre">&quot;exclude&quot;</span></code> list for excluded layers.</p></li>
 <li><p>Within each config dict, <code class="docutils literal notranslate"><span class="pre">weight.qscheme</span></code> determines <code class="docutils literal notranslate"><span class="pre">quant_type</span></code> (<code class="docutils literal notranslate"><span class="pre">&quot;per_channel&quot;</span></code> → <code class="docutils literal notranslate"><span class="pre">per_Token</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;per_tensor&quot;</span></code> → <code class="docutils literal notranslate"><span class="pre">per_Tensor</span></code>, <code class="docutils literal notranslate"><span class="pre">&quot;per_group&quot;</span></code> → <code class="docutils literal notranslate"><span class="pre">per_1x32</span></code>), and <code class="docutils literal notranslate"><span class="pre">weight.dtype</span></code> determines <code class="docutils literal notranslate"><span class="pre">quant_dtype</span></code>.</p></li>
@@ -1572,7 +1566,7 @@ level 3 is still recommended.</p></li>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">atom/config.py</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">Config</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>, <code class="docutils literal notranslate"><span class="pre">LayerQuantConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">KVCacheTensor</span></code>, <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">get_hf_config</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Config</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">CompilationLevel</span></code>, <code class="docutils literal notranslate"><span class="pre">CUDAGraphMode</span></code>, <code class="docutils literal notranslate"><span class="pre">QuantizationConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">ParallelConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">SpeculativeConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">KVCacheTensor</span></code>, <code class="docutils literal notranslate"><span class="pre">KVCacheConfig</span></code>, <code class="docutils literal notranslate"><span class="pre">get_hf_config</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">atom/utils/envs.py</span></code></p></td>
 <td><p>All <code class="docutils literal notranslate"><span class="pre">ATOM_*</span></code> environment variable definitions with lazy evaluation</p></td>
