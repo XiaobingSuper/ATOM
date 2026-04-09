@@ -6,7 +6,7 @@
   <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ATOM Documentation Accuracy Audit Report &mdash; ATOM 0.1.0 documentation</title>
+  <title>Model Run Guide &mdash; ATOM 0.1.0 documentation</title>
       <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
       <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
 
@@ -18,7 +18,9 @@
       <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/js/theme.js"></script>
     <link rel="index" title="Index" href="genindex.html" />
-    <link rel="search" title="Search" href="search.html" /> 
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="ATOM Architecture Guide" href="architecture_guide.html" />
+    <link rel="prev" title="Quickstart" href="quickstart.html" /> 
 </head>
 
 <body class="wy-body-for-nav"> 
@@ -42,7 +44,7 @@
 </div>
         </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
               <p class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
-<ul>
+<ul class="current">
 <li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="installation.html#requirements">Requirements</a></li>
 <li class="toctree-l2"><a class="reference internal" href="installation.html#installation-methods">Installation Methods</a><ul>
@@ -64,14 +66,14 @@
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
-<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#vllm-plugin-backend">vLLM Plugin Backend</a></li>
 </ul>
 </li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
-<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#live-dashboard">Live Dashboard</a></li>
 </ul>
 </li>
 </ul>
@@ -523,9 +525,9 @@
           <div role="navigation" aria-label="Page navigation">
   <ul class="wy-breadcrumbs">
       <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
-      <li class="breadcrumb-item active">ATOM Documentation Accuracy Audit Report</li>
+      <li class="breadcrumb-item active">Model Run Guide</li>
       <li class="wy-breadcrumbs-aside">
-            <a href="_sources/DOCUMENTATION_AUDIT_REPORT.md.txt" rel="nofollow"> View page source</a>
+            <a href="_sources/model_run_guide.md.txt" rel="nofollow"> View page source</a>
       </li>
   </ul>
   <hr/>
@@ -533,237 +535,139 @@
           <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
            <div itemprop="articleBody">
              
-  <section id="atom-documentation-accuracy-audit-report">
-<h1>ATOM Documentation Accuracy Audit Report<a class="headerlink" href="#atom-documentation-accuracy-audit-report" title="Link to this heading"></a></h1>
-<p><strong>Date:</strong> 2026-02-14
-<strong>Auditor:</strong> Claude Sonnet 4.5
-<strong>Scope:</strong> Complete factual accuracy check of all documentation</p>
-<section id="executive-summary">
-<h2>Executive Summary<a class="headerlink" href="#executive-summary" title="Link to this heading"></a></h2>
-<p>This audit identified <strong>8 critical factual errors</strong> in the ATOM documentation. The primary issues are:</p>
-<ul class="simple">
-<li><p>Incorrect class name (LLM vs LLMEngine)</p></li>
-<li><p>Incorrect generate() method signature</p></li>
-<li><p>Mismatched SamplingParams attributes</p></li>
-<li><p>Wrong return type documentation</p></li>
-<li><p>Python version mismatch</p></li>
-</ul>
-<p>All quickstart examples would fail to run without these fixes.</p>
-</section>
-<section id="critical-issues-all-fixed">
-<h2>Critical Issues - All Fixed ✓<a class="headerlink" href="#critical-issues-all-fixed" title="Link to this heading"></a></h2>
-<section id="installation-docs-installation-rst">
-<h3>1. Installation (<code class="docutils literal notranslate"><span class="pre">docs/installation.rst</span></code>)<a class="headerlink" href="#installation-docs-installation-rst" title="Link to this heading"></a></h3>
-<section id="issue-1-1-python-version-mismatch-fixed">
-<h4>Issue 1.1: Python Version Mismatch [FIXED ✓]<a class="headerlink" href="#issue-1-1-python-version-mismatch-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation claimed</strong>: Python 3.8 or later</p></li>
-<li><p><strong>Actual requirement</strong>: Python &gt;=3.10, &lt;3.13 (pyproject.toml line 10)</p></li>
-<li><p><strong>Status</strong>: FIXED</p></li>
-</ul>
-</section>
-<section id="issue-1-2-non-functional-verification-code-fixed">
-<h4>Issue 1.2: Non-functional Verification Code [FIXED ✓]<a class="headerlink" href="#issue-1-2-non-functional-verification-code-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation used</strong>: <code class="docutils literal notranslate"><span class="pre">atom.__version__</span></code> and <code class="docutils literal notranslate"><span class="pre">atom.is_available()</span></code></p></li>
-<li><p><strong>Actual</strong>: Neither exists in atom/<strong>init</strong>.py</p></li>
-<li><p><strong>Status</strong>: FIXED - replaced with working module checks</p></li>
-</ul>
-</section>
-</section>
-<section id="quickstart-docs-quickstart-rst">
-<h3>2. Quickstart (<code class="docutils literal notranslate"><span class="pre">docs/quickstart.rst</span></code>)<a class="headerlink" href="#quickstart-docs-quickstart-rst" title="Link to this heading"></a></h3>
-<section id="issue-2-1-wrong-class-name-fixed">
-<h4>Issue 2.1: Wrong Class Name [FIXED ✓]<a class="headerlink" href="#issue-2-1-wrong-class-name-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation used</strong>: <code class="docutils literal notranslate"><span class="pre">from</span> <span class="pre">atom</span> <span class="pre">import</span> <span class="pre">LLM</span></code></p></li>
-<li><p><strong>Actual class</strong>: <code class="docutils literal notranslate"><span class="pre">LLMEngine</span></code> (atom/<strong>init</strong>.py line 4)</p></li>
-<li><p><strong>Impact</strong>: All examples had ImportError</p></li>
-<li><p><strong>Status</strong>: FIXED - changed LLM → LLMEngine throughout</p></li>
-</ul>
-</section>
-<section id="issue-2-2-wrong-generate-signature-fixed">
-<h4>Issue 2.2: Wrong generate() Signature [FIXED ✓]<a class="headerlink" href="#issue-2-2-wrong-generate-signature-fixed" title="Link to this heading"></a></h4>
-<ul>
-<li><p><strong>Documentation showed</strong>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Hello&quot;</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">)</span>
-<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">20</span><span class="p">)</span>
-</pre></div>
-</div>
-</li>
-<li><p><strong>Actual signature</strong>:</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">def</span><span class="w"> </span><span class="nf">generate</span><span class="p">(</span>
-    <span class="bp">self</span><span class="p">,</span>
-    <span class="n">prompts</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">],</span>  <span class="c1"># Must be list</span>
-    <span class="n">sampling_params</span><span class="p">:</span> <span class="n">SamplingParams</span> <span class="o">|</span> <span class="nb">list</span><span class="p">[</span><span class="n">SamplingParams</span><span class="p">]</span>  <span class="c1"># Required</span>
-<span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
-</pre></div>
-</div>
-</li>
-<li><p><strong>Key differences</strong>:</p>
-<ol class="arabic simple">
-<li><p>prompts MUST be a list (cannot pass single string)</p></li>
-<li><p>Parameters like max_tokens CANNOT be passed directly</p></li>
-<li><p>MUST use sampling_params parameter</p></li>
-</ol>
-</li>
-<li><p><strong>Status</strong>: FIXED - updated all examples</p></li>
-</ul>
-</section>
-<section id="issue-2-3-wrong-api-server-entry-point-fixed">
-<h4>Issue 2.3: Wrong API Server Entry Point [FIXED ✓]<a class="headerlink" href="#issue-2-3-wrong-api-server-entry-point-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation used</strong>: <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">atom.entrypoints.api_server</span></code></p></li>
-<li><p><strong>Actual module</strong>: <code class="docutils literal notranslate"><span class="pre">atom.entrypoints.openai_server</span></code></p></li>
-<li><p><strong>Impact</strong>: Server startup command would fail</p></li>
-<li><p><strong>Status</strong>: FIXED</p></li>
-</ul>
-</section>
-</section>
-<section id="api-documentation-docs-api-serving-rst">
-<h3>3. API Documentation (<code class="docutils literal notranslate"><span class="pre">docs/api/serving.rst</span></code>)<a class="headerlink" href="#api-documentation-docs-api-serving-rst" title="Link to this heading"></a></h3>
-<section id="issue-3-1-class-name-mismatch-fixed">
-<h4>Issue 3.1: Class Name Mismatch [FIXED ✓]<a class="headerlink" href="#issue-3-1-class-name-mismatch-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation</strong>: LLM class</p></li>
-<li><p><strong>Actual</strong>: LLMEngine class</p></li>
-<li><p><strong>Status</strong>: FIXED - renamed throughout</p></li>
-</ul>
-</section>
-<section id="issue-3-2-samplingparams-attributes-wrong-fixed">
-<h4>Issue 3.2: SamplingParams Attributes Wrong [FIXED ✓]<a class="headerlink" href="#issue-3-2-samplingparams-attributes-wrong-fixed" title="Link to this heading"></a></h4>
-<ul>
-<li><p><strong>Documentation claimed these exist</strong>:</p>
-<ul class="simple">
-<li><p>top_p</p></li>
-<li><p>top_k</p></li>
-<li><p>presence_penalty</p></li>
-<li><p>frequency_penalty</p></li>
-</ul>
-</li>
-<li><p><strong>Actual SamplingParams</strong> (sampling_params.py lines 8-13):</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span>
-<span class="k">class</span><span class="w"> </span><span class="nc">SamplingParams</span><span class="p">:</span>
-    <span class="n">temperature</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mf">1.0</span>
-    <span class="n">max_tokens</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">64</span>
-    <span class="n">ignore_eos</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
-    <span class="n">stop_strings</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
-</pre></div>
-</div>
-</li>
-<li><p><strong>Status</strong>: FIXED - documented actual parameters, noted missing ones</p></li>
-</ul>
-</section>
-<section id="issue-3-3-wrong-return-type-fixed">
-<h4>Issue 3.3: Wrong Return Type [FIXED ✓]<a class="headerlink" href="#issue-3-3-wrong-return-type-fixed" title="Link to this heading"></a></h4>
-<ul class="simple">
-<li><p><strong>Documentation claimed</strong>: Returns <code class="docutils literal notranslate"><span class="pre">list[RequestOutput]</span></code></p></li>
-<li><p><strong>Actual</strong>: Returns <code class="docutils literal notranslate"><span class="pre">list[str]</span></code> (llm_engine.py line 102)</p></li>
-<li><p><strong>Impact</strong>: Examples trying to access <code class="docutils literal notranslate"><span class="pre">.text</span></code>, <code class="docutils literal notranslate"><span class="pre">.prompt</span></code> would crash</p></li>
-<li><p><strong>Status</strong>: FIXED - documented actual return type</p></li>
-</ul>
-</section>
-</section>
-</section>
-<section id="files-fixed">
-<h2>Files Fixed<a class="headerlink" href="#files-fixed" title="Link to this heading"></a></h2>
-<p>All issues have been resolved:</p>
-<ol class="arabic simple">
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/installation.rst</span></code> - Python version, verification code</p></li>
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/quickstart.rst</span></code> - Class name, generate() signature, all examples</p></li>
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/api/serving.rst</span></code> - Class name, parameters, return types</p></li>
-</ol>
-</section>
-<section id="summary-of-changes">
-<h2>Summary of Changes<a class="headerlink" href="#summary-of-changes" title="Link to this heading"></a></h2>
-<section id="before-broken-examples">
-<h3>Before (Broken Examples)<a class="headerlink" href="#before-broken-examples" title="Link to this heading"></a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atom</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>  <span class="c1"># Wrong class name</span>
+  <section id="model-run-guide">
+<h1>Model Run Guide<a class="headerlink" href="#model-run-guide" title="Link to this heading"></a></h1>
+<p>Ready-to-use commands for serving models on ATOM with AMD Instinct MI355X / MI300X GPUs. Each model recipe below is validated in nightly CI.</p>
+<section id="quick-start">
+<h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading"></a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Pull the latest ATOM container</span>
+docker<span class="w"> </span>pull<span class="w"> </span>rocm/atom:latest
 
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;llama-2-7b&quot;</span><span class="p">)</span>
-<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="s2">&quot;Hello&quot;</span><span class="p">,</span> <span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">)</span>  <span class="c1"># Wrong signature</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span><span class="p">)</span>  <span class="c1"># Wrong return type</span>
+<span class="c1"># Start the container</span>
+docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </span>--device<span class="o">=</span>/dev/kfd<span class="w"> </span>--device<span class="o">=</span>/dev/dri<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--group-add<span class="w"> </span>video<span class="w"> </span>--ipc<span class="o">=</span>host<span class="w"> </span>--shm-size<span class="o">=</span>16G<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--privileged<span class="w"> </span>--cap-add<span class="o">=</span>SYS_PTRACE<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-e<span class="w"> </span><span class="nv">HF_TOKEN</span><span class="o">=</span><span class="nv">$HF_TOKEN</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>rocm/atom:latest
 </pre></div>
 </div>
 </section>
-<section id="after-working-examples">
-<h3>After (Working Examples)<a class="headerlink" href="#after-working-examples" title="Link to this heading"></a></h3>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">atom</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLMEngine</span><span class="p">,</span> <span class="n">SamplingParams</span>  <span class="c1"># Correct imports</span>
-
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLMEngine</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;llama-2-7b&quot;</span><span class="p">)</span>
-<span class="n">sampling_params</span> <span class="o">=</span> <span class="n">SamplingParams</span><span class="p">(</span><span class="n">max_tokens</span><span class="o">=</span><span class="mi">50</span><span class="p">)</span>
-<span class="n">outputs</span> <span class="o">=</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">([</span><span class="s2">&quot;Hello&quot;</span><span class="p">],</span> <span class="n">sampling_params</span><span class="p">)</span>  <span class="c1"># Correct signature</span>
-<span class="nb">print</span><span class="p">(</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">])</span>  <span class="c1"># Correct - returns strings</span>
+<section id="supported-models">
+<h2>Supported Models<a class="headerlink" href="#supported-models" title="Link to this heading"></a></h2>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>Model</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Precision</p></th>
+<th class="head"><p>TP</p></th>
+<th class="head"><p>Recipe</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>DeepSeek-R1-0528</p></td>
+<td><p>MoE + MLA</p></td>
+<td><p>FP8 / MXFP4</p></td>
+<td><p>8</p></td>
+<td><p><span class="xref myst">recipes/DeepSeek-R1.md</span></p></td>
+</tr>
+<tr class="row-odd"><td><p>GLM-5</p></td>
+<td><p>MoE + MLA</p></td>
+<td><p>FP8</p></td>
+<td><p>8</p></td>
+<td><p><span class="xref myst">recipes/GLM-5.md</span></p></td>
+</tr>
+<tr class="row-even"><td><p>GPT-OSS-120B</p></td>
+<td><p>MoE</p></td>
+<td><p>FP8</p></td>
+<td><p>1</p></td>
+<td><p><span class="xref myst">recipes/GPT-OSS.md</span></p></td>
+</tr>
+<tr class="row-odd"><td><p>Kimi-K2.5</p></td>
+<td><p>MoE</p></td>
+<td><p>MXFP4</p></td>
+<td><p>4</p></td>
+<td><p><span class="xref myst">recipes/Kimi-K2.5.md</span></p></td>
+</tr>
+<tr class="row-even"><td><p>Kimi-K2-Thinking</p></td>
+<td><p>MoE</p></td>
+<td><p>FP8</p></td>
+<td><p>8</p></td>
+<td><p><span class="xref myst">recipes/Kimi-K2-Thinking.md</span></p></td>
+</tr>
+<tr class="row-odd"><td><p>Qwen3-235B</p></td>
+<td><p>MoE</p></td>
+<td><p>FP8</p></td>
+<td><p>8</p></td>
+<td><p><span class="xref myst">recipes/Qwen3-235b.md</span></p></td>
+</tr>
+<tr class="row-even"><td><p>Qwen3-Next</p></td>
+<td><p>MoE</p></td>
+<td><p>FP8</p></td>
+<td><p>8</p></td>
+<td><p><span class="xref myst">recipes/Qwen3-Next.md</span></p></td>
+</tr>
+</tbody>
+</table>
+<section id="vllm-plugin-backend">
+<h3>vLLM Plugin Backend<a class="headerlink" href="#vllm-plugin-backend" title="Link to this heading"></a></h3>
+<p>ATOM also runs as a vLLM plugin backend. See recipes under <a class="reference internal" href="#../recipes/atom_vllm/"><span class="xref myst">recipes/atom_vllm/</span></a> for vLLM-integrated serving.</p>
+</section>
+</section>
+<section id="nightly-ci-benchmark-configurations">
+<h2>Nightly CI Benchmark Configurations<a class="headerlink" href="#nightly-ci-benchmark-configurations" title="Link to this heading"></a></h2>
+<p>The nightly CI sweeps these configurations for every model:</p>
+<table class="docutils align-default">
+<thead>
+<tr class="row-odd"><th class="head"><p>ISL</p></th>
+<th class="head"><p>OSL</p></th>
+<th class="head"><p>Concurrency Levels</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>1024</p></td>
+<td><p>1024</p></td>
+<td><p>1, 2, 4, 8, 16, 32, 64, 128, 256</p></td>
+</tr>
+<tr class="row-odd"><td><p>8192</p></td>
+<td><p>1024</p></td>
+<td><p>1, 2, 4, 8, 16, 32, 64, 128, 256</p></td>
+</tr>
+</tbody>
+</table>
+<p>Run a benchmark against a running ATOM server:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>atom.benchmarks.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model<span class="w"> </span>&lt;model_name_or_path&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--backend<span class="w"> </span>vllm<span class="w"> </span>--base-url<span class="w"> </span>http://localhost:8000<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-name<span class="w"> </span>random<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--random-input-len<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--random-output-len<span class="w"> </span><span class="m">1024</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max-concurrency<span class="w"> </span><span class="m">128</span><span class="w"> </span>--num-prompts<span class="w"> </span><span class="m">1280</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--random-range-ratio<span class="w"> </span><span class="m">0</span>.8<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--request-rate<span class="w"> </span>inf<span class="w"> </span>--ignore-eos
 </pre></div>
 </div>
-</section>
-</section>
-<section id="statistics">
-<h2>Statistics<a class="headerlink" href="#statistics" title="Link to this heading"></a></h2>
+<p>Key parameters:</p>
 <ul class="simple">
-<li><p><strong>Total issues found</strong>: 8</p></li>
-<li><p><strong>Critical severity</strong>: 8 (all would cause code to fail)</p></li>
-<li><p><strong>High severity</strong>: 0</p></li>
-<li><p><strong>Medium severity</strong>: 0</p></li>
-<li><p><strong>Low severity</strong>: 0</p></li>
-<li><p><strong>Issues fixed</strong>: 8 (100%)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--random-range-ratio</span> <span class="pre">0.8</span></code> — adds ±20% jitter to sequence lengths</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--num-prompts</span></code> — typically <code class="docutils literal notranslate"><span class="pre">concurrency</span> <span class="pre">×</span> <span class="pre">10</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--request-rate</span> <span class="pre">inf</span></code> — closed-loop benchmarking (no inter-request delay)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">--ignore-eos</span></code> — forces full output length generation</p></li>
 </ul>
 </section>
-<section id="testing-recommendations">
-<h2>Testing Recommendations<a class="headerlink" href="#testing-recommendations" title="Link to this heading"></a></h2>
-<p>To prevent future documentation errors:</p>
-<ol class="arabic simple">
-<li><p><strong>Add Documentation Tests</strong>:</p>
-<ul class="simple">
-<li><p>Extract all code examples from .rst files</p></li>
-<li><p>Run them as integration tests in CI/CD</p></li>
-<li><p>Fail build if examples don’t execute</p></li>
-</ul>
-</li>
-<li><p><strong>Auto-generate API Docs</strong>:</p>
-<ul class="simple">
-<li><p>Use Sphinx autodoc to generate from docstrings</p></li>
-<li><p>Ensures signatures stay in sync with code</p></li>
-</ul>
-</li>
-<li><p><strong>Version Checks</strong>:</p>
-<ul class="simple">
-<li><p>Add CI check that verifies Python version in docs matches pyproject.toml</p></li>
-<li><p>Validate package names in installation instructions</p></li>
-</ul>
-</li>
-</ol>
-</section>
-<section id="files-reviewed">
-<h2>Files Reviewed<a class="headerlink" href="#files-reviewed" title="Link to this heading"></a></h2>
-<ul class="simple">
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/installation.rst</span></code></p></li>
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/quickstart.rst</span></code></p></li>
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/api/serving.rst</span></code></p></li>
-<li><p>✓ <code class="docutils literal notranslate"><span class="pre">docs/api/models.rst</span></code></p></li>
-</ul>
-</section>
-<section id="conclusion">
-<h2>Conclusion<a class="headerlink" href="#conclusion" title="Link to this heading"></a></h2>
-<p>All critical errors have been fixed. The documentation now accurately reflects the actual ATOM API:</p>
-<ul class="simple">
-<li><p>Correct class name (LLMEngine)</p></li>
-<li><p>Correct method signatures</p></li>
-<li><p>Correct parameter names</p></li>
-<li><p>Correct return types</p></li>
-<li><p>Correct Python version requirements</p></li>
-</ul>
-<p>Users should now be able to successfully follow the documentation.</p>
-<hr class="docutils" />
-<p><strong>Report Generated:</strong> 2026-02-14
-<strong>Status:</strong> All issues resolved ✓</p>
+<section id="live-dashboard">
+<h2>Live Dashboard<a class="headerlink" href="#live-dashboard" title="Link to this heading"></a></h2>
+<p>Nightly benchmark results are published to the <a class="reference external" href="https://rocm.github.io/ATOM/benchmark-dashboard/">ATOM Benchmark Dashboard</a>.</p>
+<p>Competitive comparison (MI355X vs B200/B300) is available on the <a class="reference external" href="https://rocm.github.io/AI-Frameworks-Dashboard/atom-benchmark/">AI Frameworks Dashboard</a>.</p>
 </section>
 </section>
 
 
            </div>
           </div>
-          <footer>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="quickstart.html" class="btn btn-neutral float-left" title="Quickstart" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="architecture_guide.html" class="btn btn-neutral float-right" title="ATOM Architecture Guide" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
 
   <hr/>
 

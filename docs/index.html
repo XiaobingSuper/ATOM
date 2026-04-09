@@ -65,6 +65,16 @@
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="model_run_guide.html#vllm-plugin-backend">vLLM Plugin Backend</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+</ul>
+</li>
 </ul>
 <p class="caption" role="heading"><span class="caption-text">User Guides</span></p>
 <ul>
@@ -549,6 +559,13 @@
 <li class="toctree-l2"><a class="reference internal" href="quickstart.html#next-steps">Next Steps</a></li>
 </ul>
 </li>
+<li class="toctree-l1"><a class="reference internal" href="model_run_guide.html">Model Run Guide</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#supported-models">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#nightly-ci-benchmark-configurations">Nightly CI Benchmark Configurations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="model_run_guide.html#live-dashboard">Live Dashboard</a></li>
+</ul>
+</li>
 </ul>
 </div>
 <div class="toctree-wrapper compound">
@@ -716,20 +733,20 @@
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p>AMD Instinct MI300X</p></td>
+<tr class="row-even"><td><p>AMD Instinct MI355X</p></td>
+<td><p>CDNA 4 (gfx950)</p></td>
+<td><p>288 GB HBM3e</p></td>
+<td><p>✅ Fully Supported (primary CI target)</p></td>
+</tr>
+<tr class="row-odd"><td><p>AMD Instinct MI300X</p></td>
 <td><p>CDNA 3 (gfx942)</p></td>
 <td><p>192 GB HBM3</p></td>
 <td><p>✅ Fully Supported</p></td>
 </tr>
-<tr class="row-odd"><td><p>AMD Instinct MI250X</p></td>
+<tr class="row-even"><td><p>AMD Instinct MI250X</p></td>
 <td><p>CDNA 2 (gfx90a)</p></td>
 <td><p>128 GB HBM2e</p></td>
 <td><p>✅ Fully Supported</p></td>
-</tr>
-<tr class="row-even"><td><p>AMD Instinct MI300A</p></td>
-<td><p>CDNA 3 (gfx950)</p></td>
-<td><p>128 GB HBM3</p></td>
-<td><p>🧪 Experimental</p></td>
 </tr>
 </tbody>
 </table>
