@@ -20,6 +20,7 @@ from aiter import (
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
+from aiter.tuned_gemm_fusion import gemm_a16w16_tp_allreduce
 from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig
@@ -399,13 +400,25 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
+        use_tp_allreduce = self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results
+        handled_tp_allreduce = False
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            if use_tp_allreduce:
+                y = gemm_a16w16_tp_allreduce(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                    ca_fp8_quant=False,
+                )
+                handled_tp_allreduce = True
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
         else:
             if x_scale is None:
                 quant_func = self.quant_func
@@ -472,7 +485,7 @@ class LinearBase(nn.Module):
                 )
                 if self.bias is not None:
                     y += self.bias
-        if self.tp_dim == 1 and self.tp_size > 1 and self.reduce_results:
+        if use_tp_allreduce and not handled_tp_allreduce:
             y = get_tp_group().all_reduce(y, ca_fp8_quant=False)
         return y
 

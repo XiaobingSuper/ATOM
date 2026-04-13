@@ -1371,16 +1371,24 @@ class DeepseekV2MLAAttention(nn.Module):
                 source_quant_dtype if is_rocm_aiter_fp4bmm_enabled() else None
             ),
         )
+        # self.o_proj = RowParallelLinear(
+        #     self.num_heads * self.v_head_dim,
+        #     self.hidden_size,
+        #     bias=False,
+        #     quant_config=base_quant_config,
+        #     reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+        #     prefix=f"{prefix}.o_proj",
+        #     source_quant_dtype=None,
+        # )
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
             self.hidden_size,
             bias=False,
             quant_config=base_quant_config,
-            reduce_results=not ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            reduce_results=True,
             prefix=f"{prefix}.o_proj",
             source_quant_dtype=None,
         )
-
         rope_params = config.rope_parameters
         rope_theta = rope_params.get("rope_theta") or 10000
         # Only use YaRN scaling when config has it (e.g. DeepSeek with factor/type "yarn").
@@ -1685,10 +1693,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             and self.layer_idx > 0
             and not is_mtp_block,
         )
+        # self.post_attention_layernorm = RMSNorm(
+        #     config.hidden_size,
+        #     eps=config.rms_norm_eps,
+        #     fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+        # )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size,
             eps=config.rms_norm_eps,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION,
+            fused_allreduce=False,
         )
         self.routed_scaling_factor = config.routed_scaling_factor
         self.fuse_rmsnorm_quant = (
