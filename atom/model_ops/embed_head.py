@@ -115,8 +115,11 @@ class VocabParallelEmbedding(nn.Module):
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
         self.vocab_end_idx = self.vocab_start_idx + self.num_embeddings_per_partition
+        # Inference serving only; match LinearBase (requires_grad=False). Avoids
+        # FlyDSL/tgemm JIT rejecting weight operands that still have requires_grad.
         self.weight = nn.Parameter(
-            torch.empty(self.num_embeddings_per_partition, embedding_dim)
+            torch.empty(self.num_embeddings_per_partition, embedding_dim),
+            requires_grad=False,
         )
         self.weight.weight_loader = self.weight_loader
 
@@ -160,7 +163,9 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         super().__init__(num_embeddings, embedding_dim)
         if bias:
-            self.bias = nn.Parameter(torch.empty(self.num_embeddings_per_partition))
+            self.bias = nn.Parameter(
+                torch.empty(self.num_embeddings_per_partition), requires_grad=False
+            )
             self.bias.weight_loader = self.weight_loader
         else:
             self.register_parameter("bias", None)
