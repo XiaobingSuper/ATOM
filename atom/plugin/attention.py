@@ -345,17 +345,18 @@ class vllmAttentionMetadataBuilderMethods:
         )
 
         if mixed:
-            prefill_max_query_len = (
-                query_lens_cpu[num_decodes + num_extends :].max().item()
-            )
-            prefill_max_seq_len = seq_lens[num_decodes + num_extends :].max().item()
-            prefill_query_start_loc = (
-                prefill_query_start_loc[num_decodes + num_extends :]
-                - prefill_query_start_loc[num_decodes + num_extends]
-            )
-            decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
-            decode_max_seq_len = seq_lens[:num_decodes].max().item()
-            decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
+            prefill_start = num_decodes + num_extends
+            if num_prefills > 0:
+                prefill_max_query_len = query_lens_cpu[prefill_start:].max().item()
+                prefill_max_seq_len = seq_lens[prefill_start:].max().item()
+                prefill_query_start_loc = (
+                    prefill_query_start_loc[prefill_start:]
+                    - prefill_query_start_loc[prefill_start]
+                )
+            if num_decodes > 0:
+                decode_max_query_len = query_lens_cpu[:num_decodes].max().item()
+                decode_max_seq_len = seq_lens[:num_decodes].max().item()
+                decode_query_start_loc = decode_query_start_loc[: num_decodes + 1]
 
         prefill_metadata = None
         decode_metadata = None
