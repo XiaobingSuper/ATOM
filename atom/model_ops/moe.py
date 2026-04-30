@@ -58,6 +58,26 @@ from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
+def _use_generic_swiglu_mxfp4_layout() -> bool:
+    return os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "1") == "1"
+
+
+def _shuffle_generic_mxfp4_weight_scale(
+    scale: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if scale is None:
+        return None
+    if scale.ndim < 2:
+        return fp4_utils.e8m0_shuffle(scale)
+    # Generic preshuffle packs the combined [expert, row] axis, not experts alone.
+    rows = 1
+    for dim in scale.shape[:-1]:
+        rows *= dim
+    return fp4_utils.e8m0_shuffle(scale.reshape(rows, scale.shape[-1])).reshape(
+        scale.shape
+    )
+
+
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
 
@@ -817,10 +837,16 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
+        bias_dtype = (
+            self.moe.in_dtype
+            if layer.activation == ActivationType.Swiglu
+            and self.quant_type == QuantType.per_1x32
+            else torch.float32
+        )
         if layer.w13_bias is not None:
-            layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
+            layer.w13_bias.data = layer.w13_bias.data.to(bias_dtype)
         if layer.w2_bias is not None:
-            layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+            layer.w2_bias.data = layer.w2_bias.data.to(bias_dtype)
 
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
@@ -868,24 +894,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 .contiguous()
                 .view(e, n, -1)
             )
-            layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
-            shuffled_w13_scale = shuffle_scale_a16w4(
-                layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
-                self.num_experts,
-                True,
-            )
-            layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
-            shuffled_w2_scale = shuffle_scale_a16w4(
-                layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
-                self.num_experts,
-                False,
-            )
             if layer.w13_bias is not None:
                 layer.w13_bias.data = (
                     layer.w13_bias.data.view(-1, n // 2, 2)
                     .permute(0, 2, 1)
                     .contiguous()
                     .view(-1, n)
+                )
+
+            if _use_generic_swiglu_mxfp4_layout():
+                # New GPT-OSS A4W4 Swiglu path: use the same generic preshuffle
+                # layout for bf16 and fp4x2 activations.
+                shuffle_weights(layer.w13_weight, layer.w2_weight)
+                shuffled_w13_scale, shuffled_w2_scale = (
+                    _shuffle_generic_mxfp4_weight_scale(layer.w13_weight_scale),
+                    _shuffle_generic_mxfp4_weight_scale(layer.w2_weight_scale),
+                )
+            else:
+                # Legacy path: keep the original A16W4-style Swiglu layout.
+                layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+                shuffled_w13_scale = shuffle_scale_a16w4(
+                    layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
+                    self.num_experts,
+                    True,
+                )
+                layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
+                shuffled_w2_scale = shuffle_scale_a16w4(
+                    layer.w2_weight_scale.view(-1, layer.w2_weight_scale.shape[-1]),
+                    self.num_experts,
+                    False,
                 )
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
