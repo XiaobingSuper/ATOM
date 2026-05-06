@@ -837,16 +837,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
-        bias_dtype = (
-            self.moe.in_dtype
-            if layer.activation == ActivationType.Swiglu
-            and self.quant_type == QuantType.per_1x32
-            else torch.float32
-        )
         if layer.w13_bias is not None:
-            layer.w13_bias.data = layer.w13_bias.data.to(bias_dtype)
+            layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
-            layer.w2_bias.data = layer.w2_bias.data.to(bias_dtype)
+            layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
