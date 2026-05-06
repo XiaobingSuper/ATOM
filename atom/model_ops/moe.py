@@ -59,7 +59,7 @@ from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
 
 def _use_generic_swiglu_mxfp4_layout() -> bool:
-    return os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "1") == "1"
+    return os.environ.get("GPTOSS_USE_GENERIC_SWIGLU_MXFP4_LAYOUT", "0") == "1"
 
 
 def _shuffle_generic_mxfp4_weight_scale(
