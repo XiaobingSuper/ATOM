@@ -70,10 +70,7 @@ def _shuffle_generic_mxfp4_weight_scale(
     if scale.ndim < 2:
         return fp4_utils.e8m0_shuffle(scale)
     # Generic preshuffle packs the combined [expert, row] axis, not experts alone.
-    rows = 1
-    for dim in scale.shape[:-1]:
-        rows *= dim
-    return fp4_utils.e8m0_shuffle(scale.reshape(rows, scale.shape[-1])).reshape(
+    return fp4_utils.e8m0_shuffle(scale.reshape(-1, scale.shape[-1])).reshape(
         scale.shape
     )
 
@@ -921,15 +918,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # quark method for moe, split it out?
         elif self.quant_method == "quark":
             shuffle_weights(layer.w13_weight, layer.w2_weight)
-            s0, s1, _ = layer.w13_weight_scale.shape
-            w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
-            w13_weight_scale = fp4_utils.e8m0_shuffle(w13_weight_scale)
-            layer.w13_weight_scale.data = w13_weight_scale.view(s0, s1, -1)
-
-            s0, s1, _ = layer.w2_weight_scale.shape
-            w2_weight_scale = layer.w2_weight_scale.view(s0 * s1, -1)
-            w2_weight_scale = fp4_utils.e8m0_shuffle(w2_weight_scale)
-            layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
+            layer.w13_weight_scale.data = _shuffle_generic_mxfp4_weight_scale(
+                layer.w13_weight_scale
+            )
+            layer.w2_weight_scale.data = _shuffle_generic_mxfp4_weight_scale(
+                layer.w2_weight_scale
+            )
             return
         else:
             shuffle_weights(layer.w13_weight, layer.w2_weight)
