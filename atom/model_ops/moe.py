@@ -859,8 +859,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale = None
             return
 
-        # quark method for moe, split it out?
-        elif self.quant_method == "quark":
+        elif self.quant_method == "quark" or not self.is_guinterleave:
             shuffle_weights(layer.w13_weight, layer.w2_weight)
             s0, s1, _ = layer.w13_weight_scale.shape
             w13_weight_scale = layer.w13_weight_scale.view(s0 * s1, -1)
@@ -873,39 +872,31 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale.data = w2_weight_scale.view(s0, s1, -1)
             return
         else:
-            # shuffle weight
+            # self.is_guinterleave is True
             layer.w13_weight.data = shuffle_weight(
                 layer.w13_weight,
-                is_guinterleave=self.is_guinterleave,
+                is_guinterleave=True,
                 gate_up=True,
             )
             layer.w2_weight.data = shuffle_weight(
                 layer.w2_weight,
-                is_guinterleave=self.is_guinterleave,
+                is_guinterleave=True,
                 gate_up=False,
             )
-
-            # shuffle scale
-            if self.is_guinterleave:
-                w13_scale_2d = layer.w13_weight_scale.view(
-                    -1, layer.w13_weight_scale.shape[-1]
-                )
-                w2_scale_2d = layer.w2_weight_scale.view(
-                    -1, layer.w2_weight_scale.shape[-1]
-                )
-            else:
-                w13_scale_2d = layer.w13_weight_scale.view(self.num_experts, -1)
-                w2_scale_2d = layer.w2_weight_scale.view(self.num_experts, -1)
-
             shuffled_w13_scale = shuffle_scale(
-                w13_scale_2d, self.num_experts, self.is_guinterleave, True
+                layer.w13_weight_scale.reshape(-1, layer.w13_weight_scale.shape[-1]),
+                self.num_experts,
+                True,
+                True,
             )
             shuffled_w2_scale = shuffle_scale(
-                w2_scale_2d, self.num_experts, self.is_guinterleave, False
+                layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1]),
+                self.num_experts,
+                True,
+                False,
             )
-
-        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
-        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+            layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
+            layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
