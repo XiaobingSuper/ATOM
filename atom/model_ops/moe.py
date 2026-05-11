@@ -883,6 +883,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 is_guinterleave=True,
                 gate_up=False,
             )
+            layer.w13_weight.is_shuffled = True
+            layer.w2_weight.is_shuffled = True
             shuffled_w13_scale = shuffle_scale(
                 layer.w13_weight_scale.reshape(-1, layer.w13_weight_scale.shape[-1]),
                 self.num_experts,
