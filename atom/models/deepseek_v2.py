@@ -130,6 +130,22 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _can_fuse_indexer_wk_weights_proj(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    indexer_prefix: str,
+) -> bool:
+    if not hasattr(config, "index_topk"):
+        return False
+    if quant_config is None:
+        return True
+
+    wk_quant_config = quant_config.get_layer_quant_config(f"{indexer_prefix}.wk")
+    if wk_quant_config.quant_type == QuantType.No:
+        return True
+    return wk_quant_config.quant_dtype == dtypes.fp8
+
+
 def _fuse_rmsnorm_fp4_quant_fake(
     x1: torch.Tensor,
     x1_weight: torch.Tensor,
@@ -1291,6 +1307,7 @@ class Indexer(nn.Module):
         quant_config: Optional[QuantizationConfig],
         cache_config: str,
         topk_indices_buffer: Optional[torch.Tensor],
+        use_wk_weights_proj_fusion: bool = True,
         prefix: str = "",
     ):
         super().__init__()
@@ -1310,12 +1327,28 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.wk_weights_proj = IndexerWkWeightsProjLinear(
-            hidden_size,
-            self.head_dim,
-            self.n_head,
-            prefix=f"{prefix}.wk_weights_proj",
-        )
+        self.use_wk_weights_proj_fusion = use_wk_weights_proj_fusion
+        if self.use_wk_weights_proj_fusion:
+            self.wk_weights_proj = IndexerWkWeightsProjLinear(
+                hidden_size,
+                self.head_dim,
+                self.n_head,
+                prefix=f"{prefix}.wk_weights_proj",
+            )
+        else:
+            self.wk = ReplicatedLinear(
+                hidden_size,
+                self.head_dim,
+                bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.wk",
+            )
+            self.weights_proj = ReplicatedLinear(
+                hidden_size,
+                self.n_head,
+                quant_config=None,
+                prefix=f"{prefix}.weights_proj",
+            )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
         self.softmax_scale = self.head_dim**-0.5
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
@@ -1355,11 +1388,15 @@ class Indexer(nn.Module):
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
 
-        k, weights = torch.split(
-            self.wk_weights_proj(hidden_states),
-            [self.head_dim, self.n_head],
-            dim=-1,
-        )
+        if self.use_wk_weights_proj_fusion:
+            k, weights = torch.split(
+                self.wk_weights_proj(hidden_states),
+                [self.head_dim, self.n_head],
+                dim=-1,
+            )
+        else:
+            k = self.wk(hidden_states)
+            weights = self.weights_proj(hidden_states)
         k = k.contiguous()
         weights = weights.contiguous()
 
@@ -1445,6 +1482,7 @@ class DeepseekV2MLAAttention(nn.Module):
 
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        model_quant_config = quant_config
 
         self.num_heads = num_heads
         tp_size = get_tensor_model_parallel_world_size()
@@ -1606,6 +1644,11 @@ class DeepseekV2MLAAttention(nn.Module):
                 base_quant_config,
                 cache_config,
                 topk_indices_buffer,
+                _can_fuse_indexer_wk_weights_proj(
+                    config,
+                    model_quant_config,
+                    f"{prefix}.indexer",
+                ),
                 f"{prefix}.indexer",
             )
         else:
@@ -2096,26 +2139,35 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.config = config
         self.quant_config = quant_config
 
+        model_prefix = maybe_prefix(prefix, "model")
+        use_indexer_wk_weights_proj_fusion = _can_fuse_indexer_wk_weights_proj(
+            config,
+            quant_config,
+            f"{model_prefix}.layers.0.self_attn.indexer",
+        )
         if hasattr(config, "q_lora_rank") and config.q_lora_rank is not None:
             self.packed_modules_mapping = {
                 "q_a_proj": ("fused_qkv_a_proj", 0),
                 "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
-                "indexer.wk": ("indexer.wk_weights_proj", 0),
-                "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
             }
         else:
             self.packed_modules_mapping = {
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
-                "indexer.wk": ("indexer.wk_weights_proj", 0),
-                "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
             }
+        if use_indexer_wk_weights_proj_fusion:
+            self.packed_modules_mapping.update(
+                {
+                    "indexer.wk": ("indexer.wk_weights_proj", 0),
+                    "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
+                }
+            )
 
         self.model = DeepseekV2Model(
             atom_config=atom_config,
-            prefix=maybe_prefix(prefix, "model"),
+            prefix=model_prefix,
             layer_type=layer_type,
         )
         if get_pp_group().is_last_rank:
