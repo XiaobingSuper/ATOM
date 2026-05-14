@@ -1026,6 +1026,7 @@ def sparse_attn_indexer(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     weights_scale: float,
+    is_neox_style: bool,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -1066,7 +1067,7 @@ def sparse_attn_indexer(
             scale_fmt,
             weights_scale,
             preshuffle=True,
-            is_neox=True,
+            is_neox=is_neox_style,
         )
         weights = weights_out
     elif fuse_k_norm_rope_cache:
@@ -1083,7 +1084,7 @@ def sparse_attn_indexer(
             quant_block_size,
             scale_fmt,
             preshuffle=True,
-            is_neox=True,
+            is_neox=is_neox_style,
         )
     else:
         indexer_k_quant_and_cache(
@@ -1217,6 +1218,7 @@ def sparse_attn_indexer_fake(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     weights_scale: float,
+    is_neox_style: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1495,6 +1497,7 @@ class Indexer(nn.Module):
             rotary_emb.cos_cache,
             rotary_emb.sin_cache,
             self._weights_scale,
+            rotary_emb.is_neox_style,
         )
 
 
