@@ -14,11 +14,6 @@ def _scale_indexer_weights_kernel(
     q_scale_ptr,  # [T, H, 1] fp32, flattened as [T * H]
     out_ptr,  # [T, H] fp32
     n_elements,
-    n_cols: tl.constexpr,
-    weights_stride_t: tl.constexpr,
-    weights_stride_h: tl.constexpr,
-    q_scale_stride_t: tl.constexpr,
-    q_scale_stride_h: tl.constexpr,
     weights_scale: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -26,17 +21,8 @@ def _scale_indexer_weights_kernel(
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
 
-    rows = offsets // n_cols
-    cols = offsets % n_cols
-    weights_offsets = rows * weights_stride_t + cols * weights_stride_h
-    q_scale_offsets = rows * q_scale_stride_t + cols * q_scale_stride_h
-
-    weights = tl.load(weights_ptr + weights_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
-    q_scale = tl.load(q_scale_ptr + q_scale_offsets, mask=mask, other=0.0).to(
-        tl.float32
-    )
+    weights = tl.load(weights_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
+    q_scale = tl.load(q_scale_ptr + offsets, mask=mask, other=0.0).to(tl.float32)
     tl.store(out_ptr + offsets, weights * q_scale * weights_scale, mask=mask)
 
 
@@ -52,13 +38,12 @@ def scale_indexer_weights(
         weights.size(0),
         weights.size(1),
         1,
-    ), (
-        f"q_scale shape {tuple(q_scale.shape)} incompatible with weights "
-        f"{tuple(weights.shape)}"
-    )
+    ), f"q_scale shape {tuple(q_scale.shape)} incompatible with weights {tuple(weights.shape)}"
+    assert weights.is_contiguous(), "weights must be contiguous"
+    assert q_scale.is_contiguous(), "q_scale must be contiguous"
 
     n_elements = weights.numel()
-    out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+    out = torch.empty_like(weights, dtype=torch.float32)
     if n_elements == 0:
         return out
 
@@ -68,11 +53,6 @@ def scale_indexer_weights(
         q_scale,
         out,
         n_elements,
-        weights.size(1),
-        weights.stride(0),
-        weights.stride(1),
-        q_scale.stride(0),
-        q_scale.stride(1),
         weights_scale,
         BLOCK_SIZE=block_size,
     )
