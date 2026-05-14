@@ -34,10 +34,7 @@ from aiter import (
     fused_qk_rmsnorm,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
-    indexer_k_quant_and_cache,
-    indexer_k_norm_rope_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
-    rope_cached_positions_fwd_inplace,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -69,10 +66,6 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
-from atom.model_ops.v4_kernels.indexer_weights import (
-    quant_indexer_q_and_scale_weights,
-    scale_indexer_weights,
-)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -123,9 +116,6 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
-ENABLE_DS_INDEXER_Q_QUANT_FUSION = envs.ATOM_ENABLE_DS_INDEXER_Q_QUANT_FUSION
-ENABLE_DS_INDEXER_K_CACHE_FUSION = envs.ATOM_ENABLE_DS_INDEXER_K_CACHE_FUSION
-ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -413,47 +403,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
         device=device,
     )[..., :qk_rope_head_dim]
     return q_c, q_c_scale, kv_c_normed, k_pe
-
-
-def _indexer_q_rope_inplace_fake(
-    q_pe: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    return q_pe
-
-
-def _indexer_q_rope_inplace(
-    q_pe: torch.Tensor,
-    positions: torch.Tensor,
-    cos_cache: torch.Tensor,
-    sin_cache: torch.Tensor,
-    is_neox_style: bool,
-) -> torch.Tensor:
-    num_tokens = positions.numel()
-    q_view = q_pe.view(1, num_tokens, -1, q_pe.shape[-1])
-    position_view = positions.view(1, num_tokens)
-    rotate_style = 0 if is_neox_style else 1
-    rope_cached_positions_fwd_inplace(
-        q_view,
-        cos_cache,
-        sin_cache,
-        position_view,
-        rotate_style,
-        True,
-        False,
-    )
-    return q_pe
-
-
-direct_register_custom_op(
-    op_name="indexer_q_rope_inplace",
-    op_func=_indexer_q_rope_inplace,
-    mutates_args=["q_pe"],
-    fake_impl=_indexer_q_rope_inplace_fake,
-)
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake(
@@ -1017,8 +966,6 @@ def sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
-    fuse_qk_rope_quant_cache: bool,
-    fuse_k_norm_rope_cache: bool,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1036,65 +983,37 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
-        if fuse_qk_rope_quant_cache:
-            return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-        return weights
+        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
         context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
-    if fuse_qk_rope_quant_cache:
-        q = q_fp8
-        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
-        weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-        indexer_qk_rope_quant_and_cache(
-            q,
-            q_fp8,
-            weights,
-            weights_out,
-            k,
-            kv_cache,
-            slot_mapping,
-            k_norm_weight,
-            k_norm_bias,
-            positions,
-            cos_cache,
-            sin_cache,
-            k_norm_eps,
-            quant_block_size,
-            scale_fmt,
-            weights_scale,
-            preshuffle=True,
-            is_neox=is_neox_style,
-        )
-        weights = weights_out
-    elif fuse_k_norm_rope_cache:
-        indexer_k_norm_rope_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            k_norm_weight,
-            k_norm_bias,
-            positions,
-            cos_cache,
-            sin_cache,
-            k_norm_eps,
-            quant_block_size,
-            scale_fmt,
-            preshuffle=True,
-            is_neox=is_neox_style,
-        )
-    else:
-        indexer_k_quant_and_cache(
-            k,
-            kv_cache,
-            slot_mapping,
-            quant_block_size,
-            scale_fmt,
-            preshuffle=True,
-        )
+    q = q_fp8
+    q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+    weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+    indexer_qk_rope_quant_and_cache(
+        q,
+        q_fp8,
+        weights,
+        weights_out,
+        k,
+        kv_cache,
+        slot_mapping,
+        k_norm_weight,
+        k_norm_bias,
+        positions,
+        cos_cache,
+        sin_cache,
+        k_norm_eps,
+        quant_block_size,
+        scale_fmt,
+        weights_scale,
+        preshuffle=True,
+        is_neox=is_neox_style,
+    )
+    weights = weights_out
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
             return weights
@@ -1209,8 +1128,6 @@ def sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
-    fuse_qk_rope_quant_cache: bool,
-    fuse_k_norm_rope_cache: bool,
     k_norm_weight: torch.Tensor,
     k_norm_bias: torch.Tensor,
     k_norm_eps: float,
@@ -1228,9 +1145,7 @@ def sparse_attn_indexer_fake(
     )
     _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    if fuse_qk_rope_quant_cache:
-        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-    return weights
+    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
@@ -1388,22 +1303,13 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
         self.scale_fmt = "ue8m0"
-        self.quant_func = get_hip_quant(QuantType.per_1x128)
         self.quant_block_size = 128  # TODO: get from config
-        self.fuse_q_quant_weights = (
-            ENABLE_DS_INDEXER_Q_QUANT_FUSION
-            and self.head_dim == self.quant_block_size
-        )
-        self.fuse_k_norm_rope_cache = (
-            ENABLE_DS_INDEXER_K_CACHE_FUSION
-            and self.head_dim == self.quant_block_size
-            and self.rope_dim == self.head_dim // 2
-        )
-        self.fuse_qk_rope_quant_cache = (
-            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
-            and self.fuse_q_quant_weights
-            and self.fuse_k_norm_rope_cache
-        )
+        if self.head_dim != self.quant_block_size or self.rope_dim != self.head_dim // 2:
+            raise ValueError(
+                "DeepSeek-V3.2 fused indexer requires "
+                f"head_dim={self.quant_block_size} and rope_dim={self.head_dim // 2}, "
+                f"got head_dim={self.head_dim}, rope_dim={self.rope_dim}"
+            )
         self.topk_indices_buffer = topk_indices_buffer
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1430,55 +1336,18 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe = q[..., : self.rope_dim]
 
         k, weights = torch.split(
             self.wk_weights_proj(hidden_states),
             [self.head_dim, self.n_head],
             dim=-1,
         )
-        if self.fuse_qk_rope_quant_cache:
-            # q RoPE/quant and k cache write are fused inside sparse_attn_indexer,
-            # where the runtime cache slot mapping is available.
-            pass
-        elif self.fuse_k_norm_rope_cache:
-            q_pe = torch.ops.aiter.indexer_q_rope_inplace(
-                q_pe,
-                positions,
-                rotary_emb.cos_cache,
-                rotary_emb.sin_cache,
-                rotary_emb.is_neox_style,
-            )
-        else:
-            k = self.k_norm(k)
-            k_pe = k[..., : self.rope_dim]
-            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
-
-        # we only quant q here since k quant is fused with cache insertion
-        if self.fuse_qk_rope_quant_cache:
-            q_fp8 = q
-        else:
-            q = q.view(-1, self.head_dim)
-
-        if self.fuse_qk_rope_quant_cache:
-            pass
-        elif self.fuse_q_quant_weights:
-            q_fp8, weights = quant_indexer_q_and_scale_weights(
-                q,
-                weights,
-                self._weights_scale,
-            )
-        else:
-            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
-            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-            q_scale = q_scale.view(-1, self.n_head, 1)
-            weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
-            q_fp8,
+            q,
             k,
             weights,
             self.quant_block_size,
@@ -1488,8 +1357,6 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
-            self.fuse_qk_rope_quant_cache,
-            self.fuse_k_norm_rope_cache,
             self.k_norm.weight,
             self.k_norm.bias,
             self.k_norm.eps,
