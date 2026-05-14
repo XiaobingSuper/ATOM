@@ -964,12 +964,12 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert hidden_states.dim() == 2, (
-            f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
-        )
-        assert hidden_states.shape[1] == self.experts.hidden_size, (
-            f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
-        )
+        assert (
+            hidden_states.dim() == 2
+        ), f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
+        assert (
+            hidden_states.shape[1] == self.experts.hidden_size
+        ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
 
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
