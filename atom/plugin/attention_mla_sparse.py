@@ -26,6 +26,8 @@ from aiter import (
     cp_gather_indexer_k_quant_cache,
     dtypes,
     indexer_k_quant_and_cache,
+    indexer_k_norm_rope_quant_and_cache,
+    indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -403,6 +405,15 @@ def sparse_attn_indexer_plugin_mode(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    fuse_qk_rope_quant_cache: bool,
+    fuse_k_norm_rope_cache: bool,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
 ) -> torch.Tensor:
     try:
         from vllm.forward_context import (
@@ -419,11 +430,17 @@ def sparse_attn_indexer_plugin_mode(
     # During profile/dummy run the metadata dict may not contain
     # our layer or may be None.
     if attn_metadata_dict is None:
+        if fuse_qk_rope_quant_cache:
+            return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
         return weights
     if k_cache_prefix not in attn_metadata_dict:
+        if fuse_qk_rope_quant_cache:
+            return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
         return weights
     layer_meta = attn_metadata_dict[k_cache_prefix]
     if layer_meta is None:
+        if fuse_qk_rope_quant_cache:
+            return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
         return weights
 
     # In plugin mode, plugin_metadata is vllmDeepseekV32IndexerMetadata from
@@ -435,13 +452,51 @@ def sparse_attn_indexer_plugin_mode(
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens
 
-    indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-    )
+    if fuse_qk_rope_quant_cache:
+        q = q_fp8
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        indexer_qk_rope_quant_and_cache(
+            q,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+        )
+        weights = weights_out
+    elif fuse_k_norm_rope_cache:
+        indexer_k_norm_rope_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+        )
+    else:
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+        )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     # topk_indices_buffer[: num_actual_tokens] = -1
@@ -575,6 +630,15 @@ def sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    fuse_qk_rope_quant_cache: bool,
+    fuse_k_norm_rope_cache: bool,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -584,6 +648,8 @@ def sparse_attn_indexer_fake(
     )
     _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+    if fuse_qk_rope_quant_cache:
+        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
     return weights
 
 

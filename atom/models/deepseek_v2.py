@@ -35,6 +35,9 @@ from aiter import (
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
+    indexer_k_norm_rope_quant_and_cache,
+    indexer_qk_rope_quant_and_cache,
+    rope_cached_positions_fwd_inplace,
     top_k_per_row_decode,
     top_k_per_row_prefill,
 )
@@ -66,6 +69,10 @@ from atom.model_ops.linear import (
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
+from atom.model_ops.v4_kernels.indexer_weights import (
+    quant_indexer_q_and_scale_weights,
+    scale_indexer_weights,
+)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -116,6 +123,17 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
+ENABLE_DS_INDEXER_Q_QUANT_FUSION = envs.ATOM_ENABLE_DS_INDEXER_Q_QUANT_FUSION
+ENABLE_DS_INDEXER_K_CACHE_FUSION = envs.ATOM_ENABLE_DS_INDEXER_K_CACHE_FUSION
+ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+_FP8_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, "float8_e4m3fn", None),
+        getattr(torch, "float8_e4m3fnuz", None),
+    )
+    if dtype is not None
+)
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -395,6 +413,47 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4_fake(
         device=device,
     )[..., :qk_rope_head_dim]
     return q_c, q_c_scale, kv_c_normed, k_pe
+
+
+def _indexer_q_rope_inplace_fake(
+    q_pe: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    return q_pe
+
+
+def _indexer_q_rope_inplace(
+    q_pe: torch.Tensor,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    is_neox_style: bool,
+) -> torch.Tensor:
+    num_tokens = positions.numel()
+    q_view = q_pe.view(1, num_tokens, -1, q_pe.shape[-1])
+    position_view = positions.view(1, num_tokens)
+    rotate_style = 0 if is_neox_style else 1
+    rope_cached_positions_fwd_inplace(
+        q_view,
+        cos_cache,
+        sin_cache,
+        position_view,
+        rotate_style,
+        True,
+        False,
+    )
+    return q_pe
+
+
+direct_register_custom_op(
+    op_name="indexer_q_rope_inplace",
+    op_func=_indexer_q_rope_inplace,
+    mutates_args=["q_pe"],
+    fake_impl=_indexer_q_rope_inplace_fake,
+)
 
 
 def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp8_fake(
@@ -958,6 +1017,15 @@ def sparse_attn_indexer(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    fuse_qk_rope_quant_cache: bool,
+    fuse_k_norm_rope_cache: bool,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -967,6 +1035,8 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
+        if fuse_qk_rope_quant_cache:
+            return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
         return weights
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
@@ -974,14 +1044,56 @@ def sparse_attn_indexer(
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
-    indexer_k_quant_and_cache(
-        k,
-        kv_cache,
-        slot_mapping,
-        quant_block_size,
-        scale_fmt,
-        preshuffle=True,
-    )
+    if fuse_qk_rope_quant_cache:
+        q = q_fp8
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        indexer_qk_rope_quant_and_cache(
+            q,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=True,
+            is_neox=True,
+        )
+        weights = weights_out
+    elif fuse_k_norm_rope_cache:
+        indexer_k_norm_rope_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+            is_neox=True,
+        )
+    else:
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+        )
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
             return weights
@@ -1096,6 +1208,15 @@ def sparse_attn_indexer_fake(
     max_model_len: int,
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
+    fuse_qk_rope_quant_cache: bool,
+    fuse_k_norm_rope_cache: bool,
+    k_norm_weight: torch.Tensor,
+    k_norm_bias: torch.Tensor,
+    k_norm_eps: float,
+    positions: torch.Tensor,
+    cos_cache: torch.Tensor,
+    sin_cache: torch.Tensor,
+    weights_scale: float,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1105,6 +1226,8 @@ def sparse_attn_indexer_fake(
     )
     _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
+    if fuse_qk_rope_quant_cache:
+        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
     return weights
 
 
@@ -1114,6 +1237,111 @@ direct_register_custom_op(
     mutates_args=["topk_indices_buffer"],
     fake_impl=sparse_attn_indexer_fake,
 )
+
+
+def _dequant_fp8_block_to_bf16(
+    weight_fp8: torch.Tensor,
+    scale: torch.Tensor,
+    block_size: int = 128,
+) -> torch.Tensor:
+    """Dequantize block-scaled FP8 weights to BF16 for BF16-only fused GEMMs."""
+    out_dim, in_dim = weight_fp8.shape
+    if out_dim % block_size != 0 or in_dim % block_size != 0:
+        raise ValueError(
+            "FP8 block dequant expects dimensions divisible by "
+            f"{block_size}, got {tuple(weight_fp8.shape)}"
+        )
+    weight = (
+        weight_fp8.unflatten(0, (-1, block_size))
+        .unflatten(-1, (-1, block_size))
+        .float()
+    )
+    scale = scale.float()
+    return (weight * scale[:, None, :, None]).flatten(2, 3).flatten(0, 1).bfloat16()
+
+
+class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
+    """Fused Indexer wk + weights projection with FP8 wk load support."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_dim: int,
+        n_head: int,
+        prefix: str = "",
+    ):
+        self._wk_pending_weight: Optional[torch.Tensor] = None
+        self._wk_pending_scale: Optional[torch.Tensor] = None
+        self._wk_loaded = False
+        super().__init__(
+            hidden_size,
+            [head_dim, n_head],
+            bias=False,
+            quant_config=None,
+            prefix=prefix,
+        )
+        # Checkpoints may store indexer.wk as FP8 plus weight_scale_inv.  The
+        # fused GEMM runs in BF16, so this parameter only receives the scale
+        # during loading and is not consumed in forward.
+        self.weight_scale = atom_parameter(
+            torch.empty(
+                (max(1, (head_dim + 127) // 128), (hidden_size + 127) // 128),
+                dtype=torch.float32,
+            )
+        )
+        self.weight_scale.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader = self.weight_loader
+
+    def _maybe_load_pending_wk(self) -> None:
+        if self._wk_pending_weight is None or self._wk_pending_scale is None:
+            return
+        wk_weight = _dequant_fp8_block_to_bf16(
+            self._wk_pending_weight,
+            self._wk_pending_scale,
+        )
+        super().weight_loader(self.weight, wk_weight, 0)
+        self._wk_pending_weight = None
+        self._wk_pending_scale = None
+        self._wk_loaded = True
+
+    def weight_loader(
+        self,
+        param: nn.Parameter,
+        loaded_weight: torch.Tensor,
+        loaded_shard_id: Optional[int] = None,
+    ):
+        if param is self.weight_scale:
+            if loaded_shard_id == 0:
+                param.weight_loader_process(param.data, loaded_weight)
+                self._wk_pending_scale = loaded_weight
+                self._maybe_load_pending_wk()
+            return
+
+        if (
+            param is self.weight
+            and loaded_shard_id == 0
+            and loaded_weight.dtype in _FP8_DTYPES
+        ):
+            self._wk_pending_weight = loaded_weight
+            self._maybe_load_pending_wk()
+            return
+
+        if param is self.weight and loaded_shard_id == 0:
+            self._wk_pending_weight = None
+            self._wk_pending_scale = None
+            self._wk_loaded = True
+
+        super().weight_loader(param, loaded_weight, loaded_shard_id)
+
+    def process_weights_after_loading(self):
+        if self._wk_pending_weight is not None or (
+            self._wk_pending_scale is not None and not self._wk_loaded
+        ):
+            raise RuntimeError(
+                "Incomplete FP8 indexer.wk load: both weight and weight_scale "
+                "are required before building wk_weights_proj."
+            )
+        super().process_weights_after_loading()
 
 
 @IndexerDecoratorForPluginMode
@@ -1147,25 +1375,33 @@ class Indexer(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.wq_b",
         )
-        self.wk = ReplicatedLinear(
+        self.wk_weights_proj = IndexerWkWeightsProjLinear(
             hidden_size,
             self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.wk",
+            self.n_head,
+            prefix=f"{prefix}.wk_weights_proj",
         )
         self.k_norm = LayerNorm(self.head_dim, eps=1e-6)
-        self.weights_proj = ReplicatedLinear(
-            hidden_size,
-            self.n_head,
-            quant_config=None,
-            prefix=f"{prefix}.weights_proj",
-        )
         self.softmax_scale = self.head_dim**-0.5
+        self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
         self.scale_fmt = "ue8m0"
         self.quant_func = get_hip_quant(QuantType.per_1x128)
         self.quant_block_size = 128  # TODO: get from config
+        self.fuse_q_quant_weights = (
+            ENABLE_DS_INDEXER_Q_QUANT_FUSION
+            and self.head_dim == self.quant_block_size
+        )
+        self.fuse_k_norm_rope_cache = (
+            ENABLE_DS_INDEXER_K_CACHE_FUSION
+            and self.head_dim == self.quant_block_size
+            and self.rope_dim == self.head_dim // 2
+        )
+        self.fuse_qk_rope_quant_cache = (
+            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+            and self.fuse_q_quant_weights
+            and self.fuse_k_norm_rope_cache
+        )
         self.topk_indices_buffer = topk_indices_buffer
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1192,30 +1428,49 @@ class Indexer(nn.Module):
     ) -> torch.Tensor:
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
-        q_pe, q_nope = torch.split(
-            q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
-        )
+        q_pe = q[..., : self.rope_dim]
 
-        k = self.wk(hidden_states)
-        k = self.k_norm(k)
-        k_pe, k_nope = torch.split(
-            k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+        k, weights = torch.split(
+            self.wk_weights_proj(hidden_states),
+            [self.head_dim, self.n_head],
+            dim=-1,
         )
-
-        q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
+        if self.fuse_qk_rope_quant_cache:
+            # q RoPE/quant and k cache write are fused inside sparse_attn_indexer,
+            # where the runtime cache slot mapping is available.
+            pass
+        elif self.fuse_k_norm_rope_cache:
+            q_pe = torch.ops.aiter.indexer_q_rope_inplace(
+                q_pe,
+                positions,
+                rotary_emb.cos_cache,
+                rotary_emb.sin_cache,
+                rotary_emb.is_neox_style,
+            )
+        else:
+            k = self.k_norm(k)
+            k_pe = k[..., : self.rope_dim]
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
 
         # we only quant q here since k quant is fused with cache insertion
-        q = q.view(-1, self.head_dim)
+        if self.fuse_qk_rope_quant_cache:
+            q_fp8 = q
+        else:
+            q = q.view(-1, self.head_dim)
 
-        q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
-        q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
-        q_scale = q_scale.view(-1, self.n_head, 1)
-
-        weights = self.weights_proj(hidden_states)
-        weights = (
-            weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
-        )
-        weights = weights.squeeze(-1)
+        if self.fuse_qk_rope_quant_cache:
+            pass
+        elif self.fuse_q_quant_weights:
+            q_fp8, weights = quant_indexer_q_and_scale_weights(
+                q,
+                weights,
+                self._weights_scale,
+            )
+        else:
+            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+            weights = scale_indexer_weights(weights, q_scale, self._weights_scale)
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
@@ -1231,6 +1486,15 @@ class Indexer(nn.Module):
             self.max_model_len,
             self.max_total_seq_len,
             self.topk_indices_buffer,
+            self.fuse_qk_rope_quant_cache,
+            self.fuse_k_norm_rope_cache,
+            self.k_norm.weight,
+            self.k_norm.bias,
+            self.k_norm.eps,
+            positions,
+            rotary_emb.cos_cache,
+            rotary_emb.sin_cache,
+            self._weights_scale,
         )
 
 
@@ -1925,11 +2189,15 @@ class DeepseekV2ForCausalLM(nn.Module):
                 "kv_a_proj_with_mqa": ("fused_qkv_a_proj", 1),
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
+                "indexer.wk": ("indexer.wk_weights_proj", 0),
+                "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
             }
         else:
             self.packed_modules_mapping = {
                 "gate_proj": ("gate_up_proj", 0),
                 "up_proj": ("gate_up_proj", 1),
+                "indexer.wk": ("indexer.wk_weights_proj", 0),
+                "indexer.weights_proj": ("indexer.wk_weights_proj", 1),
             }
 
         self.model = DeepseekV2Model(
@@ -2003,19 +2271,22 @@ class DeepseekV2ForCausalLM(nn.Module):
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
-    # DeepSeek-V3.2's indexer weights_proj are not quantized, but they are not listed in
-    # model's quant exclude mapping. So we add it to quant_default_exclude_layers.
-    quant_default_exclude_layers: list[str] = ["*.indexer.weights_proj"]
+    # DeepSeek-V3.2's indexer weights projection is BF16.  Keep the original
+    # checkpoint path and the fused ATOM path excluded from default quantization.
+    quant_default_exclude_layers: list[str] = [
+        "*.indexer.weights_proj",
+        "*.indexer.wk_weights_proj",
+    ]
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
     # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
-    # the ATOM module path is `indexer.weights_proj`.  Declaring the mapping here
-    # keeps the translation co-located with the model and out of config.py.
+    # the ATOM module path is fused as `indexer.wk_weights_proj`.  Declaring the
+    # mapping here keeps the translation co-located with the model and out of config.py.
     quant_exclude_name_mapping: dict[str, str] = {
         # HF quant config uses "indexers_proj" but the ATOM module path is
-        # "indexer.weights_proj".  str.replace translates each exclude entry.
-        "indexers_proj": "indexer.weights_proj",
+        # "indexer.wk_weights_proj".  str.replace translates each exclude entry.
+        "indexers_proj": "indexer.wk_weights_proj",
     }
