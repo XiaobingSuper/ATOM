@@ -34,6 +34,7 @@ from aiter import (
     fused_qk_rmsnorm,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
+    indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
@@ -116,6 +117,9 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 ENABLE_DS_QKNORM_FUSION = envs.ATOM_ENABLE_DS_QKNORM_FUSION
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
+ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION = (
+    envs.ATOM_ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+)
 _FP8_DTYPES = tuple(
     dtype
     for dtype in (
@@ -974,6 +978,7 @@ def sparse_attn_indexer(
     sin_cache: torch.Tensor,
     weights_scale: float,
     is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
     # careful! this will be None in dummy run
     forward_context = get_forward_context()
@@ -990,30 +995,42 @@ def sparse_attn_indexer(
     )
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
-    q = q_fp8
-    q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
-    weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-    indexer_qk_rope_quant_and_cache(
-        q,
-        q_fp8,
-        weights,
-        weights_out,
-        k,
-        kv_cache,
-        slot_mapping,
-        k_norm_weight,
-        k_norm_bias,
-        positions,
-        cos_cache,
-        sin_cache,
-        k_norm_eps,
-        quant_block_size,
-        scale_fmt,
-        weights_scale,
-        preshuffle=True,
-        is_neox=is_neox_style,
-    )
-    weights = weights_out
+    if use_qk_rope_cache_fusion:
+        q = q_fp8
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        indexer_qk_rope_quant_and_cache(
+            q,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=True,
+            is_neox=is_neox_style,
+        )
+        weights = weights_out
+    else:
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=True,
+        )
     if context.is_prefill:
         if attn_metadata.max_seqlen_k <= topk_indices_buffer.shape[1]:
             return weights
@@ -1136,6 +1153,7 @@ def sparse_attn_indexer_fake(
     sin_cache: torch.Tensor,
     weights_scale: float,
     is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
@@ -1303,13 +1321,13 @@ class Indexer(nn.Module):
         self._weights_scale = self.softmax_scale * self.n_head**-0.5
 
         self.scale_fmt = "ue8m0"
+        self.quant_func = get_hip_quant(QuantType.per_1x128)
         self.quant_block_size = 128  # TODO: get from config
-        if self.head_dim != self.quant_block_size or self.rope_dim != self.head_dim // 2:
-            raise ValueError(
-                "DeepSeek-V3.2 fused indexer requires "
-                f"head_dim={self.quant_block_size} and rope_dim={self.head_dim // 2}, "
-                f"got head_dim={self.head_dim}, rope_dim={self.rope_dim}"
-            )
+        self.use_qk_rope_cache_fusion = (
+            ENABLE_DS_INDEXER_QK_ROPE_CACHE_FUSION
+            and self.head_dim == self.quant_block_size
+            and self.rope_dim == self.head_dim // 2
+        )
         self.topk_indices_buffer = topk_indices_buffer
 
         # TODO (zyongye) change dim to fp8 later to (self.head_dim + 4)
@@ -1342,12 +1360,36 @@ class Indexer(nn.Module):
             [self.head_dim, self.n_head],
             dim=-1,
         )
+        k = k.contiguous()
+        weights = weights.contiguous()
+
+        if not self.use_qk_rope_cache_fusion:
+            q_pe, _ = torch.split(
+                q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            k = self.k_norm(k)
+            k_pe, _ = torch.split(
+                k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
+            )
+            q_pe, k_pe = rotary_emb(positions, q_pe, k_pe)
+            q[..., : self.rope_dim] = q_pe
+            k[..., : self.rope_dim] = k_pe
+
+            q = q.view(-1, self.head_dim)
+            q_fp8, q_scale = self.quant_func(q, quant_dtype=dtypes.fp8)
+            q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
+            q_scale = q_scale.view(-1, self.n_head, 1)
+            weights = (weights.unsqueeze(-1) * q_scale * self._weights_scale).squeeze(
+                -1
+            )
+        else:
+            q_fp8 = q
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
-            q,
+            q_fp8,
             k,
             weights,
             self.quant_block_size,
@@ -1365,6 +1407,7 @@ class Indexer(nn.Module):
             rotary_emb.sin_cache,
             self._weights_scale,
             rotary_emb.is_neox_style,
+            self.use_qk_rope_cache_fusion,
         )
 
 
