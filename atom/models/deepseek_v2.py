@@ -130,6 +130,28 @@ _FP8_DTYPES = tuple(
 )
 
 
+def _can_fuse_indexer_wk_quant_config(wk_quant_config) -> bool:
+    if wk_quant_config.quant_type == QuantType.No:
+        return True
+    return wk_quant_config.quant_dtype == dtypes.fp8
+
+
+def _iter_indexer_prefixes(
+    config: PretrainedConfig,
+    model_prefix: str,
+) -> list[str]:
+    attn_module_list_cfg = getattr(config, "attn_module_list_cfg", None)
+    if isinstance(attn_module_list_cfg, (list, tuple)):
+        prefixes = [
+            f"{model_prefix}.layers.{layer_idx}.self_attn.indexer"
+            for layer_idx, layer_cfg in enumerate(attn_module_list_cfg)
+            if isinstance(layer_cfg, dict) and layer_cfg.get("attn_index") is not None
+        ]
+        if prefixes:
+            return prefixes
+    return [f"{model_prefix}.layers.0.self_attn.indexer"]
+
+
 def _can_fuse_indexer_wk_weights_proj(
     config: PretrainedConfig,
     quant_config: Optional[QuantizationConfig],
@@ -141,9 +163,18 @@ def _can_fuse_indexer_wk_weights_proj(
         return True
 
     wk_quant_config = quant_config.get_layer_quant_config(f"{indexer_prefix}.wk")
-    if wk_quant_config.quant_type == QuantType.No:
-        return True
-    return wk_quant_config.quant_dtype == dtypes.fp8
+    return _can_fuse_indexer_wk_quant_config(wk_quant_config)
+
+
+def _can_fuse_model_indexer_wk_weights_proj(
+    config: PretrainedConfig,
+    quant_config: Optional[QuantizationConfig],
+    model_prefix: str,
+) -> bool:
+    return all(
+        _can_fuse_indexer_wk_weights_proj(config, quant_config, indexer_prefix)
+        for indexer_prefix in _iter_indexer_prefixes(config, model_prefix)
+    )
 
 
 def _fuse_rmsnorm_fp4_quant_fake(
@@ -750,7 +781,6 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
 
 
 class DeepseekV2MLP(nn.Module):
-
     def __init__(
         self,
         hidden_size: int,
@@ -778,8 +808,7 @@ class DeepseekV2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -791,7 +820,6 @@ class DeepseekV2MLP(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -936,12 +964,12 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        assert (
-            hidden_states.dim() == 2
-        ), f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
-        assert (
-            hidden_states.shape[1] == self.experts.hidden_size
-        ), f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
+        assert hidden_states.dim() == 2, (
+            f"Expected hidden_states to be 2D (seq_len, hidden_dim), but got {hidden_states.dim()}D, with shape {hidden_states.shape}"
+        )
+        assert hidden_states.shape[1] == self.experts.hidden_size, (
+            f"Hidden states dimension {hidden_states.shape[1]} does not match expected {self.experts.hidden_size}"
+        )
 
         if self._use_dual_stream:
             return torch.ops.aiter.maybe_dual_stream_forward(hidden_states, self.prefix)
@@ -960,7 +988,6 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 @DeepseekV32IndexerCacheDecoratorForPluginMode
 class DeepseekV32IndexerCache(nn.Module):
-
     def __init__(
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: str
     ):
@@ -976,7 +1003,7 @@ def sparse_attn_indexer(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -1004,7 +1031,7 @@ def sparse_attn_indexer(
     # Skip for dummy runs to avoid corrupting KV cache
     if forward_context.context.is_dummy_run:
         # dummy runner
-        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        return torch.zeros_like(weights, dtype=torch.float32)
     # For MTP verify decode, max_seqlen_q > 1 so total decode tokens = batch_size * max_seqlen_q
     num_decode_tokens = (
         context.batch_size * attn_metadata.max_seqlen_q if not context.is_prefill else 0
@@ -1012,13 +1039,13 @@ def sparse_attn_indexer(
     runner_block_size = get_current_atom_config().kv_cache_block_size
     kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     if use_qk_rope_cache_fusion:
-        q = q_fp8
-        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_bf16 = q_input
+        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
         indexer_qk_rope_quant_and_cache(
-            q,
+            q_bf16,
             q_fp8,
             weights,
             weights_out,
@@ -1039,6 +1066,7 @@ def sparse_attn_indexer(
         )
         weights = weights_out
     else:
+        q_fp8 = q_input
         indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -1151,7 +1179,7 @@ def sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -1236,7 +1264,7 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         # during loading and is not consumed in forward.
         self.weight_scale = atom_parameter(
             torch.empty(
-                (max(1, (head_dim + 127) // 128), (hidden_size + 127) // 128),
+                ((head_dim + 127) // 128, (hidden_size + 127) // 128),
                 dtype=torch.float32,
             )
         )
@@ -1264,7 +1292,7 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         if param is self.weight_scale:
             if loaded_shard_id == 0:
                 param.weight_loader_process(param.data, loaded_weight)
-                self._wk_pending_scale = loaded_weight
+                self._wk_pending_scale = param.data.detach().clone()
                 self._maybe_load_pending_wk()
             return
 
@@ -1273,7 +1301,7 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
             and loaded_shard_id == 0
             and loaded_weight.dtype in _FP8_DTYPES
         ):
-            self._wk_pending_weight = loaded_weight
+            self._wk_pending_weight = loaded_weight.detach().clone()
             self._maybe_load_pending_wk()
             return
 
@@ -1297,7 +1325,6 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
 
 @IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
-
     def __init__(
         self,
         atom_config: Config,
@@ -1472,6 +1499,7 @@ class DeepseekV2MLAAttention(nn.Module):
         prefix: str = "",
         layer_num: int = 0,
         topk_indices_buffer: Optional[torch.Tensor] = None,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -1644,10 +1672,14 @@ class DeepseekV2MLAAttention(nn.Module):
                 base_quant_config,
                 cache_config,
                 topk_indices_buffer,
-                _can_fuse_indexer_wk_weights_proj(
-                    config,
-                    model_quant_config,
-                    f"{prefix}.indexer",
+                (
+                    _can_fuse_indexer_wk_weights_proj(
+                        config,
+                        model_quant_config,
+                        f"{prefix}.indexer",
+                    )
+                    if use_indexer_wk_weights_proj_fusion is None
+                    else use_indexer_wk_weights_proj_fusion
                 ),
                 f"{prefix}.indexer",
             )
@@ -1796,7 +1828,6 @@ class DeepseekV2MLAAttention(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1807,6 +1838,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         layer_num: int = 0,
         is_mtp_block: bool = False,
         alt_stream: Optional[torch.cuda.Stream] = None,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -1831,6 +1863,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             layer_num=layer_num,
             topk_indices_buffer=topk_indices_buffer,
+            use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
 
         # When ATOM_ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION is turned on self.fuse_input_norm_quant is turned on only if use_triton_gemm and (FP8 or FP4),
@@ -2002,6 +2035,7 @@ class DeepseekV2Model(nn.Module):
         atom_config: Config,
         prefix: str = "",
         layer_type: type[nn.Module] = DeepseekV2DecoderLayer,
+        use_indexer_wk_weights_proj_fusion: Optional[bool] = None,
     ):
         super().__init__()
 
@@ -2046,6 +2080,7 @@ class DeepseekV2Model(nn.Module):
                 quant_config=quant_config,
                 layer_num=layer_num,
                 alt_stream=_alt_stream,
+                use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
             ),
             prefix=f"{prefix}.layers",
             layer_num_offset=0,
@@ -2126,7 +2161,6 @@ class DeepseekV2Model(nn.Module):
 
 
 class DeepseekV2ForCausalLM(nn.Module):
-
     def __init__(
         self,
         atom_config: Config,
@@ -2140,10 +2174,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.quant_config = quant_config
 
         model_prefix = maybe_prefix(prefix, "model")
-        use_indexer_wk_weights_proj_fusion = _can_fuse_indexer_wk_weights_proj(
+        use_indexer_wk_weights_proj_fusion = _can_fuse_model_indexer_wk_weights_proj(
             config,
             quant_config,
-            f"{model_prefix}.layers.0.self_attn.indexer",
+            model_prefix,
         )
         if hasattr(config, "q_lora_rank") and config.q_lora_rank is not None:
             self.packed_modules_mapping = {
@@ -2169,6 +2203,7 @@ class DeepseekV2ForCausalLM(nn.Module):
             atom_config=atom_config,
             prefix=model_prefix,
             layer_type=layer_type,
+            use_indexer_wk_weights_proj_fusion=use_indexer_wk_weights_proj_fusion,
         )
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
@@ -2248,10 +2283,10 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
     # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
-    # the ATOM module path is fused as `indexer.wk_weights_proj`.  Declaring the
-    # mapping here keeps the translation co-located with the model and out of config.py.
+    # the unfused ATOM module path is `indexer.weights_proj`.  Keep that path
+    # excluded so FP4/MXFP4 fallback does not quantize the BF16 projection.
     quant_exclude_name_mapping: dict[str, str] = {
         # HF quant config uses "indexers_proj" but the ATOM module path is
-        # "indexer.wk_weights_proj".  str.replace translates each exclude entry.
-        "indexers_proj": "indexer.wk_weights_proj",
+        # "indexer.weights_proj".  str.replace translates each exclude entry.
+        "indexers_proj": "indexer.weights_proj",
     }

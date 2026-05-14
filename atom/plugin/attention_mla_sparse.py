@@ -558,7 +558,7 @@ def sparse_attn_indexer_plugin_mode(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
@@ -593,12 +593,12 @@ def sparse_attn_indexer_plugin_mode(
     # During profile/dummy run the metadata dict may not contain
     # our layer or may be None.
     if attn_metadata_dict is None:
-        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        return torch.zeros_like(weights, dtype=torch.float32)
     if k_cache_prefix not in attn_metadata_dict:
-        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        return torch.zeros_like(weights, dtype=torch.float32)
     layer_meta = attn_metadata_dict[k_cache_prefix]
     if layer_meta is None:
-        return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+        return torch.zeros_like(weights, dtype=torch.float32)
 
     # In plugin mode, plugin_metadata is vllmDeepseekV32IndexerMetadata from
     # AiterMLASparseIndexerMetadataBuilder.
@@ -612,13 +612,13 @@ def sparse_attn_indexer_plugin_mode(
     preshuffle_cache = kv_block_size != 1
 
     if use_qk_rope_cache_fusion:
-        q = q_fp8
-        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        q_bf16 = q_input
+        q_fp8 = torch.empty_like(q_bf16, dtype=dtypes.fp8)
         weights_out = torch.empty(
             weights.shape, device=weights.device, dtype=torch.float32
         )
         indexer_qk_rope_quant_and_cache(
-            q,
+            q_bf16,
             q_fp8,
             weights,
             weights_out,
@@ -639,6 +639,7 @@ def sparse_attn_indexer_plugin_mode(
         )
         weights = weights_out
     else:
+        q_fp8 = q_input
         indexer_k_quant_and_cache(
             k,
             kv_cache,
@@ -775,7 +776,7 @@ def sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,
     k_cache_prefix: str,
     kv_cache: torch.Tensor,
-    q_fp8: torch.Tensor,
+    q_input: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
     quant_block_size: int,
