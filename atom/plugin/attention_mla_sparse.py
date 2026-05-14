@@ -25,6 +25,7 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla,
     cp_gather_indexer_k_quant_cache,
     dtypes,
+    indexer_k_quant_and_cache,
     indexer_qk_rope_quant_and_cache,
     top_k_per_row_decode,
     top_k_per_row_prefill,
@@ -576,6 +577,7 @@ def sparse_attn_indexer_plugin_mode(
     sin_cache: torch.Tensor,
     weights_scale: float,
     is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
     try:
         from vllm.forward_context import (
@@ -610,30 +612,42 @@ def sparse_attn_indexer_plugin_mode(
     kv_block_size = kv_cache.shape[1]
     preshuffle_cache = kv_block_size != 1
 
-    q = q_fp8
-    q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
-    weights_out = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
-    indexer_qk_rope_quant_and_cache(
-        q,
-        q_fp8,
-        weights,
-        weights_out,
-        k,
-        kv_cache,
-        slot_mapping,
-        k_norm_weight,
-        k_norm_bias,
-        positions,
-        cos_cache,
-        sin_cache,
-        k_norm_eps,
-        quant_block_size,
-        scale_fmt,
-        weights_scale,
-        preshuffle=preshuffle_cache,
-        is_neox=is_neox_style,
-    )
-    weights = weights_out
+    if use_qk_rope_cache_fusion:
+        q = q_fp8
+        q_fp8 = torch.empty_like(q, dtype=dtypes.fp8)
+        weights_out = torch.empty(
+            weights.shape, device=weights.device, dtype=torch.float32
+        )
+        indexer_qk_rope_quant_and_cache(
+            q,
+            q_fp8,
+            weights,
+            weights_out,
+            k,
+            kv_cache,
+            slot_mapping,
+            k_norm_weight,
+            k_norm_bias,
+            positions,
+            cos_cache,
+            sin_cache,
+            k_norm_eps,
+            quant_block_size,
+            scale_fmt,
+            weights_scale,
+            preshuffle=preshuffle_cache,
+            is_neox=is_neox_style,
+        )
+        weights = weights_out
+    else:
+        indexer_k_quant_and_cache(
+            k,
+            kv_cache,
+            slot_mapping,
+            quant_block_size,
+            scale_fmt,
+            preshuffle=preshuffle_cache,
+        )
 
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     # topk_indices_buffer[: num_actual_tokens] = -1
@@ -780,6 +794,7 @@ def sparse_attn_indexer_fake(
     sin_cache: torch.Tensor,
     weights_scale: float,
     is_neox_style: bool,
+    use_qk_rope_cache_fusion: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
