@@ -1744,10 +1744,19 @@ class AiterMLASparseMetadataForPluginMode:
     paged_kv_last_page_len: torch.Tensor
     paged_kv_indices: torch.Tensor
     paged_kv_indptr: torch.Tensor
-    paged_kv_indptr_rest: torch.Tensor
+    attn_out_dtype: torch.dtype
 
     block_size: int = 1
     topk_tokens: int = 2048
+
+    # Persistent MLA metadata (only populated when persistent mode is enabled,
+    # i.e. when the aiter sparse decode kernel supports work-stealing splits).
+    work_meta_data: torch.Tensor | None = None
+    work_indptr: torch.Tensor | None = None
+    work_info_set: torch.Tensor | None = None
+    reduce_indptr: torch.Tensor | None = None
+    reduce_final_map: torch.Tensor | None = None
+    reduce_partial_map: torch.Tensor | None = None
 
 
 class vllmMLASparseAttentionMetadataBuilderMethods:
@@ -1766,18 +1775,61 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
         )
         # Zero-fill for cudagraphs
         self.req_id_per_token_buffer.fill_(0)
+        self.paged_kv_indices.fill_(0)
+        self.paged_kv_indptr.fill_(0)
         self.req_id_per_token_buffer[: req_id_per_token.shape[0]].copy_(
             req_id_per_token, non_blocking=True
         )
-        self.paged_kv_indices.fill_(0)
-        self.paged_kv_indptr.fill_(0)
+        query_lens = (
+            common_attn_metadata.query_start_loc[1:]
+            - common_attn_metadata.query_start_loc[:-1]
+        )
+        seq_lens = common_attn_metadata.seq_lens
+
+        from atom.plugin.attention_mla_sparse import generate_sparse_seqlen_triton
+
+        sparse_seqlen = generate_sparse_seqlen_triton(
+            query_lens,
+            seq_lens,
+            common_attn_metadata.query_start_loc,
+            self.topk_tokens,
+            num_tokens,
+            common_attn_metadata.max_query_len,
+        )
+
+        torch.cumsum(sparse_seqlen, dim=0, out=self.paged_kv_indptr[1 : num_tokens + 1])
+        self.paged_kv_indptr[num_tokens + 1 :].fill_(self.paged_kv_indptr[num_tokens])
 
         req_id_per_token = self.req_id_per_token_buffer[:num_tokens]
         qo_indptr = self.qo_indptr[: num_tokens + 1]
         paged_kv_last_page_len = self.paged_kv_last_page_len[:num_tokens]
         paged_kv_indices = self.paged_kv_indices[: num_tokens * self.topk_tokens]
         paged_kv_indptr = self.paged_kv_indptr[: num_tokens + 1]
-        paged_kv_indptr_rest = self.paged_kv_indptr[num_tokens + 1 :]
+
+        # ----- Compute persistent MLA metadata -----
+        # The aiter sparse decode kernel uses qseqlen=1 (each query token is
+        # treated as its own batch entry), so persistent metadata can always
+        # be precomputed here. The kernel switches to the persistent
+        # work-stealing path automatically when work_meta_data is non-None.
+        get_mla_metadata_v1(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_last_page_len,
+            self.padded_num_heads,
+            1,
+            True,
+            self._mla_work_meta_data,
+            self._mla_work_info_set,
+            self._mla_work_indptr,
+            self._mla_reduce_indptr,
+            self._mla_reduce_final_map,
+            self._mla_reduce_partial_map,
+            page_size=1,
+            kv_granularity=16,
+            max_seqlen_qo=1,
+            uni_seqlen_qo=1,
+            fast_mode=True,
+        )
 
         attn_metadata_for_plugin_mode = AiterMLASparseMetadataForPluginMode(
             num_reqs=common_attn_metadata.num_reqs,
@@ -1790,12 +1842,18 @@ class vllmMLASparseAttentionMetadataBuilderMethods:
             block_table=common_attn_metadata.block_table_tensor,
             req_id_per_token=req_id_per_token,
             block_size=self.kv_cache_spec.block_size,
+            attn_out_dtype=self.model_dtype,
             topk_tokens=self.topk_tokens,
             qo_indptr=qo_indptr,
             paged_kv_last_page_len=paged_kv_last_page_len,
             paged_kv_indices=paged_kv_indices,
             paged_kv_indptr=paged_kv_indptr,
-            paged_kv_indptr_rest=paged_kv_indptr_rest,
+            work_meta_data=self._mla_work_meta_data,
+            work_indptr=self._mla_work_indptr,
+            work_info_set=self._mla_work_info_set,
+            reduce_indptr=self._mla_reduce_indptr,
+            reduce_final_map=self._mla_reduce_final_map,
+            reduce_partial_map=self._mla_reduce_partial_map,
         )
 
         attn_metadata = AttentionMetaData(
@@ -2063,14 +2121,12 @@ class vllmAiterMLASparseBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [1]
+        return [1, 64]
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
-        # ATOM's sparse MLA plugin path assumes kernel/page block size == 1
-        # throughout metadata construction and KV-cache indexing, so force that
-        # value when vLLM 0.19 negotiates the backend-specific cache block size.
-        return 1
+        # Prefer block_size == 64 so the indexer's preshuffled path is taken
+        return 64
 
     @staticmethod
     def get_kv_cache_shape(
@@ -2231,6 +2287,7 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
 
         self.vllm_config = config
         self.model_config = config.model_config
+        self.model_dtype = self.model_config.dtype
         self.kv_cache_spec = kv_cache_spec
         self.device = device
         max_num_batched_tokens = config.scheduler_config.max_num_batched_tokens
@@ -2241,9 +2298,6 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         self.padded_num_heads = max(self.num_heads, _MLA_MIN_HEADS)
         self.mla_dims = get_mla_dims(self.model_config)
         self.topk_tokens = config.model_config.hf_config.index_topk
-        self.topk_tokens_tensor = torch.tensor(
-            [self.topk_tokens], device=device, dtype=torch.int32
-        )
         self.max_model_len_tensor = torch.tensor(
             [self.model_config.max_model_len], device=device, dtype=torch.int32
         )
@@ -2273,6 +2327,52 @@ def create_mla_sparse_attn_metadata_builder_init_method(base_class):
         )
         self.paged_kv_indptr = torch.zeros(
             [max_num_batched_tokens + 1], dtype=torch.int32, device=device
+        )
+
+        # ----- Persistent MLA metadata buffers -----
+        # The aiter sparse decode kernel supports a "persistent" path that
+        # uses precomputed work-splitting metadata for better load balancing
+        # across CUs. Mirrors the approach used in rocm_aiter_mla.py.
+        #
+        # In the sparse case each query token is its own "batch" entry in the
+        # qo_indptr (qo_indptr = [0, 1, 2, ..., num_tokens]) and max_qo_len=1.
+        # We pad get_mla_metadata_info_v1's batch_size to max_num_batched_tokens
+        # so the buffers are large enough for any decode shape we might see.
+        (
+            (work_meta_data_size, work_meta_data_type),
+            (work_indptr_size, work_indptr_type),
+            (work_info_set_size, work_info_set_type),
+            (reduce_indptr_size, reduce_indptr_type),
+            (reduce_final_map_size, reduce_final_map_type),
+            (reduce_partial_map_size, reduce_partial_map_type),
+        ) = get_mla_metadata_info_v1(
+            max_num_batched_tokens,
+            1,
+            self.padded_num_heads,
+            torch.bfloat16,
+            dtypes.d_dtypes[config.cache_config.cache_dtype],
+            is_sparse=True,
+            fast_mode=True,
+        )
+        self._mla_work_meta_data = torch.empty(
+            work_meta_data_size, dtype=work_meta_data_type, device=device
+        )
+        self._mla_work_indptr = torch.empty(
+            work_indptr_size, dtype=work_indptr_type, device=device
+        )
+        self._mla_work_info_set = torch.empty(
+            work_info_set_size, dtype=work_info_set_type, device=device
+        )
+        self._mla_reduce_indptr = torch.empty(
+            reduce_indptr_size, dtype=reduce_indptr_type, device=device
+        )
+        self._mla_reduce_final_map = torch.empty(
+            reduce_final_map_size, dtype=reduce_final_map_type, device=device
+        )
+        self._mla_reduce_partial_map = torch.empty(
+            reduce_partial_map_size,
+            dtype=reduce_partial_map_type,
+            device=device,
         )
 
     return init_method_under_plugin_mode
