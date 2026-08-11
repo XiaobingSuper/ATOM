@@ -197,15 +197,31 @@ class _NoPositionalRotaryEmbedding(RotaryEmbedding):
 
 
 class SituAndMul(nn.Module):
-    def __init__(self, beta: float = 1.0, linear_beta: float | None = None):
+    def __init__(
+        self,
+        beta: float = 1.0,
+        linear_beta: float | None = None,
+        quant_type: QuantType | None = None,
+        quant_dtype: torch.dtype | None = None,
+    ):
         super().__init__()
         self.beta = beta
         self.linear_beta = linear_beta
+        self.quant_type = quant_type
+        self.quant_dtype = quant_dtype
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from atom.model_ops.kimi_k3 import situ_and_mul
 
-        return situ_and_mul(x, self.beta, self.linear_beta)
+        return situ_and_mul(
+            x,
+            self.beta,
+            self.linear_beta,
+            quant_type=self.quant_type,
+            quant_dtype=self.quant_dtype,
+        )
 
 
 class KimiRMSNormGated(nn.Module):
@@ -276,9 +292,14 @@ class KimiMLP(nn.Module):
         )
         if config.hidden_act != "situ":
             raise ValueError(f"Unsupported Kimi-K3 activation: {config.hidden_act}")
+        down_quant_type, down_quant_dtype = _effective_layer_quant(
+            quant_config, f"{prefix}.down_proj"
+        )
         self.act_fn = SituAndMul(
             beta=getattr(config, "activation_situ_beta", None) or 1.0,
             linear_beta=getattr(config, "activation_situ_linear_beta", None),
+            quant_type=down_quant_type,
+            quant_dtype=down_quant_dtype,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -287,7 +308,11 @@ class KimiMLP(nn.Module):
         x_scale = None
         if isinstance(x, tuple):
             x, x_scale = x
-        return self.down_proj(self.act_fn(self.gate_up_proj(x, x_scale)))
+        activated = self.act_fn(self.gate_up_proj(x, x_scale))
+        if isinstance(activated, tuple):
+            activated, activated_scale = activated
+            return self.down_proj(activated, activated_scale)
+        return self.down_proj(activated)
 
 
 class KimiSparseMoeBlock(nn.Module):

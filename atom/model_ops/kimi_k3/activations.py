@@ -50,6 +50,44 @@ if _HAS_TRITON:
         tl.store(y_ptr + row * stride_ym + col, y.to(y_ptr.dtype.element_ty), mask=mask)
 
     @triton.jit
+    def _situ_and_mul_fp8_per_token_kernel(
+        x_ptr,
+        y_ptr,
+        s_ptr,
+        D,
+        stride_xm,
+        stride_ym,
+        beta,
+        inv_beta,
+        linear_beta,
+        inv_linear_beta,
+        fp8_max,
+        HAS_LINEAR: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        col = tl.arange(0, BLOCK)
+        mask = col < D
+        g = tl.load(x_ptr + row * stride_xm + col, mask=mask, other=0.0).to(tl.float32)
+        u = tl.load(x_ptr + row * stride_xm + D + col, mask=mask, other=0.0).to(
+            tl.float32
+        )
+        gate = beta * (2.0 * tl.sigmoid(2.0 * g * inv_beta) - 1.0) * tl.sigmoid(g)
+        if HAS_LINEAR:
+            u = linear_beta * (2.0 * tl.sigmoid(2.0 * u * inv_linear_beta) - 1.0)
+        value = gate * u
+        amax = tl.max(tl.where(mask, tl.abs(value), 0.0))
+        scale = amax / fp8_max
+        inv_scale = tl.where(scale > 0.0, 1.0 / scale, 0.0)
+        quantized = tl.minimum(tl.maximum(value * inv_scale, -fp8_max), fp8_max)
+        tl.store(
+            y_ptr + row * stride_ym + col,
+            quantized.to(y_ptr.dtype.element_ty),
+            mask=mask,
+        )
+        tl.store(s_ptr + row, scale)
+
+    @triton.jit
     def _rmsnorm_gated_kernel(
         x_ptr,
         w_ptr,
@@ -131,35 +169,111 @@ if _HAS_TRITON:
 
 
 def situ_and_mul(
-    x: torch.Tensor, beta: float, linear_beta: float | None
-) -> torch.Tensor:
+    x: torch.Tensor,
+    beta: float,
+    linear_beta: float | None,
+    quant_type: QuantType | None = None,
+    quant_dtype: torch.dtype | None = None,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """SiTUv2 gated activation over the last dim (x[..., :D] gate, x[..., D:] up)."""
     *lead, two_d = x.shape
     assert two_d % 2 == 0
     d = two_d // 2
     x2 = x.reshape(-1, two_d)
     m = x2.shape[0]
-    y = torch.empty((m, d), dtype=x.dtype, device=x.device)
-    if not _HAS_TRITON or m == 0:
-        return _situ_and_mul_torch(x, beta, linear_beta)
-    BLOCK = 1024
-    grid = (m, triton.cdiv(d, BLOCK))
     has_linear = linear_beta is not None
-    _situ_and_mul_kernel[grid](
-        x2,
-        y,
-        m,
-        d,
-        x2.stride(0),
-        y.stride(0),
-        float(beta),
-        1.0 / float(beta),
-        float(linear_beta) if has_linear else 0.0,
-        (1.0 / float(linear_beta)) if has_linear else 0.0,
-        HAS_LINEAR=has_linear,
-        BLOCK=BLOCK,
+    # QuantType is a pybind enum. Compare its integer value, as the existing
+    # compiled linear paths do; Python equality graph-breaks and enum wrapper
+    # identity is not stable across spawned model workers.
+    wants_ptpc = (
+        quant_type is not None
+        and quant_type.value == QuantType.per_Token.value
+        and quant_dtype is dtypes.fp8
     )
-    return y.reshape(*lead, d)
+    assert (
+        wants_ptpc
+        or quant_type is None
+        or quant_type.value == QuantType.No.value
+    ), (
+        "situ_and_mul only supports no quantization or per-token FP8"
+    )
+
+    if (
+        wants_ptpc
+        and m > 0
+        and has_linear
+        and x.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and d % 8 == 0
+        and d <= 4096
+    ):
+        from aiter.jit.utils.chip_info import get_gfx
+
+        gfx = get_gfx()
+        use_hip_quant = gfx in ("gfx950", "gfx1250")
+        if use_hip_quant:
+            try:
+                from aiter.ops.activation import situv2_and_mul_quant
+            except ImportError:
+                pass
+            else:
+                y = torch.empty((m, d), dtype=quant_dtype, device=x.device)
+                scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+                situv2_and_mul_quant(
+                    y,
+                    x2,
+                    scale,
+                    d,
+                    float(beta),
+                    float(linear_beta),
+                )
+                return y.reshape(*lead, d), scale.reshape(*lead, 1)
+
+    if wants_ptpc and _HAS_TRITON and m > 0 and d <= 4096:
+        y = torch.empty((m, d), dtype=quant_dtype, device=x.device)
+        scale = torch.empty((m, 1), dtype=torch.float32, device=x.device)
+        block = triton.next_power_of_2(d)
+        _situ_and_mul_fp8_per_token_kernel[(m,)](
+            x2,
+            y,
+            scale,
+            d,
+            x2.stride(0),
+            y.stride(0),
+            float(beta),
+            1.0 / float(beta),
+            float(linear_beta) if has_linear else 0.0,
+            (1.0 / float(linear_beta)) if has_linear else 0.0,
+            float(torch.finfo(quant_dtype).max),
+            HAS_LINEAR=has_linear,
+            BLOCK=block,
+            num_warps=4 if block <= 1024 else 8,
+        )
+        return y.reshape(*lead, d), scale.reshape(*lead, 1)
+
+    if not _HAS_TRITON or m == 0:
+        y = _situ_and_mul_torch(x, beta, linear_beta)
+    else:
+        y = torch.empty((m, d), dtype=x.dtype, device=x.device)
+        block = 1024
+        _situ_and_mul_kernel[(m, triton.cdiv(d, block))](
+            x2,
+            y,
+            m,
+            d,
+            x2.stride(0),
+            y.stride(0),
+            float(beta),
+            1.0 / float(beta),
+            float(linear_beta) if has_linear else 0.0,
+            (1.0 / float(linear_beta)) if has_linear else 0.0,
+            HAS_LINEAR=has_linear,
+            BLOCK=block,
+        )
+        y = y.reshape(*lead, d)
+    if wants_ptpc:
+        return get_hip_quant(QuantType.per_Token)(y, quant_dtype=quant_dtype)
+    return y
 
 
 def rmsnorm_gated(
@@ -184,14 +298,17 @@ def rmsnorm_gated(
     ``x`` is normed row-wise and is made contiguous (cheap; the caller's ``out``
     already is). Supports a 2D ``[M, H]`` or 3D ``[outer, heads, H]`` gate.
     """
-    if quant_type == QuantType.per_Token and quant_dtype == dtypes.fp8:
+    if (
+        quant_type is not None
+        and quant_type.value == QuantType.per_Token.value
+        and quant_dtype is dtypes.fp8
+    ):
         return _rmsnorm_gated_per_token_quant(x, weight, gate, eps, quant_dtype)
     # Only the no-quant (bf16) path remains. Any other requested scheme is
     # unsupported here -- fail loud rather than silently feed bf16 activations to
     # a GEMM that expects quantized input.
-    assert quant_type in (None, QuantType.No), (
-        "rmsnorm_gated only fuses per-token FP8 quant; got "
-        f"quant_type={quant_type}, quant_dtype={quant_dtype}"
+    assert quant_type is None or quant_type.value == QuantType.No.value, (
+        "rmsnorm_gated only supports no quantization or per-token FP8"
     )
     h = x.shape[-1]
     x2 = x.reshape(-1, h)

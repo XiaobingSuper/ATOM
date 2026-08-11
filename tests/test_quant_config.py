@@ -426,6 +426,23 @@ class TestQuantizationConfigInit:
         assert spec.quant_dtype == FP4X2
         assert qcfg.online_exclude_layers == ["lm_head", "*.gate.*"]
 
+    def test_compressed_tensors_checkpoint_enables_online_ptpc(self):
+        hf = FakeHFConfig(
+            torch_dtype=BF16,
+            quantization_config={
+                "quant_method": "compressed-tensors",
+                "config_groups": {},
+            },
+        )
+        qcfg = QuantizationConfig(
+            hf,
+            online_quant_config={"global_quant_config": "ptpc_fp8"},
+        )
+
+        assert qcfg.online_quant is True
+        assert qcfg.online_global_spec.quant_type == QuantType.per_Token
+        assert qcfg.online_global_spec.quant_dtype == FP8
+
     def test_quark_config_parses_global_and_layer(self):
         hf = FakeHFConfig(
             torch_dtype=BF16,

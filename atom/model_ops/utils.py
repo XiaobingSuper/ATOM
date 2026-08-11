@@ -131,7 +131,11 @@ def requantize_with_max_scale(
     return max_w_scale, weight.view(quant_dtype)
 
 
-def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16, 16)):
+def shuffle_weights(
+    *tensors: torch.nn.Parameter,
+    layout: tuple[int, int] = (16, 16),
+    pad_k_to: int = 0,
+):
     """
     Applies shuffle_weight function from AITER to each
     input tensor and returns them.
@@ -144,6 +148,8 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
         layout: A pair of integers specifying the
         block sizes used to divide the tensors during shuffling.
         Default is (16, 16).
+        pad_k_to: Optionally round the K dimension up to this multiple before
+        shuffling. Supported for 2D weights only.
 
     Returns:
     A Tuple of shuffled tensors.
@@ -154,8 +160,10 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
         weight = tensor.data
         if weight.dim() == 2:
-            tensor.data = shuffle_weight(weight, layout=layout)
+            tensor.data = shuffle_weight(weight, layout=layout, pad_k_to=pad_k_to)
         elif weight.dim() == 3:
+            if pad_k_to:
+                raise ValueError("pad_k_to is only supported for 2D weights")
             # Split fully on dim0 and shuffle each 2D slice independently.
             for i in range(weight.shape[0]):
                 weight[i].copy_(shuffle_weight(weight[i], layout=layout))

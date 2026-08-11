@@ -391,6 +391,20 @@ def _a8w8_preshuffle_output_padding(output_size: int) -> int:
     return 0 if remainder == 0 else 128 - remainder
 
 
+def _a8w8_preshuffle_k_padding(input_size: int) -> int:
+    """Return the K-alignment needed by gfx1250's pipelined PTPC kernel.
+
+    The FlyDSL WMMA implementation requires at least two 128-wide K tiles.
+    Keeping this architecture-specific avoids doubling small-K work on other
+    backends that can execute K=128 directly.
+    """
+    if input_size >= 256:
+        return 0
+    from aiter.jit.utils.chip_info import get_gfx
+
+    return 256 if get_gfx() == "gfx1250" else 0
+
+
 class LinearBase(nn.Module):
     def __init__(
         self,
@@ -796,7 +810,13 @@ class LinearBase(nn.Module):
                     need_shuffle = True
             if need_shuffle and self.weight.dim() == 2:
                 self.is_output_padded = self._maybe_pad_a8w8_preshuffle_output()
-                shuffle_weights(self.weight)
+                pad_k_to = (
+                    _a8w8_preshuffle_k_padding(self.weight.shape[1])
+                    if self.quant_type == QuantType.per_Token
+                    and self.params_dtype == dtypes.fp8
+                    else 0
+                )
+                shuffle_weights(self.weight, pad_k_to=pad_k_to)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
         if self.quant_type == QuantType.per_1x32 and (

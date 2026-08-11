@@ -122,6 +122,13 @@ _MLA_Q_OUT_PADDED_DIM = 768
 _MLA_SEG_KV_LORA_RANK = 512
 _MLA_SEG_PE_DIM = 64
 
+def _get_mla_padded_num_heads(num_heads: int, use_seg_mla: bool = False) -> int:
+    padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
+    if use_seg_mla:
+        padded_num_heads = 1 << (padded_num_heads - 1).bit_length()
+    return padded_num_heads
+
+
 if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
@@ -235,21 +242,6 @@ class MLAAttention(nn.Module):
         self.kv_cache_dtype = "fp8" if kv_cache_dtype.startswith("fp8") else "auto"
         self.dtype = dtype
 
-        self.padded_num_heads = max(num_heads, _MLA_MIN_HEADS)
-        self.head_repeat_factor = 1
-        self.head_pad = 0
-        if self.padded_num_heads != num_heads:
-            if self.padded_num_heads % num_heads == 0:
-                self.head_repeat_factor = self.padded_num_heads // num_heads
-                if not getattr(MLAAttention, "_head_repeat_logged", False):
-                    MLAAttention._head_repeat_logged = True
-                    logger.info(
-                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
-                        f"(repeat factor {self.head_repeat_factor})"
-                    )
-            else:
-                self.head_pad = self.padded_num_heads - num_heads
-
         self.q_lora_rank = mla_modules.q_lora_rank
         self.kv_lora_rank = mla_modules.kv_lora_rank
         self.qk_nope_head_dim = mla_modules.qk_nope_head_dim
@@ -294,6 +286,23 @@ class MLAAttention(nn.Module):
         # ==1 falls back to the original interleaved per-token (page_size=1)
         # kernels with an unpadded 576-wide q_out. The triton path never uses seg.
         self.use_seg_mla = (not self.use_triton_mla) and envs.ATOM_MLA_PAGE_SIZE > 1
+        self.padded_num_heads = _get_mla_padded_num_heads(
+            num_heads, self.use_seg_mla
+        )
+        self.head_repeat_factor = 1
+        self.head_pad = 0
+        if self.padded_num_heads != num_heads:
+            if self.padded_num_heads % num_heads == 0:
+                self.head_repeat_factor = self.padded_num_heads // num_heads
+                if not getattr(MLAAttention, "_head_repeat_logged", False):
+                    MLAAttention._head_repeat_logged = True
+                    logger.info(
+                        f"MLA head repeat enabled: {num_heads} -> {self.padded_num_heads} "
+                        f"(repeat factor {self.head_repeat_factor})"
+                    )
+            else:
+                self.head_pad = self.padded_num_heads - num_heads
+
         if self.use_seg_mla:
             if envs.ATOM_MLA_PAGE_SIZE != _MLA_SEG_PAGE_SIZE:
                 raise RuntimeError(

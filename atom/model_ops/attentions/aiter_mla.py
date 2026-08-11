@@ -29,7 +29,7 @@ from atom.distributed.pcp_utils import (
     pcp_round_robin_query_indices,
 )
 from atom.model_engine.scheduler import ScheduledBatch
-from atom.model_ops.attention_mla import _MLA_MIN_HEADS, MLAAttention
+from atom.model_ops.attention_mla import _get_mla_padded_num_heads, MLAAttention
 from atom.utils import CpuGpuBuffer, envs
 from atom.utils.block_convert import (
     kv_indices_generate_triton,
@@ -158,7 +158,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         config = model_runner.config
         hf_config = config.hf_config
         # `self.num_attention_heads` set by CommonAttentionBuilder.__init__.
-        self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
+        self.padded_num_attention_heads = _get_mla_padded_num_heads(
+            self.num_attention_heads, self.block_size > 1
+        )
         self.is_sparse = model_runner.is_deepseek_v32
         self.index_topk = hf_config.index_topk if self.is_sparse else -1
         self.dtype_kv = dtypes.d_dtypes[config.kv_cache_dtype]
