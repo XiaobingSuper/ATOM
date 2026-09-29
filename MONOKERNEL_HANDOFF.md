@@ -10,7 +10,7 @@
 > - GLM-5.2 real weights: TP4 FP8-KV staged MoE passed no-MTP, MTP5, and
 >   DCP4+MTP4; graph supersets cover every C2–C48 recipe bucket and returned
 >   `333` without forced acceptance.
-> - Focused suite: `79 passed`; compileall, `git diff --check`, and IDE lints
+> - Focused suite: `83 passed`; compileall, `git diff --check`, and IDE lints
 >   are clean. The untracked `diff.diff` remains untouched.
 > - Performance: Kimi candidate reduced GPU work/launch count in the recorded
 >   C32 trace. GLM's first A16W4 stage regressed S8 TPOT by ~49%; profile showed
