@@ -2432,3 +2432,14 @@ def test_kimi_block_close_prefix_handoff():
     assert prefix is first
     assert pending is second
     assert pending2 is None
+
+
+def test_kimi_fold_pending_values():
+    import torch
+
+    module = _kimi_mono_module()
+    first = torch.ones(2, 3)
+    second = torch.full((2, 3), 2.0)
+    third = torch.full((2, 3), 3.0)
+    assert torch.equal(module.fold_kimi_pending(first, second, third), first + second + third)
+    assert torch.equal(module.fold_kimi_pending(None, first, second), first + second)

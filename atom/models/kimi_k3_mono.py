@@ -51,6 +51,23 @@ def _need(ok: bool, what: str) -> None:
         raise MonoUnsupported(what)
 
 
+def fold_kimi_pending(
+    prefix_sum: torch.Tensor | None,
+    pending_add: torch.Tensor | None,
+    pending_add2: torch.Tensor | None,
+) -> torch.Tensor:
+    """Materialize the baseline layer return protocol before a native layer."""
+
+    prefix_sum, pending_add, pending_add2 = resolve_attn_res_prefix(
+        prefix_sum, pending_add, pending_add2
+    )
+    if pending_add is not None:
+        prefix_sum = prefix_sum + pending_add
+        if pending_add2 is not None:
+            prefix_sum = prefix_sum + pending_add2
+    return prefix_sum
+
+
 def build_kimi_state_chains(
     output: torch.Tensor,
     resume_columns: torch.Tensor,
@@ -783,9 +800,8 @@ class KimiMonoDecode:
                     attention_delta,
                 )
             else:
-                hidden, pending, pending2 = resolve_attn_res_prefix(
-                    hidden, pending, pending2
-                )
+                hidden = fold_kimi_pending(hidden, pending, pending2)
+                pending = pending2 = None
                 blocks = self._require_blocks(blocks)
                 first_start, first_end = kimi_launch_slices(geometry)[0]
                 first = self._op(
