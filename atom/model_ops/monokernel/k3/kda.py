@@ -36,19 +36,6 @@ from atom.model_ops.monokernel.weights import LayerWeights
 _TP_SIZE = 8
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
-_INPUT_GEMM_ALIGNMENT = 32
-_INPUT_GEMM_CONFIG = {
-    "block_m": 16,
-    "block_n": 32,
-    "block_k": 128,
-    "stages": 6,
-    "split_k": 1,
-    "m_waves": 1,
-    "n_waves": 2,
-    "k_waves": 1,
-    "group_m": 0,
-    "use_half_tile_interleaved": False,
-}
 _OUTPUT_GEMM_CONFIG = {
     "block_m": 16,
     "block_n": 64,
@@ -174,33 +161,14 @@ class KimiK3KdaAttention:
             raise ValueError("KDA weights must be contiguous")
 
         device = self.t["w_kda_in"].device
-        padded_fused_width = (fused_width + _INPUT_GEMM_ALIGNMENT - 1) // _INPUT_GEMM_ALIGNMENT
-        padded_fused_width *= _INPUT_GEMM_ALIGNMENT
+        self.w_kda_in = self.t["w_kda_in"]
         self.fused_input_storage = torch.empty(
             samples,
-            padded_fused_width,
+            fused_width,
             dtype=torch.bfloat16,
             device=device,
         )
-        self.fused_input = self.fused_input_storage[:, :fused_width]
-        if prepared_weights is None:
-            self.w_kda_in_padded = torch.zeros(
-                padded_fused_width,
-                config.hidden,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
-        else:
-            prepared_input = prepared_weights.w_kda_in_padded
-            if prepared_input is None:
-                if not single_launch_attention:
-                    raise ValueError("staged KDA attention requires a padded input weight")
-                self.w_kda_in_padded = None
-            else:
-                if prepared_input.shape != (padded_fused_width, config.hidden):
-                    raise ValueError("prepared KDA input weight has the wrong shape")
-                self.w_kda_in_padded = prepared_input
+        self.fused_input = self.fused_input_storage
         self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
@@ -521,12 +489,10 @@ class KimiK3KdaAttention:
                 self.advance_step()
             return target
 
-        gemm_a16w16(
+        torch.mm(
             hidden_states,
-            self.w_kda_in_padded.T,
+            self.w_kda_in.T,
             out=self.fused_input_storage,
-            user_kwargs=_INPUT_GEMM_CONFIG,
-            layout="nt",
         )
         projection = self.local_projection
         heads = self.config.local_heads

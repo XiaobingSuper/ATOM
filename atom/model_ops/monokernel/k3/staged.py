@@ -20,7 +20,10 @@ from atom.model_ops.monokernel.k3.attn_res import KimiK3AttnRes
 from atom.model_ops.monokernel.k3.kda import KimiK3KdaAttention
 from atom.model_ops.monokernel.k3.mla import KimiK3MlaAttention
 from atom.model_ops.monokernel.k3.moe import kimi_k3_mxfp4_gemm1, kimi_k3_mxfp4_gemm2
-from atom.model_ops.monokernel.k3.prepared import KimiK3PreparedWeights
+from atom.model_ops.monokernel.k3.prepared import (
+    KimiK3PreparedTailWeights,
+    KimiK3PreparedWeights,
+)
 from atom.model_ops.monokernel.k3.router import SigmoidTopkRouter
 from atom.model_ops.monokernel.k3.router_projection import FusedRouterProjection
 from atom.model_ops.monokernel.k3.tail import FusedKimiK3Tail
@@ -70,7 +73,7 @@ class _KimiK3MlaPath:
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         conv_state_rows: int = 3,
         state_dtype: torch.dtype = torch.float32,
-        prepared_weights: KimiK3PreparedWeights | None = None,
+        prepared_weights: KimiK3PreparedTailWeights | None = None,
         prepared_backend: str = "staged",
     ) -> None:
         config = weights.config
@@ -304,7 +307,7 @@ class _KimiK3MlaPath:
         conv_state_layout: ConvStateLayout,
         conv_state_rows: int,
         state_dtype: torch.dtype,
-        prepared_weights: KimiK3PreparedWeights | None,
+        prepared_weights: KimiK3PreparedTailWeights | None,
         prepared_backend: str,
     ):
         del (

@@ -11,11 +11,17 @@ import torch
 
 from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
 from atom.model_ops.monokernel.formats import quantize_mxfp8
-from atom.model_ops.monokernel.packing import pack_bf16, pack_mxfp8_scale, pack_mxfp8_weight
-from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
+from atom.model_ops.monokernel.packing import (
+    pack_bf16,
+    pack_mxfp8_scale,
+    pack_mxfp8_weight,
+)
+from atom.model_ops.monokernel.weights import (
+    LayerWeights,
+    prepare_mxfp4_expert_storage,
+)
 
 MONOKERNEL_INPUT_ROWS = 6400
-_INPUT_ALIGNMENT = 32
 
 
 @dataclass(frozen=True)
@@ -27,15 +33,12 @@ class PreparedMxfp8Weight:
 
 
 @dataclass(frozen=True)
-class KimiK3PreparedWeights:
+class KimiK3PreparedTailWeights:
     source: LayerWeights
     backend: str
     rank: int
     npes: int
     source_ptrs: tuple[tuple[str, int], ...]
-    w_kda_in_padded: torch.Tensor | None
-    w_kda_in_packed: torch.Tensor | None
-    w_kda_o_packed: torch.Tensor | None
     w_router: torch.Tensor
     w_ug: torch.Tensor
     s_ug: torch.Tensor
@@ -48,14 +51,28 @@ class KimiK3PreparedWeights:
 
     def validate_source(self, weights: LayerWeights, backend: str | None = None) -> None:
         if backend is not None and backend != self.backend:
-            raise ValueError(f"prepared Kimi backend is {self.backend!r}, requested {backend!r}")
+            raise ValueError(
+                f"prepared Kimi backend is {self.backend!r}, requested {backend!r}"
+            )
         if weights is not self.source:
             raise ValueError("prepared Kimi weights belong to a different LayerWeights")
-        if weights.config != KIMI_K3_CONFIG or weights.rank != self.rank or weights.npes != self.npes:
+        if (
+            weights.config != KIMI_K3_CONFIG
+            or weights.rank != self.rank
+            or weights.npes != self.npes
+        ):
             raise ValueError("prepared Kimi weight geometry changed")
-        current = tuple((name, weights.t[name].data_ptr()) for name, _ in self.source_ptrs)
+        current = tuple(
+            (name, weights.t[name].data_ptr()) for name, _ in self.source_ptrs
+        )
         if current != self.source_ptrs:
             raise ValueError("prepared Kimi source storage changed")
+
+
+@dataclass(frozen=True)
+class KimiK3PreparedWeights(KimiK3PreparedTailWeights):
+    w_kda_in_packed: torch.Tensor | None
+    w_kda_o_packed: torch.Tensor | None
 
 
 def _prepare_mxfp8(weight: torch.Tensor) -> PreparedMxfp8Weight:
@@ -66,6 +83,52 @@ def _prepare_mxfp8(weight: torch.Tensor) -> PreparedMxfp8Weight:
         weight=pack_mxfp8_weight(quantized),
         scale=pack_mxfp8_scale(scale),
     )
+
+
+def _prepare_tail_kwargs(weights: LayerWeights, backend: str) -> dict:
+    if weights.config != KIMI_K3_CONFIG:
+        raise ValueError(f"expected Kimi-K3 weights, got {weights.config.name!r}")
+    tensors = weights.t
+    required = {
+        "w_r",
+        "w_latent_down",
+        "w_shared_ug",
+        "w_shared_dn",
+        "w_latent_up",
+        "w_ug",
+        "s_ug",
+        "w_dn",
+        "s_dn",
+    }
+    missing = sorted(required.difference(tensors))
+    if missing:
+        raise ValueError(f"missing Kimi tail weights: {', '.join(missing)}")
+    w_ug, s_ug, w_dn, s_dn = prepare_mxfp4_expert_storage(weights)
+    source_ptrs = tuple(
+        (name, tensor.data_ptr()) for name, tensor in sorted(tensors.items())
+    )
+    return {
+        "source": weights,
+        "backend": backend,
+        "rank": weights.rank,
+        "npes": weights.npes,
+        "source_ptrs": source_ptrs,
+        "w_router": pack_bf16(tensors["w_r"]),
+        "w_ug": w_ug,
+        "s_ug": s_ug,
+        "w_dn": w_dn,
+        "s_dn": s_dn,
+        "latent_down": _prepare_mxfp8(tensors["w_latent_down"]),
+        "shared_up": _prepare_mxfp8(tensors["w_shared_ug"]),
+        "shared_down": _prepare_mxfp8(tensors["w_shared_dn"]),
+        "latent_up": _prepare_mxfp8(tensors["w_latent_up"]),
+    }
+
+
+def prepare_kimi_k3_tail_weights(
+    weights: LayerWeights,
+) -> KimiK3PreparedTailWeights:
+    return KimiK3PreparedTailWeights(**_prepare_tail_kwargs(weights, "tail"))
 
 
 def prepare_kimi_k3_weights(
@@ -87,20 +150,6 @@ def prepare_kimi_k3_weights(
     if tensors["w_kda_o"].shape != (config.hidden, projection):
         raise ValueError(f"w_kda_o has shape {tuple(tensors['w_kda_o'].shape)}")
 
-    w_kda_in_padded = None
-    if not mtp:
-        padded_rows = (
-            (fused_width + _INPUT_ALIGNMENT - 1)
-            // _INPUT_ALIGNMENT
-            * _INPUT_ALIGNMENT
-        )
-        w_kda_in_padded = torch.zeros(
-            padded_rows,
-            config.hidden,
-            dtype=torch.bfloat16,
-            device=tensors["w_kda_in"].device,
-        )
-        w_kda_in_padded[:fused_width].copy_(tensors["w_kda_in"])
     w_kda_in_packed = None
     w_kda_o_packed = None
     if backend == "mono" or mtp:
@@ -113,32 +162,18 @@ def prepare_kimi_k3_weights(
         monokernel_input[:fused_width].copy_(tensors["w_kda_in"])
         w_kda_in_packed = pack_bf16(monokernel_input)
         w_kda_o_packed = pack_bf16(tensors["w_kda_o"])
-    w_ug, s_ug, w_dn, s_dn = prepare_mxfp4_expert_storage(weights)
-    source_ptrs = tuple((name, tensor.data_ptr()) for name, tensor in sorted(tensors.items()))
     return KimiK3PreparedWeights(
-        source=weights,
-        backend=backend,
-        rank=weights.rank,
-        npes=weights.npes,
-        source_ptrs=source_ptrs,
-        w_kda_in_padded=w_kda_in_padded,
+        **_prepare_tail_kwargs(weights, backend),
         w_kda_in_packed=w_kda_in_packed,
         w_kda_o_packed=w_kda_o_packed,
-        w_router=pack_bf16(tensors["w_r"]),
-        w_ug=w_ug,
-        s_ug=s_ug,
-        w_dn=w_dn,
-        s_dn=s_dn,
-        latent_down=_prepare_mxfp8(tensors["w_latent_down"]),
-        shared_up=_prepare_mxfp8(tensors["w_shared_ug"]),
-        shared_down=_prepare_mxfp8(tensors["w_shared_dn"]),
-        latent_up=_prepare_mxfp8(tensors["w_latent_up"]),
     )
 
 
 __all__ = [
+    "KimiK3PreparedTailWeights",
     "KimiK3PreparedWeights",
     "MONOKERNEL_INPUT_ROWS",
     "PreparedMxfp8Weight",
+    "prepare_kimi_k3_tail_weights",
     "prepare_kimi_k3_weights",
 ]
