@@ -306,15 +306,34 @@ def test_glm_kernel_indexes_int64_metadata_as_word_offsets():
         / "kernel.py"
     )
     tree = ast.parse(kernel.read_text())
+    helpers = {
+        name: next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        )
+        for name in ("row_position", "row_slot", "row_index_bounds")
+    }
+    for name, helper in helpers.items():
+        forbidden = [
+            node
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call)
+            and (
+                (isinstance(node.func, ast.Name) and node.func.id == "_uniform")
+                or (
+                    isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "readfirstlane"
+                )
+            )
+        ]
+        assert not forbidden, f"{name} must preserve lane-varying sample indices"
+
     for helper_name, pointer_name in (
         ("row_position", "positions"),
         ("row_slot", "slot_mapping"),
     ):
-        helper = next(
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.FunctionDef) and node.name == helper_name
-        )
+        helper = helpers[helper_name]
         load = next(
             node
             for node in ast.walk(helper)

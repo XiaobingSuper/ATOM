@@ -332,8 +332,8 @@ def build_glm5_monokernel(
             return fx.Float32(fx.BFloat16(bo.buffer_load(r, i, vec_width=1, dtype=T.bf16)))
 
         def row_index_bounds(s):
-            begin = _uniform(bo.buffer_load(_rsrc(sparse_kv_indptr), s, vec_width=1, dtype=T.i32))
-            end = _uniform(bo.buffer_load(_rsrc(sparse_kv_indptr), s + 1, vec_width=1, dtype=T.i32))
+            begin = fx.Int32(bo.buffer_load(_rsrc(sparse_kv_indptr), s, vec_width=1, dtype=T.i32))
+            end = fx.Int32(bo.buffer_load(_rsrc(sparse_kv_indptr), s + 1, vec_width=1, dtype=T.i32))
             return begin, end
 
         def row_active(s):
@@ -344,16 +344,16 @@ def build_glm5_monokernel(
 
         def row_position(s):
             if const_expr(use_atom_kv_cache):
-                position = _uniform(
-                    fx.Int32(bo.buffer_load(_rsrc(positions), s * 2, vec_width=1, dtype=T.i32))
+                position = fx.Int32(
+                    bo.buffer_load(_rsrc(positions), s * 2, vec_width=1, dtype=T.i32)
                 )
                 return row_active(s).select(position, fx.Int32(0))
             return pos0 + s
 
         def row_slot(s):
             if const_expr(use_atom_kv_cache):
-                return _uniform(
-                    fx.Int32(bo.buffer_load(_rsrc(slot_mapping), s * 2, vec_width=1, dtype=T.i32))
+                return fx.Int32(
+                    bo.buffer_load(_rsrc(slot_mapping), s * 2, vec_width=1, dtype=T.i32)
                 )
             return pos0 + s
 
