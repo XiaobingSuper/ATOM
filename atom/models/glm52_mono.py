@@ -413,8 +413,9 @@ class Glm52MonoDecode:
                 "glm52", self._mode, samples=samples, tp_size=npes,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
                 mtp=(self._atom_config.speculative_config is not None and self._atom_config.speculative_config.method == "mtp"),
-                query_length=query_length, dcp_size=self._dcp_size,
-                has_moe=True, external_indexer=True, cache_layout="atom",
+                query_length=query_length, dcp=self._dcp_size > 1,
+                dcp_size=self._dcp_size, has_moe=True,
+                external_indexer=True, cache_layout="atom",
             )
             _need(backend == "mono", "layer backend")
             for layer in layers:
