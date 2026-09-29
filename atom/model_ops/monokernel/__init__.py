@@ -13,9 +13,7 @@ from weakref import WeakSet
 _closed_model_monokernels: WeakSet = WeakSet()
 
 
-def close_model_monokernels(model) -> None:
-    """Close each model-owned native runner once before distributed teardown."""
-
+def _owned_model_monokernels(model):
     modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
     seen: set[int] = set()
     for module in modules:
@@ -23,6 +21,24 @@ def close_model_monokernels(model) -> None:
         if owned is None or id(owned) in seen:
             continue
         seen.add(id(owned))
+        yield owned
+
+
+def model_monokernel_memory_reserve(model) -> int:
+    """Return bytes that lazy native runners need beyond loaded model weights."""
+
+    total = 0
+    for owned in _owned_model_monokernels(model):
+        reserve = getattr(owned, "memory_reserve_bytes", None)
+        if callable(reserve):
+            total += max(int(reserve()), 0)
+    return total
+
+
+def close_model_monokernels(model) -> None:
+    """Close each model-owned native runner once before distributed teardown."""
+
+    for owned in _owned_model_monokernels(model):
         try:
             if owned in _closed_model_monokernels:
                 continue
@@ -36,4 +52,4 @@ def close_model_monokernels(model) -> None:
             close()
 
 
-__all__ = ["close_model_monokernels"]
+__all__ = ["close_model_monokernels", "model_monokernel_memory_reserve"]

@@ -71,7 +71,10 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
-from atom.model_ops.monokernel import close_model_monokernels
+from atom.model_ops.monokernel import (
+    close_model_monokernels,
+    model_monokernel_memory_reserve,
+)
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
@@ -922,7 +925,10 @@ class ModelRunner:
         """Extra GPU bytes to hold back from the KV cache budget beyond the
         base overhead. Base runner reserves nothing; override point for
         setups that share the GPU with another process."""
-        return 0
+        del total_bytes
+        if not hasattr(self, "model"):
+            return 0
+        return model_monokernel_memory_reserve(self.model)
 
     def _setup_device_and_distributed(self, rank: int, config: Config):
         # Calculate local device rank considering DP, PP and PCP.

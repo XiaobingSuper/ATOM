@@ -36,6 +36,9 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
+_NATIVE_BUCKETS = 2  # S4 and S8
+_PACKED_RESERVE_PER_LAYER = 320 << 20
+
 
 def _need(ok: bool, what: str) -> None:
     if not ok:
@@ -250,9 +253,7 @@ class KimiMonoDecode:
             (atom_config.tensor_parallel_size == 8, "not TP8"),
             (atom_config.parallel_config.data_parallel_size == 1, "DP"),
             (not atom_config.enable_dp_attention, "DPA"),
-            (getattr(atom_config, "decode_context_parallel_size", 1) == 1, "DCP"),
             (atom_config.pipeline_parallel_size == 1, "PP"),
-            (getattr(atom_config, "speculative_config", None) is None, "MTP/speculative decode"),
             (not is_plugin_mode(), "plugin mode"),
             (atom_config.kv_cache_dtype in ("bf16", "fp8"), "KV dtype"),
         )
@@ -275,6 +276,17 @@ class KimiMonoDecode:
     def _fallback(self, reason: str, samples: int) -> bool:
         self._route_stats().record_fallback(reason, samples)
         return False
+
+    def memory_reserve_bytes(self) -> int:
+        """Reserve KV-budget headroom for lazy S4/S8 packed layer artifacts."""
+
+        if not self._enabled:
+            return 0
+        return (
+            len(self._layer_specs(4))
+            * _NATIVE_BUCKETS
+            * _PACKED_RESERVE_PER_LAYER
+        )
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
         samples = input_ids.numel()
@@ -399,19 +411,10 @@ class KimiMonoDecode:
 
         made = []
         try:
-            for index, (layer, backend, key, weights) in enumerate(mapped, start=1):
+            for layer, backend, key, weights in mapped:
                 self._weights[layer.layer_idx] = weights
                 if key in self._ops:
                     continue
-                if rank == 0:
-                    logger.info(
-                        "Kimi-K3 MonoKernel preparing: backend=%s S=%d layer=%d (%d/%d)",
-                        backend,
-                        samples,
-                        layer.layer_idx,
-                        index,
-                        len(mapped),
-                    )
                 reduction_key = (samples, backend)
                 attention_reduce, moe_reduce = self._reductions.get(
                     reduction_key,

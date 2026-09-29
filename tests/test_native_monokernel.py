@@ -785,7 +785,7 @@ def test_kimi_default_off_does_not_inspect_runtime_config():
         {"decode_context_parallel_size": 2},
     ),
 )
-def test_kimi_constructor_refuses_unsupported_deployment(monkeypatch, override):
+def test_kimi_constructor_defers_agentic_gates_to_each_forward(monkeypatch, override):
     module = _kimi_mono_module()
     config = SimpleNamespace(
         tensor_parallel_size=8,
@@ -802,7 +802,7 @@ def test_kimi_constructor_refuses_unsupported_deployment(monkeypatch, override):
 
     runner = module.KimiMonoDecode(None, config, "auto")
 
-    assert runner._enabled is False
+    assert runner._enabled is True
 
 
 @pytest.mark.parametrize("samples", (4, 8))
@@ -1094,7 +1094,10 @@ def test_native_route_stats_preserve_bounded_fallback_reasons():
 
 
 def test_close_model_monokernels_is_deduplicated_and_idempotent():
-    from atom.model_ops.monokernel import close_model_monokernels
+    from atom.model_ops.monokernel import (
+        close_model_monokernels,
+        model_monokernel_memory_reserve,
+    )
 
     class Owned:
         def __init__(self):
@@ -1115,6 +1118,8 @@ def test_close_model_monokernels_is_deduplicated_and_idempotent():
     close_model_monokernels(model)
 
     assert owned.calls == 1
+    owned.memory_reserve_bytes = lambda: 123
+    assert model_monokernel_memory_reserve(model) == 123
 
 
 def test_model_runner_closes_monokernels_before_distributed_teardown():
@@ -1125,6 +1130,7 @@ def test_model_runner_closes_monokernels_before_distributed_teardown():
     close_at = source.index("close_model_monokernels(self.model)")
     destroy_at = source.index("destroy_dist_env()", close_at)
     assert close_at < destroy_at
+    assert "model_monokernel_memory_reserve(self.model)" in source
 
 
 def test_offline_profiler_forwards_tokenizer_remote_code_trust():
