@@ -11,9 +11,12 @@ from types import SimpleNamespace
 import pytest
 
 from atom.model_ops.monokernel.config import (
+    GLM5_GRAPH_BATCHES,
     ConvStateLayout,
     conv_state_offset,
     conv_state_shape,
+    glm5_kernel_samples,
+    glm5_tp_config,
 )
 from atom.model_ops.monokernel.dispatch import select_backend
 from atom.model_ops.monokernel.glm import layout as glm_layout
@@ -501,9 +504,13 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
     layers = [SimpleNamespace(layer_idx=layer_idx) for layer_idx in (1, 2)]
 
     class FakeOwned:
+        op = object()
         def close(self):
             pass
 
+    op_module = types.ModuleType("atom.model_ops.monokernel.glm.op")
+    op_module.prepare_glm5_weights = lambda *_args: {}
+    monkeypatch.setitem(sys.modules, op_module.__name__, op_module)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank[0])
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
     monkeypatch.setattr(module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object()))
@@ -516,24 +523,27 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
     def runner():
         value = object.__new__(module.Glm52MonoDecode)
         value._lm = SimpleNamespace(model=SimpleNamespace(norm=SimpleNamespace(weight=object())))
-        value._atom_config = SimpleNamespace(hf_config=SimpleNamespace(index_topk=2048))
+        value._atom_config = SimpleNamespace(
+            hf_config=SimpleNamespace(index_topk=2048), tensor_parallel_size=8,
+            kv_cache_dtype="bf16", speculative_config=None,
+        )
         value._mode = "auto"
-        value._ops = {}
-        value._refused = set()
-        value._announced = set()
+        value._required = False
+        value._shard = glm5_tp_config(8)
+        value._ops, value._weights, value._prepared, value._runtimes = {}, {}, {}, {}
+        value._refused, value._announced = set(), set()
         value._mono_layers = lambda: layers
         return value
 
     rank_zero = runner()
-    assert rank_zero._prepare(4)
-    assert rank_zero._prepare(4)
-    assert rank_zero._prepare(8)
+    assert rank_zero._prepare(4, 1)
+    assert rank_zero._prepare(4, 1)
+    assert rank_zero._prepare(8, 1)
     rank[0] = 1
-    assert runner()._prepare(4)
-
+    assert runner()._prepare(4, 1)
     assert messages == [
-        ("GLM-5.2 MonoKernel on: S=%d", 4),
-        ("GLM-5.2 MonoKernel on: S=%d", 8),
+        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 4, 4),
+        ("GLM-5.2 MonoKernel on: S=%d chunk=%d", 8, 8),
     ]
     rank_zero.close()
     assert rank_zero._announced == set()
@@ -551,6 +561,61 @@ def test_model_specific_backend_selection():
     assert select_backend("kimi_k3", "mono", **common) == "mono"
     assert select_backend("kimi_k3", "auto", **common, is_kda=False) is None
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
+
+
+def test_glm_c8_geometry_and_full_graph_ladder():
+    tp8, tp4 = glm5_tp_config(8), glm5_tp_config(4)
+    assert (tp8.local_heads, tp8.inter) == (8, 256)
+    assert (tp4.local_heads, tp4.inter) == (16, 512)
+    assert tp8.local_heads * 8 == tp4.local_heads * 4
+    assert tp8.inter * 8 == tp4.inter * 4
+    assert tp4.n_experts + tp4.num_shared_experts == 257
+    for batch in GLM5_GRAPH_BATCHES:
+        samples = batch * 6
+        assert select_backend(
+            "glm52", "auto", samples=samples, tp_size=4, kv_cache_dtype="fp8",
+            mtp=True, query_length=6,
+        ) == "mono"
+        chunk = glm5_kernel_samples(samples, 6)
+        assert chunk in (6, 12) and chunk % 6 == 0 and samples % chunk == 0
+
+
+def test_glm_q6_sparse_rows_are_intra_request_causal():
+    slots = [100 + i for i in range(12)]
+    flat, indptr, expected = [], [0], []
+    for request in range(2):
+        request_slots = slots[request * 6 : (request + 1) * 6]
+        for token in range(6):
+            row = [10 + request] + request_slots[: token + 1]
+            expected.append(row)
+            flat.extend(row)
+            indptr.append(len(flat))
+    for sample, row in enumerate(expected):
+        actual = glm_layout.sparse_cache_rows(flat, sample=sample, topk=2048, sparse_kv_indptr=indptr)
+        assert actual == row
+        request, token = divmod(sample, 6)
+        assert set(actual).isdisjoint(slots[request * 6 + token + 1 : (request + 1) * 6])
+
+
+def test_glm_tp4_symmetric_and_split_schedule_contracts():
+    cfg, samples = glm5_tp_config(4), 12
+    scratch, symmetric = glm_layout.layout(samples, cfg.local_heads, 4, 2048, inter=cfg.inter)
+    part = 4 * samples * cfg.hidden * 8
+    assert scratch["mid"] >= 0
+    assert symmetric["_part_stride"] == part and symmetric["_bytes"] == 4 * part
+    stages = dict(glm_layout.stage_tasks(
+        samples, cfg.local_heads, 2048, expert_mxfp4=True, inter=cfg.inter
+    ))
+    assert stages["split"] == samples * 2 * (2048 // 32)
+    assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
+
+
+def test_glm_required_c8_decode_does_not_fallback():
+    module = _glm_mono_module()
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._required = True
+    with pytest.raises(module.MonoUnsupported, match="required MonoKernel decode failed"):
+        runner._unsupported("missing FP8 cache")
 
 
 def test_glm_layout_covers_only_requested_decode_batches():
@@ -746,6 +811,7 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
     hf_config = SimpleNamespace(
         model_type="glm_moe_dsa",
         hidden_size=cfg.hidden,
+        num_attention_heads=cfg.local_heads * 8,
         q_lora_rank=cfg.q_lora,
         kv_lora_rank=cfg.kv_lora,
         qk_rope_head_dim=cfg.pe_dim,
@@ -807,6 +873,8 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     runner = object.__new__(module.Glm52MonoDecode)
     runner._enabled = True
     runner._mode = "auto"
+    runner._required = False
+    runner._shard = glm5_tp_config(8)
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=8,
         kv_cache_dtype="bf16",
@@ -818,13 +886,13 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
         model=SimpleNamespace(aux_hidden_state_layers=[], layers=[])
     )
     runner._mono_layers = lambda: []
-    runner._prepare = lambda _samples: True
+    runner._prepare = lambda _samples, _query_length: True
     metadata = SimpleNamespace(
         max_seqlen_q=1,
         slot_mapping=torch.tensor([7, -1, -1, -1], dtype=torch.int64),
         sparse_kv_indptr=torch.tensor([0, 1, 1, 1, 1], dtype=torch.int32),
     )
-    context = SimpleNamespace(is_prefill=False, scheduled_bs=1)
+    context = SimpleNamespace(is_prefill=False, scheduled_bs=1, running_tokens=samples)
     monkeypatch.setattr(
         module,
         "get_forward_context",
@@ -848,6 +916,54 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
         None,
         None,
     )
+
+
+def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
+    import torch
+
+    module = _glm_mono_module()
+    samples, active = 16 * 6, 8 * 6
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._enabled, runner._mode, runner._required = True, "auto", True
+    runner._shard = glm5_tp_config(4)
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=4, kv_cache_dtype="fp8",
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=5),
+        enable_dp_attention=False, decode_context_parallel_size=1,
+    )
+    runner._lm = SimpleNamespace(model=SimpleNamespace(aux_hidden_state_layers=[], layers=[]))
+    runner._mono_layers = lambda: []
+    seen = []
+    runner._prepare = lambda rows, query_length: seen.append((rows, query_length)) or True
+    metadata = SimpleNamespace(
+        max_seqlen_q=6,
+        slot_mapping=torch.cat((
+            torch.arange(active, dtype=torch.int64),
+            torch.full((samples - active,), -1, dtype=torch.int64),
+        )),
+        sparse_kv_indptr=torch.cat((
+            torch.arange(active + 1, dtype=torch.int32),
+            torch.full((samples - active,), active, dtype=torch.int32),
+        )),
+    )
+    context = SimpleNamespace(is_prefill=False, scheduled_bs=8, running_tokens=samples)
+    monkeypatch.setattr(module, "get_forward_context", lambda: SimpleNamespace(
+        context=context, attn_metadata=metadata, ubatch_slices=None, kv_cache_data={}
+    ))
+    monkeypatch.setattr(module, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(module, "_shared_sparse_buffer", lambda _layers: torch.arange(samples, dtype=torch.int32))
+    assert runner.supports(
+        torch.arange(samples), torch.arange(samples, dtype=torch.int64), None, None
+    )
+    assert seen == [(samples, 6)]
+
+
+def test_glm_fp8_fused_576_cache_has_explicit_device_io():
+    kernel = (Path(__file__).parents[1] / "atom" / "model_ops" / "monokernel" / "glm" / "kernel.py").read_text()
+    assert 'cache_fp8 = kv_cache_dtype == "fp8"' in kernel
+    assert "slot * (QK_DIM // 4)" in kernel
+    assert "_fp8_to_bf16x8(raw[0], raw[1])" in kernel
+    assert "_fp8_to_bf16x8(pe_raw[0], pe_raw[1])" in kernel
 
 
 def test_shared_linear_weight_unshuffle_round_trip():

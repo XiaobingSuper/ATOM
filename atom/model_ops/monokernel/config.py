@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -238,6 +238,37 @@ GLM5_CONFIG = LayerConfig(
     local_heads=8,
 )
 
+GLM5_REFERENCE_TP = 8
+GLM5_TP_SIZES = (4, GLM5_REFERENCE_TP)
+GLM5_GRAPH_BATCHES = (1, 2, 4, 8, 12, 16)
+GLM5_QUERY_LENGTHS = (1, 6)
+GLM5_KERNEL_SAMPLES = (1, 2, 4, 6, 8, 12)
+GLM5_GLOBAL_HEADS = GLM5_CONFIG.local_heads * GLM5_REFERENCE_TP
+GLM5_GLOBAL_INTER = GLM5_CONFIG.inter * GLM5_REFERENCE_TP
+
+
+def glm5_tp_config(tp_size: int) -> LayerConfig:
+    """Return the one GLM-5 shard geometry for ``tp_size``."""
+
+    if tp_size not in GLM5_TP_SIZES:
+        raise ValueError(f"GLM-5 tensor parallel size must be one of {GLM5_TP_SIZES}, got {tp_size}")
+    return replace(
+        GLM5_CONFIG,
+        local_heads=GLM5_GLOBAL_HEADS // tp_size,
+        inter=GLM5_GLOBAL_INTER // tp_size,
+    )
+
+
+def glm5_kernel_samples(samples: int, query_length: int) -> int:
+    """Choose an LDS-safe request-aligned launch width."""
+
+    if query_length not in GLM5_QUERY_LENGTHS or samples % query_length:
+        raise ValueError(f"unsupported GLM-5 decode shape samples={samples}, query_length={query_length}")
+    for chunk in reversed(GLM5_KERNEL_SAMPLES):
+        if chunk % query_length == 0 and samples % chunk == 0:
+            return chunk
+    raise ValueError(f"no GLM-5 kernel chunk for samples={samples}, query_length={query_length}")
+
 KIMI_K3_CONFIG = LayerConfig(
     name="kimi_k3",
     hidden=7168,
@@ -311,12 +342,13 @@ def validate_shard(
     npes: int,
     sparse_attention_topk: int,
     model_config: LayerConfig | str = GLM5_CONFIG,
+    supported_samples=SUPPORTED_SAMPLES,
 ) -> None:
     """Validate one model profile before allocating GPU buffers."""
 
     config = as_layer_config(model_config)
-    if samples not in SUPPORTED_SAMPLES:
-        raise ValueError(f"samples must be one of {SUPPORTED_SAMPLES}, got {samples}")
+    if samples not in supported_samples:
+        raise ValueError(f"samples must be one of {supported_samples}, got {samples}")
     if heads != config.local_heads:
         raise ValueError(f"{config.name} requires {config.local_heads} local heads, got {heads}")
     if npes not in SUPPORTED_PEERS:

@@ -12,8 +12,8 @@ import torch
 from atom.model_ops.monokernel.config import (
     AttentionWeight,
     GLM5_CONFIG,
+    GLM5_KERNEL_SAMPLES,
     HIDDEN,
-    INTER,
     KV_LORA,
     MOE_SLOTS,
     N_EXPERTS,
@@ -27,6 +27,7 @@ from atom.model_ops.monokernel.config import (
     Mxfp4WeightLayout,
     RouterWeightLayout,
     as_kv_cache_layout,
+    glm5_tp_config,
     validate_shard,
 )
 from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
@@ -41,6 +42,38 @@ from atom.model_ops.monokernel.runtime import SymmetricPeerBuffer
 from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
 
 __all__ = ["Glm5MonoKernel"]
+
+
+def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | str) -> dict[str, torch.Tensor]:
+    """Pack one layer once for every graph bucket using it."""
+
+    t = W.t
+    expert_mxfp4 = t["w_ug"].dtype is torch.uint8
+    moe_mode = MoeMode.A16W4 if expert_mxfp4 else MoeMode.W8A8
+    profile = replace(W.config, attention_weight=AttentionWeight(attention_weight))
+    atom_experts = (
+        expert_mxfp4
+        and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+        and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+    )
+    if (
+        W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+        or W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+    ) and not atom_experts:
+        raise ValueError("ATOM expert storage requires MXFP4 values and scales together")
+    if atom_experts:
+        packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
+        packed["w_r"] = pack_bf16(t["w_r"])
+        packed.update(dict(zip(("w_ug", "s_ug", "w_dn", "s_dn"), prepare_mxfp4_expert_storage(W))))
+        return packed
+    return pack_layer_weights(
+        t,
+        moe_mode,
+        profile,
+        mxfp4_weight_layout=Mxfp4WeightLayout.NATIVE,
+        mxfp4_scale_layout=Mxfp4ScaleLayout.NATIVE,
+        router_weight_layout=RouterWeightLayout.NATIVE,
+    )
 
 
 class Glm5MonoKernel:
@@ -69,11 +102,15 @@ class Glm5MonoKernel:
         index_max_seq: int = 4096,
         attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
+        kv_cache_dtype: str = "bf16",
+        prepared_weights: dict[str, torch.Tensor] | None = None,
+        runtime: "Glm5MonoKernel | None" = None,
         timeline=False,
     ):
-        if W.config != GLM5_CONFIG:
-            raise ValueError(f"Glm5MonoKernel requires GLM-5 weights, got {W.config.name!r}")
-        validate_shard(samples, W.heads, rank, npes, topk, GLM5_CONFIG)
+        expected_config = glm5_tp_config(npes)
+        if W.config != expected_config:
+            raise ValueError(f"Glm5MonoKernel requires {expected_config}, got {W.config}")
+        validate_shard(samples, W.heads, rank, npes, topk, W.config, supported_samples=GLM5_KERNEL_SAMPLES)
         if not 1 <= launches_per_step <= 128:
             raise ValueError(f"launches_per_step must be in [1, 128], got {launches_per_step}")
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
@@ -82,40 +119,14 @@ class Glm5MonoKernel:
         self.index_max_seq = index_max_seq
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
+        if kv_cache_dtype not in ("bf16", "fp8"):
+            raise ValueError(f"unsupported KV cache dtype {kv_cache_dtype!r}")
+        self.kv_cache_dtype = kv_cache_dtype
         t = W.t
         self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
-        moe_mode = MoeMode.A16W4 if self.expert_mxfp4 else MoeMode.W8A8
-        profile = replace(GLM5_CONFIG, attention_weight=self.attention_weight)
-        atom_experts = (
-            self.expert_mxfp4
-            and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
-            and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+        self.packed = dict(
+            prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
         )
-        if (
-            W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
-            or W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
-        ) and not atom_experts:
-            raise ValueError("ATOM expert storage requires MXFP4 values and scales together")
-        if atom_experts:
-            self.packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
-            self.packed["w_r"] = pack_bf16(t["w_r"])
-            self.packed.update(
-                dict(
-                    zip(
-                        ("w_ug", "s_ug", "w_dn", "s_dn"),
-                        prepare_mxfp4_expert_storage(W),
-                    )
-                )
-            )
-        else:
-            self.packed = pack_layer_weights(
-                t,
-                moe_mode,
-                profile,
-                mxfp4_weight_layout=Mxfp4WeightLayout.NATIVE,
-                mxfp4_scale_layout=Mxfp4ScaleLayout.NATIVE,
-                router_weight_layout=RouterWeightLayout.NATIVE,
-            )
         if with_indexer:
             required = ("w_index_k", "s_index_k", "w_index_w", "w_index_q", "s_index_q", "g_index_k", "b_index_k")
             missing = [name for name in required if name not in t]
@@ -124,9 +135,9 @@ class Glm5MonoKernel:
             self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
             self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
             self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
-        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, with_indexer, index_max_seq)
+        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, with_indexer, index_max_seq, inter=W.config.inter)
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.stages = stage_tasks(samples, W.heads, topk, with_indexer, index_max_seq, self.expert_mxfp4)
+        self.stages = stage_tasks(samples, W.heads, topk, with_indexer, index_max_seq, self.expert_mxfp4, inter=W.config.inter)
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         if with_indexer:
@@ -150,8 +161,17 @@ class Glm5MonoKernel:
             )
         else:
             self.index_params = None
-        self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
-        self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
+        self._owns_runtime = runtime is None
+        if runtime is None:
+            self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
+            self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
+            self.step = torch.zeros(1, dtype=torch.int32, device=dev)
+        else:
+            if runtime.scr_layout != self.scr_layout or runtime.sym_layout != self.sym_layout:
+                raise ValueError("shared GLM runtime geometry mismatch")
+            self.scratch = runtime.scratch
+            self.peer_buffer = runtime.peer_buffer
+            self.step = runtime.step
         self.sym_storage = self.peer_buffer.storage
         self.sym = self.peer_buffer.local_address
         self.peers = self.peer_buffer.addresses
@@ -166,9 +186,10 @@ class Glm5MonoKernel:
             expert_mxfp4=self.expert_mxfp4,
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
+            kv_cache_dtype=self.kv_cache_dtype,
+            inter=W.config.inter,
             timeline=timeline,
         )
-        self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
@@ -202,12 +223,20 @@ class Glm5MonoKernel:
         slot_mapping=None,
         sparse_kv_indptr=None,
     ):
-        """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
+        """One layer.  Mailbox epochs are ``step * launches_per_step + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
         ``advance_step`` (or pass ``advance=True``) once per step.  Both are
         stream-ordered device ops, so the sequence can be captured in a HIP graph."""
         if not 0 <= layer < self.launches_per_step:
             raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
+        total_samples = h.shape[0]
+        if total_samples % self.S:
+            raise ValueError(f"input rows {total_samples} must be divisible by kernel chunk {self.S}")
+        chunks = total_samples // self.S
+        if self.with_indexer and chunks != 1:
+            raise ValueError("fused indexer does not support chunked launches")
+        if not advance and chunks != 1:
+            raise ValueError("chunked launches must advance mailbox epochs")
         if self.with_indexer:
             if index_cache is None:
                 raise ValueError("index_cache is required when with_indexer=True")
@@ -218,67 +247,78 @@ class Glm5MonoKernel:
                 )
         if self.kv_cache_layout is KvCacheLayout.ATOM:
             cache_width = GLM5_CONFIG.kv_lora + GLM5_CONFIG.pe_dim
-            if kv_cache.dtype is not torch.bfloat16 or not kv_cache.is_contiguous():
-                raise ValueError("ATOM KV cache must be contiguous BF16")
+            fp8_dtypes = {
+                dtype for dtype in (getattr(torch, "float8_e4m3fn", None), getattr(torch, "float8_e4m3fnuz", None))
+                if dtype is not None
+            }
+            expected_dtype = (
+                kv_cache.dtype in fp8_dtypes if self.kv_cache_dtype == "fp8" else kv_cache.dtype is torch.bfloat16
+            )
+            if not expected_dtype or not kv_cache.is_contiguous():
+                raise ValueError(f"ATOM KV cache must be contiguous {self.kv_cache_dtype}")
             if kv_cache.shape[-1] != cache_width:
                 raise ValueError(f"ATOM KV cache last dimension must be {cache_width}, got {tuple(kv_cache.shape)}")
             if kv_cache.data_ptr() != pe_cache.data_ptr():
                 raise ValueError("ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache")
             for name, value, dtype, size in (
-                ("positions", positions, torch.int64, self.S),
-                ("slot_mapping", slot_mapping, torch.int64, self.S),
-                ("sparse_kv_indptr", sparse_kv_indptr, torch.int32, self.S + 1),
+                ("positions", positions, torch.int64, total_samples),
+                ("slot_mapping", slot_mapping, torch.int64, total_samples),
+                ("sparse_kv_indptr", sparse_kv_indptr, torch.int32, total_samples + 1),
             ):
                 if value is None or value.dtype is not dtype or value.numel() < size or not value.is_contiguous():
                     got = None if value is None else (tuple(value.shape), value.dtype)
                     raise ValueError(f"{name} must be contiguous {dtype} with at least {size} values, got {got}")
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(self.S, HIDDEN, dtype=torch.bfloat16, device=h.device)
+            x_out = torch.empty(total_samples, HIDDEN, dtype=torch.bfloat16, device=h.device)
+        elif x_out.shape != (total_samples, HIDDEN):
+            raise ValueError(f"x_out must have shape {(total_samples, HIDDEN)}, got {tuple(x_out.shape)}")
         p = lambda x: x.data_ptr()  # noqa: E731
-        self.launch(
-            p(h),
-            p(x_out),
-            p(cur_pos),
-            p(cur_pos if positions is None else positions),
-            p(cur_pos if slot_mapping is None else slot_mapping),
-            p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr),
-            p(kv_cache),
-            p(pe_cache),
-            p(index_cache) if self.with_indexer else p(indices),
-            p(cos),
-            p(sin),
-            p(t["g_in"]),
-            p(t["g_q"]),
-            p(t["g_kv"]),
-            p(t["g_post"]),
-            p(t["w_qkv_a"]),
-            p(t.get("s_qkv_a", t["w_qkv_a"])),
-            p(t["w_q_b"]),
-            p(t.get("s_q_b", t["w_q_b"])),
-            p(t["w_uk"]),
-            p(t.get("s_uk", t["w_uk"])),
-            p(t["w_uv"]),
-            p(t.get("s_uv", t["w_uv"])),
-            p(t["w_o"]),
-            p(t.get("s_o", t["w_o"])),
-            p(t["w_r"]),
-            p(t["bias"]),
-            p(t["w_ug"]),
-            p(t["s_ug"]),
-            p(t["w_dn"]),
-            p(t["s_dn"]),
-            p(self.scratch),
-            self.sym,
-            p(self.peers),
-            p(self.index_params) if self.with_indexer else (0 if self.timeline is None else p(self.timeline)),
-            p(self.step),
-            self.rank,
-            layer,
-            stream=torch.cuda.current_stream(),
-        )
-        if advance:
-            self.advance_step()
+        for chunk in range(chunks):
+            row = chunk * self.S
+            self.launch(
+                p(h) + row * HIDDEN * h.element_size(),
+                p(x_out) + row * HIDDEN * x_out.element_size(),
+                p(cur_pos),
+                p(cur_pos if positions is None else positions) + (0 if positions is None else row * 8),
+                p(cur_pos if slot_mapping is None else slot_mapping) + (0 if slot_mapping is None else row * 8),
+                p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr) + (0 if sparse_kv_indptr is None else row * 4),
+                p(kv_cache),
+                p(pe_cache),
+                p(index_cache) if self.with_indexer else p(indices),
+                p(cos),
+                p(sin),
+                p(t["g_in"]),
+                p(t["g_q"]),
+                p(t["g_kv"]),
+                p(t["g_post"]),
+                p(t["w_qkv_a"]),
+                p(t.get("s_qkv_a", t["w_qkv_a"])),
+                p(t["w_q_b"]),
+                p(t.get("s_q_b", t["w_q_b"])),
+                p(t["w_uk"]),
+                p(t.get("s_uk", t["w_uk"])),
+                p(t["w_uv"]),
+                p(t.get("s_uv", t["w_uv"])),
+                p(t["w_o"]),
+                p(t.get("s_o", t["w_o"])),
+                p(t["w_r"]),
+                p(t["bias"]),
+                p(t["w_ug"]),
+                p(t["s_ug"]),
+                p(t["w_dn"]),
+                p(t["s_dn"]),
+                p(self.scratch),
+                self.sym,
+                p(self.peers),
+                p(self.index_params) if self.with_indexer else (0 if self.timeline is None else p(self.timeline)),
+                p(self.step),
+                self.rank,
+                layer,
+                stream=torch.cuda.current_stream(),
+            )
+            if chunk + 1 < chunks or advance:
+                self.advance_step()
         return x_out
 
     def advance_step(self):
@@ -287,7 +327,8 @@ class Glm5MonoKernel:
     def close(self):
         """Release this rank's remote HIP IPC mappings."""
 
-        self.peer_buffer.close()
+        if self._owns_runtime:
+            self.peer_buffer.close()
 
     def __enter__(self):
         return self
@@ -334,7 +375,7 @@ class Glm5MonoKernel:
             scores=self.debug("scores", (S, N_EXPERTS)),
             sel=self.debug("sel", (S, MOE_SLOTS), torch.int32),
             prob=self.debug("prob", (S, MOE_SLOTS)),
-            mid=self.debug("mid", (S, MOE_SLOTS, INTER)),
+            mid=self.debug("mid", (S, MOE_SLOTS, self.W.config.inter)),
             xq=self.debug("xqd", (S, HIDDEN), pairs=False),
         )
         if self.with_indexer:

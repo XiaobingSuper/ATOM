@@ -92,10 +92,10 @@ def sparse_keys_per_task(samples: int) -> int:
     return 32 if samples > 4 else 64
 
 
-def ug_split(samples: int):
+def ug_split(samples: int, inter: int = INTER):
     """Return the balanced up/gate leftover split for batches two and four."""
 
-    full_tiles, remainder = divmod((samples * TOP_K + 1) * N_UG_PER_SLOT, BLOCKS)
+    full_tiles, remainder = divmod((samples * TOP_K + 1) * (inter // UG_TILE), BLOCKS)
     if samples not in (2, 4) or remainder == 0 or BLOCKS % remainder:
         return None
     segments = BLOCKS // remainder
@@ -115,6 +115,7 @@ def layout(
     sparse_attention_topk: int,
     with_indexer: bool = False,
     index_max_seq: int = 4096,
+    inter: int = INTER,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
 
@@ -139,7 +140,7 @@ def layout(
         ("xqs", samples * XQ_BLOCKS * pair_bytes),
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
-        ("mid", samples * MOE_SLOTS * INTER * pair_bytes),
+        ("mid", samples * MOE_SLOTS * inter * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * HIDDEN * 4),
     ]
@@ -179,6 +180,7 @@ def stage_tasks(
     with_indexer: bool = False,
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
+    inter: int = INTER,
 ):
     """Return ``(stage name, task count)`` pairs in execution order."""
 
@@ -197,11 +199,11 @@ def stage_tasks(
             ("index_select", samples),
         ]
     tasks += [
-        ("split", samples * (sparse_attention_topk // sparse_keys_per_task(samples))),
+        ("split", samples * (heads // WAVES) * (sparse_attention_topk // sparse_keys_per_task(samples))),
         ("uv", samples * (heads * V_DIM // UV_TILE)),
         ("o", N_ROW_TILES),
         ("router", samples * N_ROUTER),
-        ("ug", BLOCKS if samples == 1 else samples * BLOCKS),
+        ("ug", BLOCKS if samples == 1 else samples * max(BLOCKS, ((MOE_SLOTS * inter // UG_TILE + BLOCKS - 1) // BLOCKS) * BLOCKS)),
         ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
     ]
     return tasks
