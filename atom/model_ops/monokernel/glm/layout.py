@@ -56,18 +56,24 @@ def sparse_cache_rows(
     return sparse_kv_indices[start : start + count]
 
 
-def paged_row_contract(sparse_kv_indices, sparse_kv_indptr, sample: int):
+def paged_row_contract(
+    sparse_kv_indices,
+    sparse_kv_indptr,
+    sample: int,
+    slot_mapping=None,
+):
     """Reference the device contract for one ATOM-layout request row."""
 
     start, end = sparse_kv_indptr[sample : sample + 2]
     active = end > start
     rows = sparse_kv_indices[start:end] if active else ()
+    owns_slot = slot_mapping is None or slot_mapping[sample] >= 0
     return {
         "active": active,
         "context": end - start,
         "index_base": start if active else 0,
         "safe_row": rows[0] if active else 0,
-        "write_cache": active,
+        "write_cache": active and owns_slot,
     }
 
 

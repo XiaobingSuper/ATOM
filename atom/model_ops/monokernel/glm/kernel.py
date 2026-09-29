@@ -317,7 +317,7 @@ def build_glm5_monokernel(
         # makes it unique per layer within the step.
         step_value = _uniform(bo.buffer_load(_rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        peer_slot = (step_value * launches_per_step + layer) & 1
+        peer_slot = step_value & 1
         pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
         r_peers = _rsrc(peers)
         # One wave sends to one peer, so retain only that wave's destination.
@@ -352,6 +352,9 @@ def build_glm5_monokernel(
             if const_expr(use_atom_kv_cache):
                 return _uniform(fx.Int32(bo.buffer_load(_rsrc(slot_mapping), s, vec_width=1, dtype=T.i64)))
             return pos0 + s
+
+        def row_writes_cache(s):
+            return row_active(s) & (row_slot(s) >= 0)
 
         def lds_ld(ptr, i):
             return fx.ptr_load(ptr + i)
@@ -1057,10 +1060,10 @@ def build_glm5_monokernel(
             for s in range_constexpr(S):
                 pos = row_position(s)
                 slot = row_slot(s)
-                active = row_active(s)
+                writes_cache = row_writes_cache(s)
                 kvn = bf16_round(vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g)
                 if const_expr(use_atom_kv_cache):
-                    if active:
+                    if writes_cache:
                         bo.buffer_store(kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid)
                 else:
                     bo.buffer_store(kvn.to(fx.BFloat16), r_kv, pos * KV_LORA + tid)
@@ -1071,7 +1074,7 @@ def build_glm5_monokernel(
                     p0 = bf16_round(x0 * c - x1 * sn)
                     p1 = bf16_round(x0 * sn + x1 * c)
                     if const_expr(use_atom_kv_cache):
-                        if active:
+                        if writes_cache:
                             pe_offset = slot * QK_DIM + KV_LORA + tid * 2
                             bo.buffer_store(p0.to(fx.BFloat16), r_pe, pe_offset)
                             bo.buffer_store(p1.to(fx.BFloat16), r_pe, pe_offset + 1)
@@ -1748,8 +1751,9 @@ def build_glm5_monokernel(
                 l_sp = ok_sp.select(ml_got[1][0].bitcast(fx.Float32), fx.Float32(0.0))
                 w_sp = _exp(m_sp - wave_max(m_sp))
                 den = wave_sum(l_sp * w_sp)
+                inv_den = (den > 0.0).select(_rcp(den), fx.Float32(0.0))
                 if ok_sp:
-                    lds_st(misc, lane, w_sp * _rcp(den))
+                    lds_st(misc, lane, w_sp * inv_den)
             stamp("uv", tt, 2)
             gpu.barrier()
             for dh in range_constexpr(2):

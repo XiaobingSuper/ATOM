@@ -325,7 +325,7 @@ def build_kimi_k3_mla_attention(
         # makes it unique per layer within the step.
         step_value = _uniform(bo.buffer_load(_rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        peer_slot = (step_value * launches_per_step + layer) & 1
+        peer_slot = step_value & 1
         pos0 = _uniform(bo.buffer_load(_rsrc(cur_pos), 0, vec_width=1, dtype=T.i32))
         r_peers = _rsrc(peers)
         # Each wave sends to one peer, so retain only that wave's destination.

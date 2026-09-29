@@ -41,6 +41,26 @@ def _need(ok: bool, what: str) -> None:
         raise MonoUnsupported(what)
 
 
+def _kda_state_pool_supported(cache) -> bool:
+    """Validate the fixed native KDA state ABI before any device launch."""
+
+    conv_state = getattr(cache, "k_cache", None)
+    recurrent_state = getattr(cache, "v_cache", None)
+    cfg = KIMI_K3_CONFIG
+    if not isinstance(conv_state, torch.Tensor) or not isinstance(recurrent_state, torch.Tensor):
+        return False
+    slots = conv_state.shape[0] if conv_state.ndim == 3 else 0
+    return (
+        slots > 0
+        and conv_state.shape == (slots, 3, 3 * cfg.local_heads * cfg.v_dim)
+        and conv_state.dtype is torch.bfloat16
+        and conv_state.is_contiguous()
+        and recurrent_state.shape == (slots, cfg.local_heads, cfg.v_dim, cfg.v_dim)
+        and recurrent_state.dtype is torch.float32
+        and recurrent_state.is_contiguous()
+    )
+
+
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     attn = layer.self_attn
     moe = layer.block_sparse_moe
@@ -192,6 +212,7 @@ class _KimiLayerOp:
             group=tp.cpu_group,
             reduce_group=tp.device_group,
             mtp=False,
+            launches_per_step=1,
             conv_state_layout=ConvStateLayout.TIME_MAJOR,
         )
 
@@ -216,7 +237,9 @@ class KimiMonoDecode:
             (atom_config.tensor_parallel_size == 8, "not TP8"),
             (atom_config.parallel_config.data_parallel_size == 1, "DP"),
             (not atom_config.enable_dp_attention, "DPA"),
+            (getattr(atom_config, "decode_context_parallel_size", 1) == 1, "DCP"),
             (atom_config.pipeline_parallel_size == 1, "PP"),
+            (getattr(atom_config, "speculative_config", None) is None, "MTP/speculative decode"),
             (not is_plugin_mode(), "plugin mode"),
             (atom_config.kv_cache_dtype in ("bf16", "fp8"), "KV dtype"),
         )
@@ -243,7 +266,12 @@ class KimiMonoDecode:
             tp_size=self._atom_config.tensor_parallel_size,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
         )
-        if backend is None or positions.numel() != samples:
+        if (
+            backend is None
+            or positions.dtype is not torch.int64
+            or positions.numel() != samples
+            or not positions.is_contiguous()
+        ):
             return False
         fwd = get_forward_context()
         if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
@@ -253,13 +281,36 @@ class KimiMonoDecode:
             md = getattr(fwd.attn_metadata, "gdn_metadata", None)
         if md is None:
             return False
-        return (
+        state_indices = getattr(md, "non_spec_state_indices_tensor", None)
+        if (
+            not isinstance(state_indices, torch.Tensor)
+            or state_indices.shape != (samples,)
+            or state_indices.dtype is not torch.int32
+            or not state_indices.is_contiguous()
+        ):
+            return False
+        supported = (
             md.num_prefills == 0
-            and md.num_decodes > 0
+            and md.num_decodes == md.num_actual_tokens
             and md.num_spec_decodes == 0
             and 0 < md.num_actual_tokens <= samples
             and not getattr(md, "replayssm", False)
         )
+        if not supported:
+            return False
+        model = getattr(getattr(self, "_lm", None), "model", None)
+        if model is None:
+            return True
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            if not layer.is_linear_attn or not hasattr(layer, "block_sparse_moe"):
+                continue
+            try:
+                cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
+            except KeyError:
+                return False
+            if not _kda_state_pool_supported(cache):
+                return False
+        return True
 
     def _op(self, layer, samples: int) -> _KimiLayerOp:
         backend = select_backend(
@@ -352,7 +403,7 @@ class KimiMonoDecode:
                 state_indices,
                 cache.k_cache,
                 cache.v_cache,
-                epoch_layer=layer.layer_idx,
+                epoch_layer=0,
             )
         hidden, _ = model.output_attn_res(hidden, blocks, pending, pending2)
         return hidden

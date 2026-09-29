@@ -126,7 +126,7 @@ def build_kimi_k3_tail(
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        slot = (step_value * LAYER_SLOTS + layer) & 1
+        slot = step_value & 1
         routed_base = fx.Int64(slot) * fx.Int64(slot_bytes)
         final_base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
         peer_words = fx.Vector(bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32))

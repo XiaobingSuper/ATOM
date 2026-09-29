@@ -61,7 +61,7 @@ def build_symmetric_bf16_allreduce(
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        slot = (step_value * LAYER_SLOTS + layer) & 1
+        slot = step_value & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
         peer_words = fx.Vector(bo.buffer_load(rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32))
@@ -203,7 +203,7 @@ def build_symmetric_bf16_allreduce_rmsnorm(
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        slot = (step_value * LAYER_SLOTS + layer) & 1
+        slot = step_value & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
         peer_words = fx.Vector(bo.buffer_load(rsrc(peers), wave * 2, vec_width=2, dtype=T.i32))
@@ -401,7 +401,7 @@ def build_symmetric_bf16_final_reduce(
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * LAYER_SLOTS + layer + 1
-        slot = (step_value * LAYER_SLOTS + layer) & 1
+        slot = step_value & 1
         base = fx.Int64(region_base) + fx.Int64(slot) * fx.Int64(slot_bytes)
 
         peer_words = fx.Vector(bo.buffer_load(rsrc(peers), fx.min(wave, npes - 1) * 2, vec_width=2, dtype=T.i32))

@@ -25,6 +25,7 @@ from atom.model_ops.monokernel.config import (
 )
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
+    is_flat_atom_cache_page_size,
     select_backend,
     tp_uniform_local_validation,
 )
@@ -269,7 +270,7 @@ class Glm52MonoDecode:
             (atom_config.kv_cache_dtype == "bf16", "KV dtype"),
             (not is_plugin_mode(), "plugin mode"),
             (not envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV, "shuffled MLA cache"),
-            (envs.ATOM_MLA_PAGE_SIZE is None, "segmented MLA cache"),
+            (is_flat_atom_cache_page_size(envs.ATOM_MLA_PAGE_SIZE), "segmented MLA cache"),
         )
         for ok, why in checks:
             if not ok:
@@ -422,8 +423,10 @@ class Glm52MonoDecode:
             or metadata.max_seqlen_q != 1
             or metadata.slot_mapping.dtype is not torch.int64
             or metadata.slot_mapping.numel() < samples
+            or not metadata.slot_mapping.is_contiguous()
             or metadata.sparse_kv_indptr.dtype is not torch.int32
             or metadata.sparse_kv_indptr.numel() < samples + 1
+            or not metadata.sparse_kv_indptr.is_contiguous()
         ):
             return False
 

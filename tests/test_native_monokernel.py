@@ -107,7 +107,12 @@ def _preshuffled_per_token_fp8_linear(source):
 
 
 def _kimi_decode_context(samples, actual_tokens=None, state_indices=None):
+    import torch
+
     actual_tokens = samples if actual_tokens is None else actual_tokens
+    if state_indices is None:
+        state_indices = torch.arange(samples, dtype=torch.int32)
+        state_indices[actual_tokens:] = -1
     metadata = SimpleNamespace(
         num_prefills=0,
         num_decodes=actual_tokens,
@@ -395,6 +400,14 @@ def test_glm_layout_covers_only_requested_decode_batches():
         assert symmetric["_bytes"] > 0
 
 
+def test_glm_flat_atom_cache_requires_page_one():
+    from atom.model_ops.monokernel.dispatch import is_flat_atom_cache_page_size
+
+    assert is_flat_atom_cache_page_size(1)
+    assert not is_flat_atom_cache_page_size(2)
+    assert not is_flat_atom_cache_page_size(None)
+
+
 def test_glm_flat_and_paged_sparse_indices_are_physical_rows():
     indices = [90, 91, 92, 93, 40, 41, 42, 43]
     assert list(
@@ -433,8 +446,9 @@ def test_glm_flat_and_paged_sparse_indices_are_physical_rows():
 def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
     physical = [17]
     indptr = [0, 1, 1, 1, 1]
+    slots = [7, -1, -1, -1]
 
-    active = glm_layout.paged_row_contract(physical, indptr, 0)
+    active = glm_layout.paged_row_contract(physical, indptr, 0, slots)
     assert active == {
         "active": True,
         "context": 1,
@@ -443,7 +457,7 @@ def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
         "write_cache": True,
     }
     for sample in range(1, 4):
-        padded = glm_layout.paged_row_contract(physical, indptr, sample)
+        padded = glm_layout.paged_row_contract(physical, indptr, sample, slots)
         assert padded == {
             "active": False,
             "context": 0,
@@ -457,6 +471,32 @@ def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
             topk=4,
             sparse_kv_indptr=indptr,
         ) == []
+
+
+def test_glm_non_owner_row_attends_without_writing_cache():
+    contract = glm_layout.paged_row_contract([17], [0, 1], 0, [-1])
+
+    assert contract == {
+        "active": True,
+        "context": 1,
+        "index_base": 0,
+        "safe_row": 17,
+        "write_cache": False,
+    }
+
+
+def test_glm_empty_sparse_merge_avoids_divide_by_zero():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
+
+    assert "def row_writes_cache(s):" in source
+    assert "inv_den = (den > 0.0).select(_rcp(den), fx.Float32(0.0))" in source
 
 
 def test_glm_full_and_shared_layers_use_one_sparse_buffer():
@@ -615,12 +655,22 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
         lambda _layers: torch.arange(samples, dtype=torch.int32),
     )
 
-    assert runner.supports(
+    args = (
         torch.arange(samples),
         torch.arange(samples, dtype=torch.int64),
         None,
         None,
     )
+    assert runner.supports(*args)
+
+    metadata.slot_mapping = torch.arange(samples * 2, dtype=torch.int64)[::2]
+    assert not runner.supports(*args)
+    metadata.slot_mapping = torch.tensor([7, -1, -1, -1], dtype=torch.int64)
+    metadata.sparse_kv_indptr = torch.tensor(
+        [0, 99, 1, 99, 1, 99, 1, 99, 1, 99],
+        dtype=torch.int32,
+    )[::2]
+    assert not runner.supports(*args)
 
 
 def test_shared_linear_weight_unshuffle_round_trip():
@@ -685,6 +735,33 @@ def test_kimi_default_off_does_not_inspect_runtime_config():
     assert runner._ops == {}
 
 
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"speculative_config": object()},
+        {"decode_context_parallel_size": 2},
+    ),
+)
+def test_kimi_constructor_refuses_unsupported_deployment(monkeypatch, override):
+    module = _kimi_mono_module()
+    config = SimpleNamespace(
+        tensor_parallel_size=8,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_dp_attention=False,
+        decode_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        speculative_config=None,
+        kv_cache_dtype="bf16",
+    )
+    for name, value in override.items():
+        setattr(config, name, value)
+    monkeypatch.setattr(module, "is_plugin_mode", lambda: False)
+
+    runner = module.KimiMonoDecode(None, config, "auto")
+
+    assert runner._enabled is False
+
+
 @pytest.mark.parametrize("samples", (4, 8))
 def test_kimi_inputs_embeds_are_eligible(monkeypatch, samples):
     import torch
@@ -704,6 +781,95 @@ def test_kimi_inputs_embeds_are_eligible(monkeypatch, samples):
     assert not runner.supports(input_ids, positions, None, inputs_embeds.float())
     assert not runner.supports(input_ids, positions, None, inputs_embeds[:, :-1])
     assert not runner.supports(input_ids, positions, None, inputs_embeds.T.contiguous().T)
+
+
+def test_kimi_supports_requires_contiguous_int32_decode_slots(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    samples = 4
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
+    inputs = torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16)
+    positions = torch.arange(samples, dtype=torch.int64)
+
+    for invalid in (
+        torch.arange(samples, dtype=torch.int64),
+        torch.arange(samples - 1, dtype=torch.int32),
+        torch.arange(samples * 2, dtype=torch.int32)[::2],
+    ):
+        monkeypatch.setattr(
+            module,
+            "get_forward_context",
+            lambda invalid=invalid: _kimi_decode_context(
+                samples,
+                state_indices=invalid,
+            ),
+        )
+        assert not runner.supports(torch.arange(samples), positions, None, inputs)
+
+
+def test_kimi_supports_rejects_multi_token_decode(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    samples = 4
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
+    context = _kimi_decode_context(samples)
+    context.attn_metadata.kda_metadata.num_decodes = 1
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+
+    assert not runner.supports(
+        torch.arange(samples),
+        torch.arange(samples, dtype=torch.int64),
+        None,
+        torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
+    )
+
+
+def test_kimi_state_pool_contract_requires_bf16_conv_and_fp32_recurrence():
+    import torch
+
+    module = _kimi_mono_module()
+    config = module.KIMI_K3_CONFIG
+    cache = SimpleNamespace(
+        k_cache=torch.zeros(
+            2,
+            3,
+            3 * config.local_heads * config.v_dim,
+            dtype=torch.bfloat16,
+        ),
+        v_cache=torch.zeros(
+            2,
+            config.local_heads,
+            config.v_dim,
+            config.v_dim,
+            dtype=torch.float32,
+        ),
+    )
+
+    assert module._kda_state_pool_supported(cache)
+    cache.v_cache = cache.v_cache.to(torch.bfloat16)
+    assert not module._kda_state_pool_supported(cache)
+    cache.v_cache = torch.zeros(
+        2,
+        config.local_heads,
+        config.v_dim,
+        config.v_dim,
+        dtype=torch.float32,
+    )
+    cache.k_cache = torch.zeros(
+        2,
+        4,
+        3 * config.local_heads * config.v_dim,
+        dtype=torch.bfloat16,
+    )
+    assert not module._kda_state_pool_supported(cache)
 
 
 @pytest.mark.parametrize(("samples", "actual_tokens"), ((4, 3), (8, 5)))
@@ -799,6 +965,39 @@ def test_kimi_negative_slot_device_guards_cover_staged_and_mono_paths():
     assert "if slot >= 0:\n            decode()\n        else:\n            zero_output()" in recurrence
     assert "if (input_slot >= 0) & (output_slot >= 0):" in mono
     assert mono.count("valid_state = (input_slot >= 0) & (output_slot >= 0)") >= 3
+
+
+def test_per_layer_mailboxes_alternate_between_decode_steps():
+    root = Path(__file__).parents[1] / "atom" / "model_ops" / "monokernel"
+    sources = {
+        "symmetric": (root / "symmetric_allreduce.py").read_text(),
+        "tail": (root / "k3" / "tail.py").read_text(),
+        "k3": (root / "k3" / "kernel.py").read_text(),
+        "glm": (root / "glm" / "kernel.py").read_text(),
+    }
+
+    assert sources["symmetric"].count("slot = step_value & 1") == 3
+    assert "slot = step_value & 1" in sources["tail"]
+    assert "slot = step_value & 1" in sources["k3"]
+    assert "peer_slot = step_value & 1" in sources["glm"]
+    for source in sources.values():
+        assert "(step_value * LAYER_SLOTS + layer) & 1" not in source
+        assert "(step_value * launches_per_step + layer) & 1" not in source
+
+
+def test_kimi_mono_respects_declared_mxfp4_layout():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "k3"
+        / "kda.py"
+    ).read_text()
+
+    assert "prepare_mxfp4_expert_storage(self.W)" in source
+    assert 'pack_mxfp4(self.t["w_ug"])' not in source
+    assert 'pack_mxfp4(self.t["w_dn"])' not in source
 
 
 def test_kimi_forward_uses_inputs_embeds(monkeypatch):

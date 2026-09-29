@@ -435,7 +435,7 @@ def build_kimi_k3_monokernel(
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * launches_per_step + layer + 1
-        slot = (step_value * launches_per_step + layer) & 1
+        slot = step_value & 1
         symmetric_base = fx.Int64(slot) * fx.Int64(slot_bytes)
 
         def stamp(index):

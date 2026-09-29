@@ -43,6 +43,12 @@ def normalize_mode(mode: str) -> str:
     return mode
 
 
+def is_flat_atom_cache_page_size(page_size: int | None) -> bool:
+    """Return whether MLA uses one physical cache row per token."""
+
+    return page_size == 1
+
+
 def select_backend(
     model: str,
     mode: str,

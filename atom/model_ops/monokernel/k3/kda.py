@@ -22,12 +22,14 @@ from atom.model_ops.monokernel.k3.kernel import (
 )
 from atom.model_ops.monokernel.packing import (
     pack_bf16,
-    pack_mxfp4,
     pack_mxfp8_scale,
     pack_mxfp8_weight,
 )
 from atom.model_ops.monokernel.symmetric_allreduce import SymmetricBf16Allreduce
-from atom.model_ops.monokernel.weights import LayerWeights
+from atom.model_ops.monokernel.weights import (
+    LayerWeights,
+    prepare_mxfp4_expert_storage,
+)
 
 _TP_SIZE = 8
 _HEAD_DIM = 128
@@ -252,14 +254,17 @@ class KimiK3KdaAttention:
             shared_up, shared_up_scale = quantize_mxfp8(self.t["w_shared_ug"])
             shared_down, shared_down_scale = quantize_mxfp8(self.t["w_shared_dn"])
             latent_up, latent_up_scale = quantize_mxfp8(self.t["w_latent_up"])
+            w_ug, s_ug, w_dn, s_dn = prepare_mxfp4_expert_storage(self.W)
             self.moe_packed = {
                 "w_r": pack_bf16(self.t["w_r"]),
                 "w_latent_down": pack_mxfp8_weight(latent_down),
                 "s_latent_down": pack_mxfp8_scale(latent_down_scale),
                 "w_shared_ug": pack_mxfp8_weight(shared_up),
                 "s_shared_ug": pack_mxfp8_scale(shared_up_scale),
-                "w_ug": pack_mxfp4(self.t["w_ug"]),
-                "w_dn": pack_mxfp4(self.t["w_dn"]),
+                "w_ug": w_ug,
+                "s_ug": s_ug,
+                "w_dn": w_dn,
+                "s_dn": s_dn,
                 "w_shared_dn": pack_mxfp8_weight(shared_down),
                 "s_shared_dn": pack_mxfp8_scale(shared_down_scale),
                 "w_latent_up": pack_mxfp8_weight(latent_up),
@@ -347,6 +352,21 @@ class KimiK3KdaAttention:
                 f"conv_state must be contiguous BF16 {list(expected_conv_state)} "
                 f"for {self.conv_state_layout.value} layout"
             )
+        expected_recurrent_state = (
+            conv_state.shape[0],
+            self.config.local_heads,
+            _HEAD_DIM,
+            _HEAD_DIM,
+        )
+        if (
+            recurrent_state.shape != expected_recurrent_state
+            or recurrent_state.dtype != torch.float32
+            or not recurrent_state.is_contiguous()
+        ):
+            raise ValueError(
+                "recurrent_state must be contiguous FP32 "
+                f"{list(expected_recurrent_state)}"
+            )
 
         if self.monokernel_launch is not None:
             if self.fuse_attn_res:
@@ -405,9 +425,9 @@ class KimiK3KdaAttention:
                 pointer_or_hidden("w_shared_ug"),
                 pointer_or_hidden("s_shared_ug"),
                 pointer_or_hidden("w_ug"),
-                self.t["s_ug"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                pointer_or_hidden("s_ug"),
                 pointer_or_hidden("w_dn"),
-                self.t["s_dn"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                pointer_or_hidden("s_dn"),
                 self.t["g_latent"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
                 pointer_or_hidden("w_shared_dn"),
                 pointer_or_hidden("s_shared_dn"),
@@ -479,10 +499,10 @@ class KimiK3KdaAttention:
                     "peers": self.symmetric_allreduce.peer_buffer.addresses.data_ptr(),
                     "step": self.step.data_ptr(),
                     "rank": self.rank,
-                    "layer": layer,
+                    "layer": 0,
                     "npes": self.npes,
                     "max_pairs": self.symmetric_allreduce.max_pairs,
-                    "layer_slots": MAX_LAYERS_PER_STEP,
+                    "layer_slots": 1,
                 },
             )
         else:
