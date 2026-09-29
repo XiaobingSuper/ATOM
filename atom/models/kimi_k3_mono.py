@@ -361,5 +361,5 @@ class KimiMonoDecode:
         for owned in self._ops.values():
             owned.close()
         self._ops.clear()
-        self._weights.clear()
+        getattr(self, "_weights", {}).clear()
         self._refused.clear()

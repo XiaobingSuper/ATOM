@@ -63,8 +63,9 @@ def _preshuffled_mxfp4_linear(source):
 
     packed, scale = quantize_mxfp4(source)
     fp4_dtype = torch.float4_e2m1fn_x2
-    shuffled_weight = _preshuffle_linear_weight(packed)
+    shuffled_weight = _preshuffle_linear_weight(packed.view(fp4_dtype))
     shuffled_weight.is_shuffled = True
+    rows = source.shape[0]
     groups = scale.shape[1]
     shuffled_scale = (
         scale.reshape(rows // 32, 2, 16, groups // 8, 2, 4)
@@ -233,18 +234,17 @@ def test_tp_validation_consensus_propagates_peer_failure(monkeypatch):
         tp_uniform_local_validation,
     )
 
-    group = object()
-
-    def all_gather_object(output, local, seen_group):
+    def all_gather_object(output, local, group=None):
         assert local is None
-        assert seen_group is group
+        assert group is tp_group
         output[:] = [None, "ValueError: rank-local layout"]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    tp_group = object()
     with pytest.raises(MonoUnsupported, match="rank 1: ValueError: rank-local layout"):
         tp_uniform_local_validation(
             None,
-            group=group,
+            group=tp_group,
             world_size=2,
             context="weight mapping failed",
         )
@@ -364,9 +364,12 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
         "get_tp_group",
         lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
     )
-    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
-
-    module._KimiLayerOp(SimpleNamespace(layer_idx=1), samples=8, mode=mode)
+    module._KimiLayerOp(
+        SimpleNamespace(layer_idx=1),
+        weights=object(),
+        samples=8,
+        mode=mode,
+    )
 
     assert captured[0]["conv_state_layout"] is ConvStateLayout.TIME_MAJOR
 
@@ -521,7 +524,7 @@ def test_glm_bf16_attention_layout_mapping():
     assert torch.equal(w_uv.view(2, 3, 3), by_head[:, 2:])
 
     linear.weight = weight.float()
-    with pytest.raises(module.MonoUnsupported, match="must be BF16"):
+    with pytest.raises(module.MonoUnsupported, match="BF16 weight has dtype"):
         linear_bf16(
             linear,
             name="kv_b_proj",
