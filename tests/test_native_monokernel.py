@@ -487,6 +487,18 @@ def test_kimi_mono_accepts_shared_reduction_dependencies():
     assert dependencies <= forwarded
 
 
+def test_kimi_prepare_defers_collectives_until_rank_consensus():
+    source = (
+        Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
+    ).read_text()
+    prepare = source[source.index("    def _prepare(") : source.index("    def _op(")]
+
+    assert "defer_collectives=True" in prepare
+    assert prepare.index("rank-local construction failed") < prepare.index(
+        "initialize_collectives"
+    )
+
+
 def test_model_specific_backend_selection():
     common = dict(samples=8, tp_size=8, kv_cache_dtype="fp8")
     assert select_backend("glm52", "auto", **common) is None
@@ -565,6 +577,23 @@ def test_glm_staged_moe_uses_fused_fp32_router():
 
     assert "biased_grouped_topk_hip(" in source
     assert "torch.topk(" not in source
+
+
+def test_glm_staged_moe_publishes_only_after_rank_consensus():
+    source = (
+        Path(__file__).parents[1] / "atom" / "models" / "glm52_mono.py"
+    ).read_text()
+    prepare = source[
+        source.index("    def _prepare_staged_moe(") : source.index(
+            "    def _staged_moe_forward("
+        )
+    ]
+
+    assert "staged MoE weight mapping failed" in prepare
+    assert "staged MoE construction failed" in prepare
+    assert prepare.index("staged MoE construction failed") < prepare.index(
+        "self._staged_ops.update"
+    )
 
 
 def test_glm_shard_geometry_derives_from_tensor_parallel_size():

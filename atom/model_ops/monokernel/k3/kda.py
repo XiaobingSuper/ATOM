@@ -95,6 +95,7 @@ class KimiK3KdaAttention:
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
+        defer_collectives: bool = False,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -122,6 +123,7 @@ class KimiK3KdaAttention:
         self.S = samples
         self.rank = rank
         self.npes = npes
+        self.group = group
         self.reduce_group = reduce_group
         self.reduce_backend = reduce_backend
         self.launches_per_step = launches_per_step
@@ -194,16 +196,14 @@ class KimiK3KdaAttention:
         self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
         self.core = KimiK3KdaRecurrence(samples, conv_state_layout, state_dtype)
         if reduce_backend == "symmetric":
-            self.symmetric_allreduce = (
-                symmetric_allreduce
-                if symmetric_allreduce is not None
-                else SymmetricBf16Allreduce(
+            self.symmetric_allreduce = symmetric_allreduce
+            if self.symmetric_allreduce is None and not defer_collectives:
+                self.symmetric_allreduce = SymmetricBf16Allreduce(
                     (self.partial.numel(),),
                     rank=rank,
                     npes=npes,
                     group=group,
                 )
-            )
         else:
             if symmetric_allreduce is not None:
                 raise ValueError("an injected KDA all-reduce requires reduce_backend='symmetric'")
@@ -219,9 +219,10 @@ class KimiK3KdaAttention:
         self.w_kda_in_packed = None
         self.w_kda_o_packed = None
         if (
-            self.symmetric_allreduce is not None
+            reduce_backend == "symmetric"
             and single_launch_attention
             and state_dtype is torch.float32
+            and (self.symmetric_allreduce is not None or defer_collectives)
         ):
             self._pack_monokernel_projections()
             self.monokernel_scratch = torch.zeros(
@@ -242,6 +243,29 @@ class KimiK3KdaAttention:
             raise ValueError("Kimi-K3 MTP currently requires FP32 state")
         if reduce_group is None:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
+
+    def initialize_symmetric_allreduce(
+        self,
+        shared: SymmetricBf16Allreduce | None = None,
+    ) -> SymmetricBf16Allreduce:
+        """Initialize the collective only after rank-local construction agrees."""
+
+        if self.reduce_backend != "symmetric":
+            raise ValueError("deferred KDA collectives require the symmetric backend")
+        if self.symmetric_allreduce is None:
+            self.symmetric_allreduce = (
+                shared
+                if shared is not None
+                else SymmetricBf16Allreduce(
+                    (self.partial.numel(),),
+                    rank=self.rank,
+                    npes=self.npes,
+                    group=self.group,
+                )
+            )
+        elif shared is not None and self.symmetric_allreduce is not shared:
+            raise ValueError("KDA all-reduce was initialized with a different resource")
+        return self.symmetric_allreduce
 
     def _pack_monokernel_projections(self) -> None:
         if self.w_kda_in_packed is not None:

@@ -31,6 +31,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         attention_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
+        defer_collectives: bool = False,
     ) -> None:
         if state_dtype is not torch.float32:
             raise ValueError("Kimi-K3 single-launch MonoKernel requires FP32 state")
@@ -51,6 +52,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             moe_symmetric_allreduce=moe_symmetric_allreduce,
             state_dtype=state_dtype,
+            defer_collectives=defer_collectives,
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)
 

@@ -306,11 +306,22 @@ class Glm52MonoDecode:
             not is_plugin_mode(),
         )
         if all(staged_checks):
+            install_error = None
             try:
                 self._install_staged_moe()
             except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+                install_error = error
+            try:
+                tp_uniform_local_validation(
+                    install_error,
+                    group=get_tp_group().cpu_group,
+                    world_size=get_tensor_model_parallel_world_size(),
+                    context="GLM-5.2 staged MoE installation failed",
+                )
+            except MonoUnsupported as error:
+                self._uninstall_staged_moe()
                 logger.warning("GLM-5.2 staged MoE off: %s", error)
-            else:
+            if install_error is None and self._staged_bindings:
                 self._staged_enabled = True
                 self._enabled = False
                 logger.info(
@@ -409,6 +420,14 @@ class Glm52MonoDecode:
             self._staged_bindings.clear()
             raise
 
+    def _uninstall_staged_moe(self) -> None:
+        context = self._atom_config.compilation_config.static_forward_context
+        for binding in self._staged_bindings:
+            binding.layer.mlp.forward = binding.original
+            if context.get(binding.key) is binding:
+                context.pop(binding.key)
+        self._staged_bindings.clear()
+
     def _prepare_staged_moe(self, rows: int) -> bool:
         if all((binding.layer.layer_idx, rows) in self._staged_ops for binding in self._staged_bindings):
             return True
@@ -433,6 +452,15 @@ class Glm52MonoDecode:
                 world_size=npes,
                 context="GLM-5.2 staged MoE weight mapping failed",
             )
+        except MonoUnsupported as caught:
+            self._staged_refused.add(rows)
+            logger.warning("GLM-5.2 staged MoE fallback before launch: %s", caught)
+            return False
+
+        workspace = None
+        stages = {}
+        construction_error = None
+        try:
             from atom.model_ops.monokernel.glm.staged_moe import (
                 Glm52MoeWorkspace,
                 Glm52Tp4MoeStage,
@@ -453,11 +481,21 @@ class Glm52MonoDecode:
                 )
                 for binding, weights in mapped
             }
-        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as caught:
+        except (AttributeError, RuntimeError, ValueError) as caught:
+            construction_error = caught
+        try:
+            tp_uniform_local_validation(
+                construction_error,
+                group=get_tp_group().cpu_group,
+                world_size=npes,
+                context="GLM-5.2 staged MoE construction failed",
+            )
+        except MonoUnsupported as caught:
             self._staged_refused.add(rows)
             logger.warning("GLM-5.2 staged MoE fallback before launch: %s", caught)
             return False
 
+        assert workspace is not None
         self._staged_workspaces[rows] = workspace
         self._staged_ops.update(stages)
         logger.info(
@@ -725,12 +763,7 @@ class Glm52MonoDecode:
         )
 
     def close(self) -> None:
-        context = self._atom_config.compilation_config.static_forward_context
-        for binding in self._staged_bindings:
-            binding.layer.mlp.forward = binding.original
-            if context.get(binding.key) is binding:
-                context.pop(binding.key)
-        self._staged_bindings.clear()
+        self._uninstall_staged_moe()
         self._staged_ops.clear()
         self._staged_workspaces.clear()
         self._staged_refused.clear()

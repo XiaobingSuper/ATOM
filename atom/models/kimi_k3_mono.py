@@ -222,6 +222,7 @@ class _KimiLayerOp:
         attention_symmetric_allreduce=None,
         moe_symmetric_allreduce=None,
         state_dtype: torch.dtype = torch.float32,
+        defer_collectives: bool = False,
     ) -> None:
         from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
         from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
@@ -243,7 +244,11 @@ class _KimiLayerOp:
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             moe_symmetric_allreduce=moe_symmetric_allreduce,
             state_dtype=state_dtype,
+            defer_collectives=defer_collectives,
         )
+
+    def initialize_collectives(self, attention=None, moe=None):
+        return self.op.initialize_collectives(attention, moe)
 
 
 class KimiMonoDecode:
@@ -432,8 +437,7 @@ class KimiMonoDecode:
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
-        made = []
-        created_reduction_keys = []
+        pending = []
         try:
             for layer, backend, key in specs:
                 if key in self._ops:
@@ -454,11 +458,6 @@ class KimiMonoDecode:
                 )
                 assert weights is not None
                 self._weights[layer.layer_idx] = weights
-                reduction_key = (samples, backend)
-                attention_reduce, moe_reduce = self._reductions.get(
-                    reduction_key,
-                    (None, None),
-                )
                 owned = None
                 construction_error = None
                 try:
@@ -467,9 +466,8 @@ class KimiMonoDecode:
                         weights,
                         samples,
                         backend,
-                        attention_symmetric_allreduce=attention_reduce,
-                        moe_symmetric_allreduce=moe_reduce,
                         state_dtype=state_dtype,
+                        defer_collectives=True,
                     )
                 except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
                     construction_error = error
@@ -477,24 +475,52 @@ class KimiMonoDecode:
                     construction_error,
                     group=tp.cpu_group,
                     world_size=npes,
-                    context=f"Kimi-K3 layer {layer.layer_idx} construction failed",
+                    context=f"Kimi-K3 layer {layer.layer_idx} rank-local construction failed",
                 )
                 assert owned is not None
-                self._ops[key] = owned
-                made.append(key)
-                if reduction_key not in self._reductions:
-                    op = owned.op
-                    self._reductions[reduction_key] = (
-                        op.attention.symmetric_allreduce,
-                        op.symmetric_allreduce,
-                    )
-                    created_reduction_keys.append(reduction_key)
                 owned.op.release_packed_sources()
                 self._weights.pop(layer.layer_idx, None)
+                pending.append((key, backend, owned))
+
+            grouped = {}
+            for key, backend, owned in pending:
+                grouped.setdefault((samples, backend), []).append((key, owned))
+            for reduction_key, group in grouped.items():
+                shared = self._reductions.get(reduction_key, (None, None))
+                for key, owned in group:
+                    initialized = None
+                    initialization_error = None
+                    try:
+                        initialized = owned.initialize_collectives(*shared)
+                    except (AttributeError, RuntimeError, ValueError) as error:
+                        initialization_error = error
+                    tp_uniform_local_validation(
+                        initialization_error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=f"Kimi-K3 layer {key[0]} collective initialization failed",
+                    )
+                    assert initialized is not None
+                    shared = initialized
+                self._reductions[reduction_key] = shared
+
+            self._ops.update((key, owned) for key, _, owned in pending)
         except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
-            for key in reversed(made):
-                self._ops.pop(key)
-            self._close_reductions(reversed(created_reduction_keys))
+            closed = set()
+            for _, _, owned in reversed(pending):
+                reductions = (
+                    getattr(owned.op, "symmetric_allreduce", None),
+                    getattr(owned.op.attention, "symmetric_allreduce", None),
+                )
+                for reduction in reductions:
+                    if reduction is None or id(reduction) in closed:
+                        continue
+                    reduction.close()
+                    closed.add(id(reduction))
+            for reduction_key in {
+                (samples, backend) for _, backend, _ in pending
+            }:
+                self._reductions.pop(reduction_key, None)
             for layer, _, _ in specs:
                 self._weights.pop(layer.layer_idx, None)
             self._refused.update(key for _, _, key in specs)

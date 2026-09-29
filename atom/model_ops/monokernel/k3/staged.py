@@ -76,6 +76,7 @@ class _KimiK3MlaPath:
         attention_symmetric_allreduce=None,
         moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
+        defer_collectives: bool = False,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -97,6 +98,7 @@ class _KimiK3MlaPath:
         self.S = samples
         self.rank = rank
         self.npes = npes
+        self.group = group
         self.reduce_group = reduce_group
         if reduce_backend not in {"symmetric", "nccl"}:
             raise ValueError(f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'")
@@ -150,6 +152,7 @@ class _KimiK3MlaPath:
             conv_state_layout=conv_state_layout,
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             state_dtype=state_dtype,
+            defer_collectives=defer_collectives,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -240,10 +243,9 @@ class _KimiK3MlaPath:
         self.attention_delta = torch.empty_like(self.shared_partial)
         self._profiler = CudaStageProfiler()
         if reduce_backend == "symmetric":
-            self.symmetric_allreduce = (
-                moe_symmetric_allreduce
-                if moe_symmetric_allreduce is not None
-                else SymmetricBf16Allreduce(
+            self.symmetric_allreduce = moe_symmetric_allreduce
+            if self.symmetric_allreduce is None and not defer_collectives:
+                self.symmetric_allreduce = SymmetricBf16Allreduce(
                     (self.routed_partial.numel(), self.final_partial.numel()),
                     rank=rank,
                     npes=npes,
@@ -252,29 +254,63 @@ class _KimiK3MlaPath:
                     final_shard_width=self.hidden_shard,
                     rmsnorm_width=self.routed_hidden,
                 )
-            )
         else:
             if moe_symmetric_allreduce is not None:
                 raise ValueError("an injected MoE all-reduce requires reduce_backend='symmetric'")
             self.symmetric_allreduce = None
-        self.fused_tail = (
-            FusedKimiK3Tail(
-                samples,
-                config.hidden,
-                self.routed_hidden,
-                self.shared_inter,
-                rank,
-                npes,
-                self.symmetric_allreduce.max_pairs,
-            )
-            if self.symmetric_allreduce is not None and self.fuse_shared_experts
-            else None
-        )
+        self.fused_tail = self._build_fused_tail()
 
         # The sorter also clears this output buffer before atomic stage2.
         self.moe_buf = self.routed_partial
         if reduce_group is None:
             raise ValueError("the Kimi-K3 staged path requires a GPU-capable TP reduce_group")
+
+    def _build_fused_tail(self):
+        if self.symmetric_allreduce is None or not self.fuse_shared_experts:
+            return None
+        return FusedKimiK3Tail(
+            self.S,
+            self.config.hidden,
+            self.routed_hidden,
+            self.shared_inter,
+            self.rank,
+            self.npes,
+            self.symmetric_allreduce.max_pairs,
+        )
+
+    def initialize_collectives(
+        self,
+        attention: SymmetricBf16Allreduce | None = None,
+        moe: SymmetricBf16Allreduce | None = None,
+    ) -> tuple[SymmetricBf16Allreduce, SymmetricBf16Allreduce]:
+        """Publish shared reductions after all ranks built local artifacts."""
+
+        initialize_attention = getattr(
+            self.attention,
+            "initialize_symmetric_allreduce",
+            None,
+        )
+        if initialize_attention is None:
+            raise ValueError("deferred collectives require KDA attention")
+        attention = initialize_attention(attention)
+        if self.symmetric_allreduce is None:
+            self.symmetric_allreduce = (
+                moe
+                if moe is not None
+                else SymmetricBf16Allreduce(
+                    (self.routed_partial.numel(), self.final_partial.numel()),
+                    rank=self.rank,
+                    npes=self.npes,
+                    group=self.group,
+                    final_hidden=self.config.hidden,
+                    final_shard_width=self.hidden_shard,
+                    rmsnorm_width=self.routed_hidden,
+                )
+            )
+        elif moe is not None and self.symmetric_allreduce is not moe:
+            raise ValueError("MoE all-reduce was initialized with a different resource")
+        self.fused_tail = self._build_fused_tail()
+        return attention, self.symmetric_allreduce
 
     def _build_attention(
         self,
@@ -292,10 +328,18 @@ class _KimiK3MlaPath:
         conv_state_layout: ConvStateLayout,
         attention_symmetric_allreduce,
         state_dtype: torch.dtype,
+        defer_collectives: bool,
     ):
         if attention_symmetric_allreduce is not None:
             raise ValueError("Kimi-K3 MLA does not accept a KDA all-reduce")
-        del reduce_group, reduce_backend, mtp, conv_state_layout, state_dtype
+        del (
+            reduce_group,
+            reduce_backend,
+            mtp,
+            conv_state_layout,
+            state_dtype,
+            defer_collectives,
+        )
         return KimiK3MlaAttention(
             weights,
             samples,
@@ -759,6 +803,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         conv_state_layout: ConvStateLayout,
         attention_symmetric_allreduce,
         state_dtype: torch.dtype,
+        defer_collectives: bool,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -776,6 +821,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             conv_state_layout=conv_state_layout,
             symmetric_allreduce=attention_symmetric_allreduce,
             state_dtype=state_dtype,
+            defer_collectives=defer_collectives,
         )
 
     def forward(
