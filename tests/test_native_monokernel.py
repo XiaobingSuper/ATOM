@@ -62,6 +62,7 @@ def _preshuffled_mxfp4_linear(source):
     from atom.model_ops.monokernel.formats import dequantize_mxfp4, quantize_mxfp4
 
     packed, scale = quantize_mxfp4(source)
+    rows = source.shape[0]
     fp4_dtype = torch.float4_e2m1fn_x2
     shuffled_weight = _preshuffle_linear_weight(packed)
     shuffled_weight.is_shuffled = True
@@ -144,7 +145,7 @@ def test_peer_buffer_allocation_failure_is_collective(monkeypatch):
     def fail_allocation(*_args, **_kwargs):
         raise RuntimeError("rank 0 allocation failed")
 
-    def all_gather_object(output, local, group):
+    def all_gather_object(output, local, *, group):
         gathers.append((local, group))
         output[:] = [local, (None, (b"peer-handle", 0))]
 
@@ -193,7 +194,7 @@ def test_peer_buffer_remote_open_failure_is_collective(monkeypatch):
     monkeypatch.setattr(runtime, "open_ipc_handle", open_ipc_handle)
     monkeypatch.setattr(runtime, "close_ipc_handle", closed.append)
 
-    def all_gather_object(output, local, group):
+    def all_gather_object(output, local, *, group):
         gathers.append((local, group))
         if len(gathers) == 1:
             output[:] = [
@@ -233,18 +234,18 @@ def test_tp_validation_consensus_propagates_peer_failure(monkeypatch):
         tp_uniform_local_validation,
     )
 
-    group = object()
+    expected_group = object()
 
-    def all_gather_object(output, local, seen_group):
+    def all_gather_object(output, local, *, group):
         assert local is None
-        assert seen_group is group
+        assert group is expected_group
         output[:] = [None, "ValueError: rank-local layout"]
 
     monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
     with pytest.raises(MonoUnsupported, match="rank 1: ValueError: rank-local layout"):
         tp_uniform_local_validation(
             None,
-            group=group,
+            group=expected_group,
             world_size=2,
             context="weight mapping failed",
         )
@@ -364,9 +365,12 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
         "get_tp_group",
         lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
     )
-    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
-
-    module._KimiLayerOp(SimpleNamespace(layer_idx=1), samples=8, mode=mode)
+    module._KimiLayerOp(
+        SimpleNamespace(layer_idx=1),
+        weights=object(),
+        samples=8,
+        mode=mode,
+    )
 
     assert captured[0]["conv_state_layout"] is ConvStateLayout.TIME_MAJOR
 
@@ -521,7 +525,10 @@ def test_glm_bf16_attention_layout_mapping():
     assert torch.equal(w_uv.view(2, 3, 3), by_head[:, 2:])
 
     linear.weight = weight.float()
-    with pytest.raises(module.MonoUnsupported, match="must be BF16"):
+    with pytest.raises(
+        module.MonoUnsupported,
+        match=r"kv_b_proj BF16 weight has dtype torch\.float32",
+    ):
         linear_bf16(
             linear,
             name="kv_b_proj",
@@ -669,6 +676,7 @@ def test_kimi_runner_close_is_idempotent():
     runner = object.__new__(KimiMonoDecode)
     owned = Owned()
     runner._ops = {(1, 4, "staged"): owned}
+    runner._weights = {}
     runner._refused = set()
     runner.close()
     runner.close()
