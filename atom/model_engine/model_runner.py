@@ -71,6 +71,7 @@ from atom.model_ops.eplb import (
     initialize_eplb_runtime,
     with_eplb_forward_monitor,
 )
+from atom.model_ops.monokernel import close_model_monokernels
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
 from atom.spec_decode.drafter import Drafter
@@ -1066,15 +1067,20 @@ class ModelRunner:
         builder = getattr(self, "attn_metadata_builder", None)
         if builder is not None:
             builder.close()
-        # 1. Destroy distributed env (NCCL + CustomAllreduce + process groups)
-        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
-        destroy_dist_env()
-        # 2. Release CUDA graphs
+        # 1. Release CUDA graphs before closing any native runner whose graph
+        #    captures raw IPC addresses.
         if not self.enforce_eager:
             self.graphs = self.graph_pool = None  # type: ignore
         if isinstance(self.model, UBatchWrapper):
             self.model.tbo_graphs.clear()
-        # 3. Release GPU tensors. `kv_cache` is the whole paged pool -- the
+        # 2. Native runners synchronize and close peer mappings collectively,
+        #    so they must close while their process groups are still alive.
+        if hasattr(self, "model"):
+            close_model_monokernels(self.model)
+        # 3. Destroy distributed env (NCCL + CustomAllreduce + process groups).
+        #    Must happen while ops module is still alive for CustomAllreduce cleanup.
+        destroy_dist_env()
+        # 4. Release GPU tensors. `kv_cache` is the whole paged pool -- the
         # scales and any indexer cache are regions of it, not attributes.
         for attr in (
             "kv_cache",

@@ -29,6 +29,7 @@ from atom.model_ops.monokernel.dispatch import (
     select_backend,
     tp_uniform_local_validation,
 )
+from atom.model_ops.monokernel.telemetry import MonoRouteStats
 from atom.model_ops.monokernel.weights import (
     LayerWeights,
     atom_mxfp4_storage_view,
@@ -251,6 +252,7 @@ class Glm52MonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int], _GlmLayerOp] = {}
         self._refused: set[int] = set()
+        self._stats = MonoRouteStats("glm52")
         self._enabled = mode != "off"
         if not self._enabled:
             return
@@ -320,6 +322,20 @@ class Glm52MonoDecode:
                 self._enabled = False
                 return
 
+    def _route_stats(self) -> MonoRouteStats:
+        stats = getattr(self, "_stats", None)
+        if stats is None:
+            stats = MonoRouteStats("glm52")
+            self._stats = stats
+        return stats
+
+    def route_stats(self) -> dict[str, object]:
+        return self._route_stats().snapshot()
+
+    def _fallback(self, reason: str, samples: int) -> bool:
+        self._route_stats().record_fallback(reason, samples)
+        return False
+
     def _mono_layers(self):
         model = self._lm.model
         return [
@@ -357,7 +373,7 @@ class Glm52MonoDecode:
                 )
                 _need(backend == "mono", "layer backend")
                 mapped.append((layer, _layer_weights(layer, rank, npes)))
-        except (MonoUnsupported, ValueError) as error:
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
             validation_error = error
         try:
             tp_uniform_local_validation(
@@ -377,20 +393,28 @@ class Glm52MonoDecode:
                 owned = _GlmLayerOp(weights, samples, self._atom_config.hf_config.index_topk)
                 self._ops[layer.layer_idx, samples] = owned
                 made.append((layer.layer_idx, samples))
-        except (MonoUnsupported, ValueError) as error:
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
             for key in made:
                 self._ops.pop(key).close()
             self._refused.add(samples)
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
+        logger.info(
+            "GLM-5.2 MonoKernel ready: backend=mono S=%d layers=%d",
+            samples,
+            len(mapped),
+        )
         return True
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
-        if not self._enabled or intermediate_tensors is not None:
-            return False
-        if self._lm.model.aux_hidden_state_layers:
-            return False
         samples = input_ids.numel()
+        self._route_stats().record_attempt(samples)
+        if not self._enabled:
+            return self._fallback("disabled", samples)
+        if intermediate_tensors is not None:
+            return self._fallback("pipeline", samples)
+        if self._lm.model.aux_hidden_state_layers:
+            return self._fallback("aux_hidden_states", samples)
         if select_backend(
             "glm52",
             self._mode,
@@ -402,15 +426,15 @@ class Glm52MonoDecode:
             dcp=self._atom_config.decode_context_parallel_size > 1,
             plugin=is_plugin_mode(),
         ) != "mono":
-            return False
+            return self._fallback("dispatch", samples)
         if positions.dtype is not torch.int64 or positions.numel() != samples or not positions.is_contiguous():
-            return False
+            return self._fallback("positions", samples)
         if inputs_embeds is not None and (
             inputs_embeds.shape != (samples, GLM5_CONFIG.hidden)
             or inputs_embeds.dtype is not torch.bfloat16
             or not inputs_embeds.is_contiguous()
         ):
-            return False
+            return self._fallback("inputs_embeds", samples)
 
         fwd = get_forward_context()
         context = fwd.context
@@ -428,7 +452,7 @@ class Glm52MonoDecode:
             or metadata.sparse_kv_indptr.numel() < samples + 1
             or not metadata.sparse_kv_indptr.is_contiguous()
         ):
-            return False
+            return self._fallback("metadata", samples)
 
         try:
             shared = _shared_sparse_buffer(self._lm.model.layers)
@@ -442,8 +466,10 @@ class Glm52MonoDecode:
                     f"layer {layer.layer_idx} fused BF16 cache",
                 )
         except (KeyError, MonoUnsupported):
-            return False
-        return self._prepare(samples)
+            return self._fallback("cache_layout", samples)
+        if not self._prepare(samples):
+            return self._fallback("prepare", samples)
+        return True
 
     @staticmethod
     def _refresh_indexer(layer, state: torch.Tensor, positions: torch.Tensor) -> None:
@@ -477,6 +503,7 @@ class Glm52MonoDecode:
         fwd = get_forward_context()
         metadata = fwd.attn_metadata
         samples = input_ids.numel()
+        self._route_stats().record_hit("mono", samples)
         hidden = model.get_input_embeddings(input_ids) if inputs_embeds is None else inputs_embeds
         residual = None
         shared_indices = _shared_sparse_buffer(model.layers)

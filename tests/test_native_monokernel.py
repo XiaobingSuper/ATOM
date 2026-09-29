@@ -872,6 +872,35 @@ def test_kimi_state_pool_contract_requires_bf16_conv_and_fp32_recurrence():
     assert not module._kda_state_pool_supported(cache)
 
 
+def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    samples = 4
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[], start_layer=0, end_layer=0)
+    )
+    monkeypatch.setattr(module, "get_forward_context", lambda: _kimi_decode_context(samples))
+    calls = []
+    runner._prepare = lambda value: calls.append(value) or False
+    args = (
+        torch.arange(samples),
+        torch.arange(samples, dtype=torch.int64),
+        None,
+        torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
+    )
+
+    assert not runner.supports(*args)
+    assert calls == [samples]
+    runner._prepare = lambda value: calls.append(value) or True
+    assert runner.supports(*args)
+    assert calls == [samples, samples]
+
+
 @pytest.mark.parametrize(("samples", "actual_tokens"), ((4, 3), (8, 5)))
 def test_kimi_graph_padding_dispatches(monkeypatch, samples, actual_tokens):
     import torch
@@ -940,6 +969,8 @@ def test_kimi_padded_forward_propagates_negative_slots_without_state_mutation(
     )
     runner = object.__new__(module.KimiMonoDecode)
     runner._lm = SimpleNamespace(model=model)
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(kv_cache_dtype="bf16")
     runner._op = lambda *_args: SimpleNamespace(op=FakeOp())
     context = _kimi_decode_context(samples, actual_tokens, state_indices)
     context.kv_cache_data = {
@@ -1000,6 +1031,57 @@ def test_kimi_mono_respects_declared_mxfp4_layout():
     assert 'pack_mxfp4(self.t["w_dn"])' not in source
 
 
+def test_native_route_stats_preserve_bounded_fallback_reasons():
+    from atom.model_ops.monokernel.telemetry import MonoRouteStats
+
+    stats = MonoRouteStats("kimi_k3")
+    stats.record_attempt(4)
+    stats.record_hit("staged", 4)
+    stats.record_attempt(8)
+    stats.record_fallback("state_layout", 8)
+
+    assert stats.snapshot() == {
+        "model": "kimi_k3",
+        "attempts": 2,
+        "hits": {"staged:s4": 1},
+        "fallbacks": {"state_layout:s8": 1},
+    }
+
+
+def test_close_model_monokernels_is_deduplicated_and_idempotent():
+    from atom.model_ops.monokernel import close_model_monokernels
+
+    class Owned:
+        def __init__(self):
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+
+    owned = Owned()
+    modules = [
+        SimpleNamespace(_mono=owned),
+        SimpleNamespace(_mono=owned),
+        SimpleNamespace(),
+    ]
+    model = SimpleNamespace(modules=lambda: modules)
+
+    close_model_monokernels(model)
+    close_model_monokernels(model)
+
+    assert owned.calls == 1
+
+
+def test_model_runner_closes_monokernels_before_distributed_teardown():
+    source = (
+        Path(__file__).parents[1] / "atom" / "model_engine" / "model_runner.py"
+    ).read_text()
+
+    close_at = source.index("close_model_monokernels(self.model)")
+    destroy_at = source.index("destroy_dist_env()", close_at)
+    assert close_at < destroy_at
+
+
 def test_kimi_forward_uses_inputs_embeds(monkeypatch):
     import torch
 
@@ -1019,6 +1101,8 @@ def test_kimi_forward_uses_inputs_embeds(monkeypatch):
     )
     runner = object.__new__(module.KimiMonoDecode)
     runner._lm = SimpleNamespace(model=model)
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(kv_cache_dtype="bf16")
     monkeypatch.setattr(module, "get_forward_context", lambda: _kimi_decode_context(samples))
 
     output = runner.forward(torch.arange(samples), torch.arange(samples), inputs_embeds)

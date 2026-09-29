@@ -25,6 +25,7 @@ from atom.model_ops.monokernel.dispatch import (
     select_backend,
     tp_uniform_local_validation,
 )
+from atom.model_ops.monokernel.telemetry import MonoRouteStats
 from atom.model_ops.monokernel.weights import (
     LayerWeights,
     atom_mxfp4_storage_view,
@@ -230,6 +231,7 @@ class KimiMonoDecode:
         self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
         self._refused: set[tuple[int, int, str]] = set()
+        self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
         if not self._enabled:
             return
@@ -249,16 +251,33 @@ class KimiMonoDecode:
                 self._enabled = False
                 break
 
+    def _route_stats(self) -> MonoRouteStats:
+        stats = getattr(self, "_stats", None)
+        if stats is None:
+            stats = MonoRouteStats("kimi_k3")
+            self._stats = stats
+        return stats
+
+    def route_stats(self) -> dict[str, object]:
+        return self._route_stats().snapshot()
+
+    def _fallback(self, reason: str, samples: int) -> bool:
+        self._route_stats().record_fallback(reason, samples)
+        return False
+
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
-        if not self._enabled or intermediate_tensors is not None:
-            return False
         samples = input_ids.numel()
+        self._route_stats().record_attempt(samples)
+        if not self._enabled:
+            return self._fallback("disabled", samples)
+        if intermediate_tensors is not None:
+            return self._fallback("pipeline", samples)
         if inputs_embeds is not None and (
             inputs_embeds.shape != (samples, KIMI_K3_CONFIG.hidden)
             or inputs_embeds.dtype != torch.bfloat16
             or not inputs_embeds.is_contiguous()
         ):
-            return False
+            return self._fallback("inputs_embeds", samples)
         backend = select_backend(
             "kimi_k3",
             self._mode,
@@ -272,15 +291,15 @@ class KimiMonoDecode:
             or positions.numel() != samples
             or not positions.is_contiguous()
         ):
-            return False
+            return self._fallback("dispatch", samples)
         fwd = get_forward_context()
         if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
-            return False
+            return self._fallback("forward_mode", samples)
         md = getattr(fwd.attn_metadata, "kda_metadata", None)
         if md is None:
             md = getattr(fwd.attn_metadata, "gdn_metadata", None)
         if md is None:
-            return False
+            return self._fallback("metadata", samples)
         state_indices = getattr(md, "non_spec_state_indices_tensor", None)
         if (
             not isinstance(state_indices, torch.Tensor)
@@ -288,7 +307,7 @@ class KimiMonoDecode:
             or state_indices.dtype is not torch.int32
             or not state_indices.is_contiguous()
         ):
-            return False
+            return self._fallback("state_indices", samples)
         supported = (
             md.num_prefills == 0
             and md.num_decodes == md.num_actual_tokens
@@ -297,7 +316,7 @@ class KimiMonoDecode:
             and not getattr(md, "replayssm", False)
         )
         if not supported:
-            return False
+            return self._fallback("decode_shape", samples)
         model = getattr(getattr(self, "_lm", None), "model", None)
         if model is None:
             return True
@@ -307,9 +326,86 @@ class KimiMonoDecode:
             try:
                 cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
             except KeyError:
-                return False
+                return self._fallback("state_cache", samples)
             if not _kda_state_pool_supported(cache):
-                return False
+                return self._fallback("state_layout", samples)
+        if not self._prepare(samples):
+            return self._fallback("prepare", samples)
+        return True
+
+    def _layer_specs(self, samples: int):
+        model = self._lm.model
+        specs = []
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            backend = select_backend(
+                "kimi_k3",
+                self._mode,
+                samples=samples,
+                tp_size=8,
+                kv_cache_dtype=self._atom_config.kv_cache_dtype,
+                is_kda=layer.is_linear_attn,
+                has_moe=hasattr(layer, "block_sparse_moe"),
+            )
+            if backend is not None:
+                specs.append((layer, backend, (layer.layer_idx, samples, backend)))
+        return specs
+
+    def _prepare(self, samples: int) -> bool:
+        specs = self._layer_specs(samples)
+        if not specs:
+            return False
+        if all(key in self._ops for _, _, key in specs):
+            return True
+        if any(key in self._refused for _, _, key in specs):
+            return False
+        if torch.cuda.is_current_stream_capturing():
+            return False
+
+        rank = get_tensor_model_parallel_rank()
+        npes = get_tensor_model_parallel_world_size()
+        tp = get_tp_group()
+        mapped = []
+        validation_error = None
+        try:
+            for layer, backend, key in specs:
+                weights = self._weights.get(layer.layer_idx)
+                if weights is None:
+                    weights = _layer_weights(layer, rank, npes)
+                mapped.append((layer, backend, key, weights))
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+            validation_error = error
+        try:
+            tp_uniform_local_validation(
+                validation_error,
+                group=tp.cpu_group,
+                world_size=npes,
+                context=f"Kimi-K3 S{samples} weight mapping failed",
+            )
+        except MonoUnsupported as error:
+            self._refused.update(key for _, _, key in specs)
+            logger.warning("Kimi-K3 MonoKernel fallback before launch: %s", error)
+            return False
+
+        made = []
+        try:
+            for layer, backend, key, weights in mapped:
+                self._weights[layer.layer_idx] = weights
+                if key in self._ops:
+                    continue
+                self._ops[key] = _KimiLayerOp(layer, weights, samples, backend)
+                made.append(key)
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+            for key in reversed(made):
+                self._ops.pop(key).close()
+            self._refused.update(key for _, _, key in specs)
+            logger.warning("Kimi-K3 MonoKernel fallback before launch: %s", error)
+            return False
+        logger.info(
+            "Kimi-K3 MonoKernel ready: backend=%s S=%d layers=%d",
+            specs[0][1],
+            samples,
+            len(specs),
+        )
         return True
 
     def _op(self, layer, samples: int) -> _KimiLayerOp:
@@ -325,40 +421,10 @@ class KimiMonoDecode:
         if backend is None:
             raise MonoUnsupported("layer fallback")
         key = (layer.layer_idx, samples, backend)
-        if key in self._refused:
-            raise MonoUnsupported("layer construction refused")
-        if key not in self._ops:
-            if torch.cuda.is_current_stream_capturing():
-                raise MonoUnsupported("cannot construct during graph capture")
-            rank = get_tensor_model_parallel_rank()
-            npes = get_tensor_model_parallel_world_size()
-            tp = get_tp_group()
-            weights = self._weights.get(layer.layer_idx)
-            validation_error = None
-            if weights is None:
-                try:
-                    weights = _layer_weights(layer, rank, npes)
-                except (MonoUnsupported, ValueError) as error:
-                    validation_error = error
-            try:
-                tp_uniform_local_validation(
-                    validation_error,
-                    group=tp.cpu_group,
-                    world_size=npes,
-                    context=f"layer {layer.layer_idx} weight mapping failed",
-                )
-                assert weights is not None
-                self._weights[layer.layer_idx] = weights
-                self._ops[key] = _KimiLayerOp(layer, weights, samples, backend)
-            except (MonoUnsupported, ValueError) as error:
-                self._refused.add(key)
-                logger.warning(
-                    "Kimi-K3 MonoKernel layer %d fallback: %s",
-                    layer.layer_idx,
-                    error,
-                )
-                raise MonoUnsupported(str(error)) from error
-        return self._ops[key]
+        try:
+            return self._ops[key]
+        except KeyError as error:
+            raise MonoUnsupported("layer was not prepared before launch") from error
 
     def forward(
         self,
@@ -372,6 +438,14 @@ class KimiMonoDecode:
         if md is None:
             md = fwd.attn_metadata.gdn_metadata
         samples = input_ids.numel()
+        backend = select_backend(
+            "kimi_k3",
+            self._mode,
+            samples=samples,
+            tp_size=8,
+            kv_cache_dtype=self._atom_config.kv_cache_dtype,
+        )
+        self._route_stats().record_hit(backend or "baseline", samples)
         hidden = model.get_input_embeddings(input_ids) if inputs_embeds is None else inputs_embeds
         blocks = hidden.new_zeros(samples, 0, hidden.shape[-1])
         pending = pending2 = None
