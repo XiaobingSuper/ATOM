@@ -28,6 +28,8 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         reduce_group=None,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        conv_state_rows: int = 3,
+        state_dtype: torch.dtype = torch.float32,
         prepared_weights: KimiK3PreparedWeights | None = None,
     ) -> None:
         super().__init__(
@@ -44,6 +46,8 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             reduce_backend="symmetric",
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            conv_state_rows=conv_state_rows,
+            state_dtype=state_dtype,
             prepared_weights=prepared_weights,
             prepared_backend="mono",
         )
@@ -57,6 +61,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         *,
+        num_accepted_tokens: torch.Tensor | None = None,
         x_out: torch.Tensor | None = None,
         epoch_layer: int = 0,
         advance: bool = True,
@@ -83,6 +88,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             state_indices,
             conv_state,
             recurrent_state,
+            num_accepted_tokens=num_accepted_tokens,
             x_out=self.attention_delta,
             block_residual=block_residual,
             pre_updated=self.pre_updated,

@@ -9,6 +9,7 @@ import torch
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.arith import ArithValue
 from flydsl.expr.typing import Int32, Int64, Stream, T
@@ -510,10 +511,15 @@ def build_router_projection(
 
             if tid < route_count:
                 expert = fx.ptr_load(route_ids + tid)
-                position = fx.atomic_add(
-                    cumsum + expert + 1,
-                    fx.Int32(1),
-                    syncscope=fx.rocdl.SyncScope.Workgroup,
+                position = fx.Int32(
+                    llvm.AtomicRMWOp(
+                        llvm.AtomicBinOp.add,
+                        (cumsum + expert + 1).llvm_ptr,
+                        fx.Int32(1).ir_value(),
+                        llvm.AtomicOrdering.monotonic,
+                        syncscope=fx.rocdl.SyncScope.Workgroup,
+                        alignment=4,
+                    ).result
                 )
                 fx.ptr_store(position, route_positions + tid)
             gpu.barrier()

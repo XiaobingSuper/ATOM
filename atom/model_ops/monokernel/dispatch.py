@@ -73,6 +73,7 @@ def select_backend(
     native: bool = True,
     decode: bool = True,
     mtp: bool = False,
+    q: int = 1,
     dpa: bool = False,
     dcp: bool = False,
     plugin: bool = False,
@@ -103,8 +104,16 @@ def select_backend(
         ):
             return "mono"
         return None
-    if samples not in SAMPLES or tp_size != 8 or kv_cache_dtype not in ("bf16", "fp8") or mtp:
-        return None
-    if model == "kimi_k3" and is_kda and has_moe:
-        return "staged" if mode in ("auto", "staged") else "mono"
+    if model == "kimi_k3":
+        if (
+            tp_size != 8
+            or kv_cache_dtype not in ("bf16", "fp8")
+            or samples <= 0
+            or q <= 0
+            or samples % q
+            or mtp != (q > 1)
+        ):
+            return None
+        if is_kda and has_moe and mode in ("auto", "staged"):
+            return "staged"
     return None

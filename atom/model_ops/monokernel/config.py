@@ -107,6 +107,36 @@ def conv_state_shape(
 
 
 @dataclass(frozen=True)
+class KimiDecodeGeometry:
+    """One grouped decode/state contract for Kimi-K3 native execution."""
+
+    groups: int
+    q: int
+    conv_state_rows: int
+    state_dtype: str
+    replay_mode: bool
+
+    def __post_init__(self) -> None:
+        if self.groups <= 0:
+            raise ValueError(f"groups must be positive, got {self.groups}")
+        if self.q <= 0:
+            raise ValueError(f"q must be positive, got {self.q}")
+        if self.conv_state_rows < self.q + 2:
+            raise ValueError(
+                "conv_state_rows must retain the q-token rollback window plus "
+                f"two history rows, got q={self.q}, rows={self.conv_state_rows}"
+            )
+        if self.state_dtype not in {"fp16", "fp32"}:
+            raise ValueError(
+                f"state_dtype must be 'fp16' or 'fp32', got {self.state_dtype!r}"
+            )
+
+    @property
+    def tokens(self) -> int:
+        return self.groups * self.q
+
+
+@dataclass(frozen=True)
 class MoeFormat:
     activation: ExpertActivation
     weight: ExpertWeight

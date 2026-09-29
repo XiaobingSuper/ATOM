@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 FlyDSL Project Contributors
 
-"""Kimi-K3 decode recurrence over slot-indexed FP32 state.
+"""Kimi-K3 decode recurrence with FP32 accumulation over typed state slots.
 
 The kernel deliberately uses raw device pointers rather than tensor descriptors.
 Besides matching the rest of the fused Kimi path, this keeps the generated kernel
@@ -40,7 +40,7 @@ _V_TILE = _WAVES * _V_LANES
 _V_BLOCKS = 1
 _V_PER_BLOCK = _HEAD_DIM // _V_BLOCKS
 _V_ITERS = _V_PER_BLOCK // _V_TILE
-_STATE_SLOT_BYTES = _HEADS * _HEAD_DIM * _HEAD_DIM * 4
+_STATE_SLOT_ELEMENTS = _HEADS * _HEAD_DIM * _HEAD_DIM
 _CONV_CHANNELS = 3 * _HEADS * _HEAD_DIM
 _CONV_STATE_LENGTH = 3
 _CONV_KERNEL_WIDTH = 4
@@ -68,6 +68,8 @@ def _subgroup_sum(value):
 def build_kimi_k3_kda_recurrence(
     samples: int,
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+    conv_state_rows: int = _CONV_STATE_LENGTH,
+    state_dtype: str = "fp32",
 ):
     """Build the fused Kimi-K3 convolution, recurrence, and norm kernel."""
 
@@ -75,6 +77,11 @@ def build_kimi_k3_kda_recurrence(
         raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
     if not isinstance(conv_state_layout, ConvStateLayout):
         raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+    if conv_state_rows < _CONV_STATE_LENGTH:
+        raise ValueError(f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}")
+    if state_dtype not in {"fp16", "fp32"}:
+        raise ValueError(f"state_dtype must be 'fp16' or 'fp32', got {state_dtype!r}")
+    state_item_bytes = 2 if state_dtype == "fp16" else 4
     fuse_output_norm = True
     fuse_conv = True
     fuse_gate_projection = True
@@ -148,11 +155,11 @@ def build_kimi_k3_kda_recurrence(
         def decode():
             # Shift the raw address in 64-bit space before making a buffer
             # resource. Slot pools can exceed the descriptor's i32 offset range.
-            state_rsrc = rsrc(state + fx.Int64(slot) * fx.Int64(_STATE_SLOT_BYTES))
+            state_rsrc = rsrc(state + fx.Int64(slot) * fx.Int64(_STATE_SLOT_ELEMENTS * state_item_bytes))
             vector_base = (sample * _HEADS + head) * _HEAD_DIM
 
             if const_expr(fuse_conv):
-                conv_state_rsrc = rsrc(conv_state + fx.Int64(slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2))
+                conv_state_rsrc = rsrc(conv_state + fx.Int64(slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2))
 
                 def convolve(channel):
                     state_offsets = (
@@ -161,21 +168,21 @@ def build_kimi_k3_kda_recurrence(
                             channel,
                             0,
                             _CONV_CHANNELS,
-                            _CONV_STATE_LENGTH,
+                            conv_state_rows,
                         ),
                         conv_state_offset(
                             conv_state_layout,
                             channel,
                             1,
                             _CONV_CHANNELS,
-                            _CONV_STATE_LENGTH,
+                            conv_state_rows,
                         ),
                         conv_state_offset(
                             conv_state_layout,
                             channel,
                             2,
                             _CONV_CHANNELS,
-                            _CONV_STATE_LENGTH,
+                            conv_state_rows,
                         ),
                     )
                     state0 = fx.BFloat16(
@@ -368,9 +375,9 @@ def build_kimi_k3_kda_recurrence(
                             state_rsrc,
                             state_offset,
                             vec_width=_VALUES_PER_THREAD,
-                            dtype=T.f32,
+                            dtype=(T.f16 if state_dtype == "fp16" else T.f32),
                         )
-                    )
+                    ).to(fx.Float32)
 
             for v_iter in range_constexpr(_V_ITERS):
                 v_index = v_block * _V_PER_BLOCK + wave * _V_LANES + v_lane + v_iter * _V_TILE
@@ -412,8 +419,9 @@ def build_kimi_k3_kda_recurrence(
                 for k_iter in range_constexpr(_K_ITERS):
                     k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
                     state_offset = (head * _HEAD_DIM + v_index) * _HEAD_DIM + k_base
+                    state_value = state_vecs[v_iter * _K_ITERS + k_iter]
                     bo.buffer_store(
-                        state_vecs[v_iter * _K_ITERS + k_iter],
+                        state_value.to(fx.Float16) if state_dtype == "fp16" else state_value,
                         state_rsrc,
                         state_offset,
                     )
@@ -545,14 +553,27 @@ class KimiK3KdaRecurrence:
         self,
         samples: int,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        conv_state_rows: int = _CONV_STATE_LENGTH,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
         if samples not in {1, 2, 4, 8}:
             raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
         if not isinstance(conv_state_layout, ConvStateLayout):
             raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+        if conv_state_rows < _CONV_STATE_LENGTH:
+            raise ValueError(f"conv_state_rows must be at least {_CONV_STATE_LENGTH}, got {conv_state_rows}")
+        if state_dtype not in {torch.float16, torch.float32}:
+            raise ValueError(f"state_dtype must be FP16 or FP32, got {state_dtype}")
         self.samples = samples
         self.conv_state_layout = conv_state_layout
-        self.launch = build_kimi_k3_kda_recurrence(samples, conv_state_layout)
+        self.conv_state_rows = conv_state_rows
+        self.state_dtype = state_dtype
+        self.launch = build_kimi_k3_kda_recurrence(
+            samples,
+            conv_state_layout,
+            conv_state_rows,
+            "fp16" if state_dtype is torch.float16 else "fp32",
+        )
 
     def __call__(
         self,
@@ -598,7 +619,7 @@ class KimiK3KdaRecurrence:
             self.conv_state_layout,
             conv_state.shape[0] if conv_state.ndim == 3 else 0,
             _CONV_CHANNELS,
-            _CONV_STATE_LENGTH,
+            self.conv_state_rows,
         )
         if (
             conv_state.shape != expected_conv_state
@@ -618,10 +639,13 @@ class KimiK3KdaRecurrence:
         if (
             state.ndim != 4
             or state.shape[1:] != (_HEADS, _HEAD_DIM, _HEAD_DIM)
-            or state.dtype != torch.float32
+            or state.dtype != self.state_dtype
             or not state.is_contiguous()
         ):
-            raise ValueError(f"state must be contiguous FP32 [slots, {_HEADS}, {_HEAD_DIM}, {_HEAD_DIM}]")
+            raise ValueError(
+                f"state must be contiguous {self.state_dtype} "
+                f"[slots, {_HEADS}, {_HEAD_DIM}, {_HEAD_DIM}]"
+            )
         if (
             output_gate.shape
             not in {

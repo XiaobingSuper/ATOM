@@ -92,6 +92,8 @@ class KimiK3KdaAttention:
         single_launch_attention: bool = True,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        conv_state_rows: int = 3,
+        state_dtype: torch.dtype = torch.float32,
         prepared_weights: KimiK3PreparedWeights | None = None,
         prepared_backend: str = "staged",
     ) -> None:
@@ -110,6 +112,12 @@ class KimiK3KdaAttention:
             raise ValueError(f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'")
         if not isinstance(conv_state_layout, ConvStateLayout):
             raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+        if conv_state_rows < 3 or (mtp and conv_state_rows < samples + 2):
+            raise ValueError(
+                f"conv_state_rows={conv_state_rows} cannot hold q={samples} rollback history"
+            )
+        if state_dtype not in {torch.float16, torch.float32}:
+            raise ValueError(f"state_dtype must be FP16 or FP32, got {state_dtype}")
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
             raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], " f"got {launches_per_step}")
 
@@ -124,6 +132,8 @@ class KimiK3KdaAttention:
         self.launches_per_step = launches_per_step
         self.mtp = mtp
         self.conv_state_layout = conv_state_layout
+        self.conv_state_rows = conv_state_rows
+        self.state_dtype = state_dtype
         self.local_projection = config.local_heads * _HEAD_DIM
         if prepared_weights is not None:
             prepared_weights.validate_source(weights, prepared_backend)
@@ -182,14 +192,25 @@ class KimiK3KdaAttention:
             )
             self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
         else:
-            if prepared_weights.w_kda_in_padded.shape != (padded_fused_width, config.hidden):
-                raise ValueError("prepared KDA input weight has the wrong shape")
-            self.w_kda_in_padded = prepared_weights.w_kda_in_padded
+            prepared_input = prepared_weights.w_kda_in_padded
+            if prepared_input is None:
+                if not single_launch_attention:
+                    raise ValueError("staged KDA attention requires a padded input weight")
+                self.w_kda_in_padded = None
+            else:
+                if prepared_input.shape != (padded_fused_width, config.hidden):
+                    raise ValueError("prepared KDA input weight has the wrong shape")
+                self.w_kda_in_padded = prepared_input
         self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
         self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
-        self.core = KimiK3KdaRecurrence(samples, conv_state_layout)
+        self.core = KimiK3KdaRecurrence(
+            samples,
+            conv_state_layout,
+            conv_state_rows,
+            state_dtype,
+        )
         self.symmetric_allreduce = (
             SymmetricBf16Allreduce(
                 (self.partial.numel(),),
@@ -214,20 +235,17 @@ class KimiK3KdaAttention:
             self.w_kda_in_packed is None or self.w_kda_o_packed is None
         ):
             raise ValueError("mono prepared weights require packed KDA input/output")
-        if single_launch_attention and prepared_weights is not None and (
-            self.w_kda_in_packed is None or self.w_kda_o_packed is None
-        ):
-            raise ValueError("single-launch KDA attention requires packed input/output weights")
         if self.symmetric_allreduce is not None and single_launch_attention:
-            monokernel_input = torch.zeros(
-                MONOKERNEL_INPUT_ROWS,
-                config.hidden,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            monokernel_input[:fused_width].copy_(self.t["w_kda_in"])
-            self.w_kda_in_packed = pack_bf16(monokernel_input)
-            self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
+            if self.w_kda_in_packed is None:
+                monokernel_input = torch.zeros(
+                    MONOKERNEL_INPUT_ROWS,
+                    config.hidden,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                monokernel_input[:fused_width].copy_(self.t["w_kda_in"])
+                self.w_kda_in_packed = pack_bf16(monokernel_input)
+                self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
             self.monokernel_scratch = torch.zeros(
                 monokernel_scratch_nbytes(samples, mtp=mtp),
                 dtype=torch.uint8,
@@ -240,6 +258,8 @@ class KimiK3KdaAttention:
                 launches_per_step,
                 mtp=mtp,
                 conv_state_layout=conv_state_layout,
+                conv_state_rows=conv_state_rows,
+                state_dtype="fp16" if state_dtype is torch.float16 else "fp32",
             )
         elif mtp:
             raise ValueError("Kimi-K3 MTP requires the single-launch attention path")
@@ -323,6 +343,8 @@ class KimiK3KdaAttention:
             fuse_moe,
             self.mtp,
             conv_state_layout=self.conv_state_layout,
+            conv_state_rows=self.conv_state_rows,
+            state_dtype="fp16" if self.state_dtype is torch.float16 else "fp32",
         )
 
     def forward(
@@ -332,6 +354,7 @@ class KimiK3KdaAttention:
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         *,
+        num_accepted_tokens: torch.Tensor | None = None,
         x_out: torch.Tensor | None = None,
         block_residual: torch.Tensor | None = None,
         pre_updated: torch.Tensor | None = None,
@@ -374,6 +397,7 @@ class KimiK3KdaAttention:
             self.conv_state_layout,
             conv_state.shape[0] if conv_state.ndim == 3 else 0,
             3 * self.local_projection,
+            self.conv_state_rows,
         )
         if (
             conv_state.shape != expected_conv_state
@@ -384,6 +408,22 @@ class KimiK3KdaAttention:
                 f"conv_state must be contiguous BF16 {list(expected_conv_state)} "
                 f"for {self.conv_state_layout.value} layout"
             )
+
+        if recurrent_state.dtype is not self.state_dtype or not recurrent_state.is_contiguous():
+            raise ValueError(
+                f"recurrent_state must be contiguous {self.state_dtype}, "
+                f"got {recurrent_state.dtype}"
+            )
+        if self.mtp:
+            if (
+                num_accepted_tokens is None
+                or num_accepted_tokens.shape != (1,)
+                or num_accepted_tokens.dtype is not torch.int32
+                or not num_accepted_tokens.is_contiguous()
+            ):
+                raise ValueError("MTP num_accepted_tokens must be contiguous int32 [1]")
+        elif num_accepted_tokens is not None:
+            raise ValueError("num_accepted_tokens is only valid for MTP")
 
         if self.monokernel_launch is not None:
             if self.fuse_attn_res:
@@ -461,6 +501,11 @@ class KimiK3KdaAttention:
                 self.t["g_kda_out"].data_ptr(),
                 self.w_kda_o_packed.data_ptr(),
                 state_indices.data_ptr(),
+                (
+                    num_accepted_tokens.data_ptr()
+                    if num_accepted_tokens is not None
+                    else state_indices.data_ptr()
+                ),
                 conv_state.data_ptr(),
                 recurrent_state.data_ptr(),
                 self.monokernel_scratch.data_ptr(),

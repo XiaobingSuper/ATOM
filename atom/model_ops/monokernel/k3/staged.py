@@ -68,6 +68,8 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        conv_state_rows: int = 3,
+        state_dtype: torch.dtype = torch.float32,
         prepared_weights: KimiK3PreparedWeights | None = None,
         prepared_backend: str = "staged",
     ) -> None:
@@ -145,6 +147,8 @@ class _KimiK3MlaPath:
             kv_cache_layout=kv_cache_layout,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            conv_state_rows=conv_state_rows,
+            state_dtype=state_dtype,
             prepared_weights=prepared_weights,
             prepared_backend=prepared_backend,
         )
@@ -298,10 +302,21 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        conv_state_rows: int,
+        state_dtype: torch.dtype,
         prepared_weights: KimiK3PreparedWeights | None,
         prepared_backend: str,
     ):
-        del reduce_group, reduce_backend, mtp, conv_state_layout, prepared_weights, prepared_backend
+        del (
+            reduce_group,
+            reduce_backend,
+            mtp,
+            conv_state_layout,
+            conv_state_rows,
+            state_dtype,
+            prepared_weights,
+            prepared_backend,
+        )
         return KimiK3MlaAttention(
             weights,
             samples,
@@ -744,6 +759,8 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        conv_state_rows: int,
+        state_dtype: torch.dtype,
         prepared_weights: KimiK3PreparedWeights | None,
         prepared_backend: str,
     ):
@@ -761,6 +778,8 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             single_launch_attention=(prepared_weights is None and samples <= 4) or mtp,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            conv_state_rows=conv_state_rows,
+            state_dtype=state_dtype,
             prepared_weights=prepared_weights,
             prepared_backend=prepared_backend,
         )
@@ -773,6 +792,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         conv_state: torch.Tensor,
         recurrent_state: torch.Tensor,
         *,
+        num_accepted_tokens: torch.Tensor | None = None,
         x_out: torch.Tensor | None = None,
         epoch_layer: int = 0,
         advance: bool = True,
@@ -826,6 +846,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
                 state_indices,
                 conv_state,
                 recurrent_state,
+                num_accepted_tokens=num_accepted_tokens,
                 x_out=self.attention_delta,
                 layer=epoch_layer,
                 advance=False,

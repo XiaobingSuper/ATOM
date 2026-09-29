@@ -71,7 +71,7 @@ _OUTPUT_TASKS = _HIDDEN // _OUTPUT_ROW_TILE
 _CONV_CHANNELS = 3 * _PROJECTION
 _CONV_STATE_LENGTH = 3
 _CONV_KERNEL_WIDTH = 4
-_STATE_SLOT_BYTES = _HEADS * _HEAD_DIM * _HEAD_DIM * 4
+_STATE_SLOT_ELEMENTS = _HEADS * _HEAD_DIM * _HEAD_DIM
 _K_LANES = 8
 _V_LANES = _WAVE_SIZE // _K_LANES
 _VALUES_PER_THREAD = 4
@@ -207,6 +207,8 @@ def build_kimi_k3_monokernel(
     fuse_moe: bool = False,
     mtp: bool = False,
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+    conv_state_rows: int = _CONV_STATE_LENGTH,
+    state_dtype: str = "fp32",
 ):
     """Build the fixed-shape single-launch Kimi-K3 decode MonoKernel."""
 
@@ -216,6 +218,14 @@ def build_kimi_k3_monokernel(
         raise ValueError(f"Kimi-K3 MonoKernel requires TP8, got TP{npes}")
     if not isinstance(conv_state_layout, ConvStateLayout):
         raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+    if conv_state_rows < _CONV_STATE_LENGTH or (mtp and conv_state_rows < samples + 2):
+        raise ValueError(
+            f"conv_state_rows={conv_state_rows} cannot hold q={samples} rollback history"
+        )
+    if state_dtype not in {"fp16", "fp32"}:
+        raise ValueError(f"state_dtype must be 'fp16' or 'fp32', got {state_dtype!r}")
+    state_item_bytes = 2 if state_dtype == "fp16" else 4
+    state_slot_bytes = _STATE_SLOT_ELEMENTS * state_item_bytes
     if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
         raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], got {launches_per_step}")
     fuse_attn_res = attn_res_blocks >= 0
@@ -350,6 +360,7 @@ def build_kimi_k3_monokernel(
         norm_weight: Int64,
         packed_output_weight: Int64,
         state_indices: Int64,
+        num_accepted_tokens: Int64,
         conv_state: Int64,
         recurrent_state: Int64,
         scratch: Int64,
@@ -400,6 +411,7 @@ def build_kimi_k3_monokernel(
         norm_weight_rsrc = rsrc(norm_weight)
         output_weight_rsrc = rsrc(packed_output_weight)
         indices_rsrc = rsrc(state_indices)
+        accepted_rsrc = rsrc(num_accepted_tokens)
         output_rsrc = rsrc(output)
         input_mailbox_rsrc = rsrc(scratch + fx.Int64(input_mailbox_offset))
         norm_mailbox_rsrc = rsrc(scratch + fx.Int64(norm_mailbox_offset))
@@ -1703,21 +1715,21 @@ def build_kimi_k3_monokernel(
                         channel,
                         0,
                         _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
+                        conv_state_rows,
                     ),
                     conv_state_offset(
                         conv_state_layout,
                         channel,
                         1,
                         _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
+                        conv_state_rows,
                     ),
                     conv_state_offset(
                         conv_state_layout,
                         channel,
                         2,
                         _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
+                        conv_state_rows,
                     ),
                 )
                 state0 = fx.BFloat16(
@@ -1785,6 +1797,99 @@ def build_kimi_k3_monokernel(
                 fx.ptr_store(convolve(channel), shared_value + channel_in_head)
             gpu.barrier()
 
+        def prepare_mtp_kda_conv(sample, head):
+            base_slot = uniform(bo.buffer_load(indices_rsrc, 1, vec_width=1, dtype=T.i32))
+            accepted_offset = uniform(
+                bo.buffer_load(accepted_rsrc, 0, vec_width=1, dtype=T.i32)
+            ) - 1
+            conv_state_rsrc = rsrc(
+                conv_state
+                + fx.Int64(base_slot)
+                * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
+            )
+
+            def physical_offset(channel, time):
+                if const_expr(conv_state_layout is ConvStateLayout.TIME_MAJOR):
+                    return time * _CONV_CHANNELS + channel
+                return channel * conv_state_rows + time
+
+            def convolve(channel):
+                history_base = (sample == 0).select(accepted_offset, sample - 1)
+                state0 = fx.BFloat16(
+                    bo.buffer_load(
+                        conv_state_rsrc,
+                        physical_offset(channel, history_base),
+                        vec_width=1,
+                        dtype=T.bf16,
+                        cache_modifier=CM_DEV,
+                    )
+                )
+                state1 = fx.BFloat16(
+                    bo.buffer_load(
+                        conv_state_rsrc,
+                        physical_offset(channel, history_base + 1),
+                        vec_width=1,
+                        dtype=T.bf16,
+                        cache_modifier=CM_DEV,
+                    )
+                )
+                state2 = fx.BFloat16(
+                    bo.buffer_load(
+                        conv_state_rsrc,
+                        physical_offset(channel, history_base + 2),
+                        vec_width=1,
+                        dtype=T.bf16,
+                        cache_modifier=CM_DEV,
+                    )
+                )
+                current = get_input(sample, channel)
+                weights = fx.Vector(
+                    bo.buffer_load(
+                        conv_weight_rsrc,
+                        channel * _CONV_KERNEL_WIDTH,
+                        vec_width=_CONV_KERNEL_WIDTH,
+                        dtype=T.bf16,
+                    )
+                ).to(fx.Float32)
+                values = fx.Vector.from_elements(
+                    [fx.Float32(state0), fx.Float32(state1), fx.Float32(state2), current],
+                    fx.Float32,
+                )
+                convolution = (values * weights).reduce(fx.ReductionOp.ADD)
+                if sample == 0:
+                    bo.buffer_store(
+                        state1,
+                        conv_state_rsrc,
+                        physical_offset(channel, 0),
+                        cache_modifier=CM_DEV,
+                    )
+                    bo.buffer_store(
+                        state2,
+                        conv_state_rsrc,
+                        physical_offset(channel, 1),
+                        cache_modifier=CM_DEV,
+                    )
+                bo.buffer_store(
+                    current.to(fx.BFloat16),
+                    conv_state_rsrc,
+                    physical_offset(channel, sample + 2),
+                    cache_modifier=CM_DEV,
+                )
+                return (convolution * sigmoid_batch([convolution])[0]).to(fx.BFloat16)
+
+            if tid < _HEAD_DIM:
+                channel = head * _HEAD_DIM + tid
+                fx.ptr_store(convolve(channel), shared_query + tid)
+            elif tid < 2 * _HEAD_DIM:
+                channel_in_head = tid - _HEAD_DIM
+                channel = _PROJECTION + head * _HEAD_DIM + channel_in_head
+                fx.ptr_store(convolve(channel), shared_key + channel_in_head)
+            elif tid < 3 * _HEAD_DIM:
+                channel_in_head = tid - 2 * _HEAD_DIM
+                channel = 2 * _PROJECTION + head * _HEAD_DIM + channel_in_head
+                fx.ptr_store(convolve(channel), shared_value + channel_in_head)
+            gpu.barrier()
+
         # Stage 2a: ordinary decode uses one CTA per independent (sample, head).
         # Ordered MTP recurrence is handled by the pipeline below.
         recurrence_task = bid
@@ -1795,10 +1900,10 @@ def build_kimi_k3_monokernel(
             head = recurrence_task % _HEADS
             input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
             output_slot = input_slot
-            state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
+            state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
             state_out_rsrc = state_rsrc
             conv_state_rsrc = rsrc(
-                conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
+                conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * conv_state_rows * 2)
             )
             conv_state_out_rsrc = conv_state_rsrc
 
@@ -1899,10 +2004,10 @@ def build_kimi_k3_monokernel(
                                 state_rsrc,
                                 state_offset,
                                 vec_width=_VALUES_PER_THREAD,
-                                dtype=T.f32,
+                                dtype=(T.f16 if state_dtype == "fp16" else T.f32),
                                 cache_modifier=CM_DEV,
                             )
-                        )
+                        ).to(fx.Float32)
 
                 for v_iter in range_constexpr(_V_ITERS):
                     value_index = wave * _V_LANES + v_lane + v_iter * _V_TILE
@@ -1930,7 +2035,7 @@ def build_kimi_k3_monokernel(
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * _K_TILE
                         state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
                         bo.buffer_store(
-                            state_vectors[v_iter * _K_ITERS + k_iter],
+                            state_vectors[v_iter * _K_ITERS + k_iter].to(fx.Float16) if state_dtype == "fp16" else state_vectors[v_iter * _K_ITERS + k_iter],
                             state_out_rsrc,
                             state_offset,
                             cache_modifier=CM_DEV,
@@ -2021,13 +2126,7 @@ def build_kimi_k3_monokernel(
                         )
 
                 if valid_state:
-                    conv_state_rsrc = rsrc(
-                        conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
-                    )
-                    conv_state_out_rsrc = rsrc(
-                        conv_state + fx.Int64(output_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
-                    )
-                    prepare_kda_conv(sample, head, conv_state_rsrc, conv_state_out_rsrc)
+                    prepare_mtp_kda_conv(sample, head)
                     publish_mtp_component(0, shared_query)
                     publish_mtp_component(1, shared_key)
                     publish_mtp_component(
@@ -2070,8 +2169,8 @@ def build_kimi_k3_monokernel(
                 result = fx.Float32(0.0)
                 value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
                 if valid_state:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
-                    state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
+                    state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(state_slot_bytes))
                     qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                     k_lane = lane % mtp_k_lanes
                     exp_a_log = exp(lds_load(norm_sums, _WAVES))
@@ -2196,10 +2295,10 @@ def build_kimi_k3_monokernel(
                                 state_rsrc,
                                 state_offset,
                                 vec_width=_VALUES_PER_THREAD,
-                                dtype=T.f32,
+                                dtype=(T.f16 if state_dtype == "fp16" else T.f32),
                                 cache_modifier=CM_DEV,
                             )
-                        )
+                        ).to(fx.Float32)
                         state_vector = state_vector * decay_vectors[k_iter]
                         state_vectors[k_iter] = state_vector
                         state_key_parts = fx.math.fma(state_vector, key_vectors[k_iter], state_key_parts)
@@ -2230,7 +2329,7 @@ def build_kimi_k3_monokernel(
                             key_vectors[k_iter], value_new_vector, state_vectors[k_iter]
                         )
                         bo.buffer_store(
-                            state_vectors[k_iter],
+                            state_vectors[k_iter].to(fx.Float16) if state_dtype == "fp16" else state_vectors[k_iter],
                             state_out_rsrc,
                             state_offset,
                             cache_modifier=CM_DEV,
@@ -2283,7 +2382,7 @@ def build_kimi_k3_monokernel(
                     fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32) for _ in range_constexpr(mtp_k_iters)
                 ]
                 if input_slot >= 0:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(state_slot_bytes))
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
                         state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
@@ -2292,10 +2391,10 @@ def build_kimi_k3_monokernel(
                                 state_rsrc,
                                 state_offset,
                                 vec_width=_VALUES_PER_THREAD,
-                                dtype=T.f32,
+                                dtype=(T.f16 if state_dtype == "fp16" else T.f32),
                                 cache_modifier=CM_DEV,
                             )
-                        )
+                        ).to(fx.Float32)
 
                 exp_a_log = exp(lds_load(norm_sums, _WAVES))
                 dt_vectors = [None] * mtp_k_iters
@@ -2329,7 +2428,7 @@ def build_kimi_k3_monokernel(
                     next_state_vectors = [loop_args[k_iter] for k_iter in range_constexpr(mtp_k_iters)]
                     result = fx.Float32(0.0)
                     if valid_state:
-                        state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                        state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(state_slot_bytes))
                         qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                         beta_logit = lds_load(norm_sums, _WAVES + 1)
                         beta_value = sigmoid_batch([beta_logit])[0]
@@ -2475,7 +2574,7 @@ def build_kimi_k3_monokernel(
                                 next_state_vectors[k_iter],
                             )
                             bo.buffer_store(
-                                next_state_vectors[k_iter],
+                                next_state_vectors[k_iter].to(fx.Float16) if state_dtype == "fp16" else next_state_vectors[k_iter],
                                 state_out_rsrc,
                                 state_offset,
                                 cache_modifier=CM_DEV,
@@ -3410,6 +3509,7 @@ def build_kimi_k3_monokernel(
         norm_weight: Int64,
         packed_output_weight: Int64,
         state_indices: Int64,
+        num_accepted_tokens: Int64,
         conv_state: Int64,
         recurrent_state: Int64,
         scratch: Int64,
@@ -3464,6 +3564,7 @@ def build_kimi_k3_monokernel(
             norm_weight,
             packed_output_weight,
             state_indices,
+            num_accepted_tokens,
             conv_state,
             recurrent_state,
             scratch,
