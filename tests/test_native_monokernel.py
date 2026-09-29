@@ -704,6 +704,9 @@ def test_glm_chunk12_covers_routing_expert_tiles_and_down_lds():
         for lane_group in range(4)
         for element in range(4)
     ] == list(range(16))
+    assert [glm_layout.split_score_column(wave, 0) for wave in range(8)] == list(range(8))
+    assert [glm_layout.fp8_kv_upper_pair_lane(lane) for lane in range(0, 16, 4)] == [2, 6, 10, 14]
+    assert [glm_layout.fp8_pe_upper_pair_lane(lane) for lane in range(0, 16, 2)] == list(range(1, 16, 2))
     assert glm_layout.down_x_words(12, 512, True) == 27_648
 
 

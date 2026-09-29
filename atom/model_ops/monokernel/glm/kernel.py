@@ -97,12 +97,15 @@ from atom.model_ops.monokernel.glm.layout import (
     dcp_local_uv_tile,
     dcp_summary_index,
     dcp_uv_owner,
+    fp8_kv_upper_pair_lane,
+    fp8_pe_upper_pair_lane,
     dn_tile,
     down_x_words,
     layout,
     sample_wave_batches,
     sparse_keys_per_task,
     split_acc_head,
+    split_score_column,
     stage_tasks,
     ug_split,
     ug_task_rounds,
@@ -1151,6 +1154,7 @@ def build_glm5_monokernel(
                 active = row_writes_cache(s)
                 value = vs[s] * _rsq(ssq[s] * (1.0 / KV_LORA) + EPS) * g
                 if const_expr(cache_fp8):
+                    value = bf16_round(value)
                     kvn, _ = _fp8_roundtrip(value, value)
                 else:
                     kvn = bf16_round(value)
@@ -1160,9 +1164,12 @@ def build_glm5_monokernel(
                             pair = fx.Int32(
                                 rocdl.cvt_pk_fp8_f32(T.i32, kvn, _xshfl(kvn, 1), fx.Int32(0), False)
                             ) & fx.Int32(0xFFFF)
+                            upper_pair = bpermute_i32(fp8_kv_upper_pair_lane(lane) * 4, pair)
                             if lane % 4 == 0:
                                 bo.buffer_store(
-                                    pair | (_xshfl(pair, 2) << 16), r_kv, slot * (QK_DIM // 4) + tid // 4
+                                    pair | (upper_pair << 16),
+                                    r_kv,
+                                    slot * (QK_DIM // 4) + tid // 4
                                 )
                         else:
                             bo.buffer_store(kvn.to(fx.BFloat16), r_kv, slot * QK_DIM + tid)
@@ -1174,6 +1181,7 @@ def build_glm5_monokernel(
                     c, sn = cs[s], sns[s]
                     p0, p1 = x0 * c - x1 * sn, x0 * sn + x1 * c
                     if const_expr(cache_fp8):
+                        p0, p1 = bf16_round(p0), bf16_round(p1)
                         p0, p1 = _fp8_roundtrip(p0, p1)
                     else:
                         p0, p1 = bf16_round(p0), bf16_round(p1)
@@ -1183,9 +1191,10 @@ def build_glm5_monokernel(
                                 pair = fx.Int32(
                                     rocdl.cvt_pk_fp8_f32(T.i32, p0, p1, fx.Int32(0), False)
                                 ) & fx.Int32(0xFFFF)
+                                upper_pair = bpermute_i32(fp8_pe_upper_pair_lane(lane) * 4, pair)
                                 if lane % 2 == 0:
                                     bo.buffer_store(
-                                        pair | (_xshfl(pair, 1) << 16),
+                                        pair | (upper_pair << 16),
                                         r_pe,
                                         slot * (QK_DIM // 4) + KV_LORA // 4 + tid // 2,
                                     )
@@ -1769,7 +1778,7 @@ def build_glm5_monokernel(
             # (four row groups, two K halves); the batch-8 32-key tile uses two
             # row groups and four waves per K half.  All waves subsequently own
             # one attention head for softmax and P@V.
-            hn = fx.min(lane % 16, H - 1)
+            hn = head_group * WAVES + fx.min(lane % 16, WAVES - 1)
             rgk = wave % (SPLIT_KEYS // 16)
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for st in range_constexpr(QK_DIM // 32 // 2):
@@ -1790,7 +1799,7 @@ def build_glm5_monokernel(
             kidx = t * SPLIT_KEYS + lane
             valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
             r16 = lane % 16
-            cl = h + 16 * (r16 // 4)
+            cl = split_score_column(wave, lane)
             key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
             half_stride = SPLIT_KEYS // 16
             raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(

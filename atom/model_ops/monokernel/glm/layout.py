@@ -44,6 +44,20 @@ def split_acc_head(lane_group: int, element: int):
     return lane_group * 4 + element
 
 
+def split_score_column(wave: int, lane: int):
+    """Locate this wave's head column in a 16x16 MFMA score tile."""
+
+    return wave + 16 * ((lane % 16) // 4)
+
+
+def fp8_kv_upper_pair_lane(lane):
+    return (lane & -4) + 2
+
+
+def fp8_pe_upper_pair_lane(lane):
+    return (lane & -2) + 1
+
+
 def sparse_cache_rows(
     sparse_kv_indices,
     *,
