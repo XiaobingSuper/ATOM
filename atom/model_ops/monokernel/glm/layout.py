@@ -98,6 +98,18 @@ def sparse_keys_per_task(samples: int) -> int:
     return 32 if samples > 4 else 64
 
 
+def sample_wave_batches(samples: int) -> int:
+    return (samples + WAVES - 1) // WAVES
+
+
+def ug_task_rounds(inter: int) -> int:
+    return (inter + BLOCKS - 1) // BLOCKS
+
+
+def down_x_words(samples: int, inter: int, expert_mxfp4: bool) -> int:
+    return samples * MOE_SLOTS * inter // (2 if expert_mxfp4 else 4)
+
+
 def ug_split(samples: int, inter: int = INTER):
     """Return the balanced up/gate leftover split for batches two and four."""
 

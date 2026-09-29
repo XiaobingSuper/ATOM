@@ -628,20 +628,21 @@ def test_glm_required_c8_decode_does_not_fallback():
         runner._unsupported("missing FP8 cache")
 
 
-def test_glm_chunk12_covers_routing_and_expert_tiles():
-    kernel = (
-        Path(__file__).parents[1]
-        / "atom"
-        / "model_ops"
-        / "monokernel"
-        / "glm"
-        / "kernel.py"
-    ).read_text()
-    assert "for sample_batch in range_constexpr((S + WAVES - 1) // WAVES):" in kernel
-    assert "route_sample = wave + sample_batch * WAVES" in kernel
-    assert "for task_round in range_constexpr((I + G - 1) // G):" in kernel
-    routed = [wave + batch * 8 for batch in range(2) for wave in range(8) if wave + batch * 8 < 12]
-    expert_tiles = [cta + task_round * 256 for task_round in range(2) for cta in range(256)]
+def test_glm_chunk12_covers_routing_expert_tiles_and_down_lds():
+    assert glm_layout.sample_wave_batches(12) == 2
+    assert glm_layout.ug_task_rounds(256) == 1
+    assert glm_layout.ug_task_rounds(512) == 2
+    routed = [
+        wave + batch * glm_layout.WAVES
+        for batch in range(glm_layout.sample_wave_batches(12))
+        for wave in range(glm_layout.WAVES)
+        if wave + batch * glm_layout.WAVES < 12
+    ]
+    expert_tiles = [
+        cta + task_round * glm_layout.BLOCKS
+        for task_round in range(glm_layout.ug_task_rounds(512))
+        for cta in range(glm_layout.BLOCKS)
+    ]
     assert routed == list(range(12))
     assert expert_tiles == list(range(512))
     assert [
@@ -650,6 +651,7 @@ def test_glm_chunk12_covers_routing_and_expert_tiles():
         for lane_group in range(2)
         for element in range(4)
     ] == list(range(16))
+    assert glm_layout.down_x_words(12, 512, True) == 27_648
 
 
 def test_glm_layout_covers_only_requested_decode_batches():

@@ -94,11 +94,14 @@ from atom.model_ops.monokernel.glm.layout import (
     XQ_BLOCKS,
     XQ_WAVES,
     dn_tile,
+    down_x_words,
     layout,
+    sample_wave_batches,
     sparse_keys_per_task,
     split_acc_head,
     stage_tasks,
     ug_split,
+    ug_task_rounds,
 )
 from atom.model_ops.monokernel.layout import CM_DEV, CM_SYS, LAYER_SLOTS, NEG, POLL_MAX, THREADS, TL_COLS
 from atom.model_ops.monokernel.ops import (
@@ -222,7 +225,7 @@ def build_glm5_monokernel(
     # activations, and sparse attention.  Metadata, reductions, and outputs live
     # after that common X region because they are simultaneously live in GEMVs.
     SPLIT_X_WORDS = PT_OFF + SPLIT_KEYS * PS
-    X_WORDS = max(SAMPLE_TILE * HIDDEN // 2, S * HIDDEN // 4, SPLIT_X_WORDS, index_max_seq)
+    X_WORDS = max(SAMPLE_TILE * HIDDEN // 2, S * HIDDEN // 4, SPLIT_X_WORDS, index_max_seq, down_x_words(S, I, expert_mxfp4))
     MISC_OFF = X_WORDS
     MISC_WORDS = max(8 + S * XQ_BLOCKS, S * MOE_SLOTS * (I // 128), N_SPLIT)
     KEYS_OFF = MISC_OFF + MISC_WORDS
@@ -1979,7 +1982,7 @@ def build_glm5_monokernel(
 
         def dn_route(bs):
             """Expert-down routing: one whole wave per sample, in wave-sized batches."""
-            for sample_batch in range_constexpr((S + WAVES - 1) // WAVES):
+            for sample_batch in range_constexpr(sample_wave_batches(S)):
                 route_sample = wave + sample_batch * WAVES
                 if route_sample < S:
                     e, w = route_top8(route_sample, bs=bs)
@@ -2183,7 +2186,7 @@ def build_glm5_monokernel(
             stage_xq(list(range(S)))
             gpu.barrier()
             u0 = start("ug")
-            for task_round in range_constexpr((I + G - 1) // G):
+            for task_round in range_constexpr(ug_task_rounds(I)):
                 u = fx.Int32(u0 + task_round * G)
                 c = u % (I // UG8)
                 has_sh = u < I // UG8
@@ -2277,6 +2280,8 @@ def build_glm5_monokernel(
                     gpu.barrier()
                     ug8_emit(sample, False)
                     stamp("ug", sample * G + u, 4)
+                if const_expr(task_round + 1 < ug_task_rounds(I)):
+                    gpu.barrier()
 
         elif const_expr(ug_split(S, I) is not None):
             # S = 2, 4 (the router already quantized every sample's activation): job 0 is
