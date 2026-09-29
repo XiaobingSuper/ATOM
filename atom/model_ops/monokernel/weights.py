@@ -232,13 +232,40 @@ def atom_mxfp4_storage_view(
     return tensor.view(torch.uint8).view(-1)
 
 
-def prepare_mxfp4_expert_storage(weights: LayerWeights) -> tuple[torch.Tensor, ...]:
+def prepare_mxfp4_expert_storage(
+    weights: LayerWeights, *, canonical: bool = True
+) -> tuple[torch.Tensor, ...]:
     config = weights.config
     tensors = weights.t
     experts = config.n_experts if weights.physical_experts is None else weights.physical_experts
     expert_hidden = config.hidden if config.routed_hidden is None else config.routed_hidden
     ug_rows = 2 * config.inter
     dn_rows = expert_hidden
+
+    if not canonical:
+        if (
+            weights.mxfp4_weight_layout is not Mxfp4WeightLayout.ATOM
+            or weights.mxfp4_scale_layout is not Mxfp4ScaleLayout.ATOM
+        ):
+            raise ValueError("zero-copy MXFP4 storage requires ATOM values and scales")
+        return (
+            atom_mxfp4_storage_view(
+                tensors["w_ug"], name="w_ug",
+                logical_rows=experts * ug_rows, logical_k=expert_hidden, scale=False,
+            ),
+            atom_mxfp4_storage_view(
+                tensors["s_ug"], name="s_ug",
+                logical_rows=experts * ug_rows, logical_k=expert_hidden, scale=True,
+            ),
+            atom_mxfp4_storage_view(
+                tensors["w_dn"], name="w_dn",
+                logical_rows=experts * dn_rows, logical_k=config.inter, scale=False,
+            ),
+            atom_mxfp4_storage_view(
+                tensors["s_dn"], name="s_dn",
+                logical_rows=experts * dn_rows, logical_k=config.inter, scale=True,
+            ),
+        )
 
     from atom.model_ops.monokernel.packing import pack_mxfp4
 

@@ -58,6 +58,12 @@ def fp8_pe_upper_pair_lane(lane):
     return (lane & -2) + 1
 
 
+def atom_mxfp4_scale_index(row, col, cols):
+    r32, a, b = row // 32, (row // 16) % 2, row % 16
+    c8, d, e = col // 8, (col // 4) % 2, col % 4
+    return ((((r32 * (cols // 8) + c8) * 4 + e) * 16 + b) * 2 + d) * 2 + a
+
+
 def sparse_cache_rows(
     sparse_kv_indices,
     *,

@@ -81,6 +81,7 @@ from atom.model_ops.monokernel.glm.layout import (
     INDEX_KEYS_PER_TASK,
     INDEX_Q_ROWS,
     INDEX_TILE,
+    atom_mxfp4_scale_index,
     N_QKV_A,
     N_ROUTER,
     N_ROW_TILES,
@@ -164,6 +165,7 @@ def build_glm5_monokernel(
     with_indexer: bool = False,
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
+    atom_experts: bool = False,
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     kv_cache_dtype: str = "bf16",
@@ -188,6 +190,7 @@ def build_glm5_monokernel(
     use_atom_kv_cache = cache_layout is KvCacheLayout.ATOM
     cache_fp8 = kv_cache_dtype == "fp8"
     assert not cache_fp8 or use_atom_kv_cache
+    assert not atom_experts or expert_mxfp4
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S, heads)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
@@ -604,13 +607,42 @@ def build_glm5_monokernel(
         def unit_mxfp4(w_rsrc, s_rsrc, rg, kc, K, b_word, coef, ln=None):
             """Issue one native packed 128-K MXFP4 tile and four E8M0 row scales."""
             ln = lane if ln is None else ln
-            raw = fx.Vector(bo.buffer_load(w_rsrc, ((rg * (K // 128) + kc) * 64 + ln) * 4, vec_width=4, dtype=T.i32))
             row = rg * 16 + ln % 16
-            packed_scale = fx.Int32(bo.buffer_load(s_rsrc, row * (K // 128) + kc, vec_width=1, dtype=T.i32))
-            scales = [
-                ((packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
-                for sp in range_constexpr(4)
-            ]
+            if const_expr(atom_experts):
+                g4 = ln // 16
+                raw = fx.Vector.from_elements(
+                    [
+                        fx.Int32(bo.buffer_load(
+                            w_rsrc,
+                            (rg * (K // 64) + kc * 2 + sp // 2) * 128
+                            + (sp % 2) * 64 + (row % 16) * 4 + g4,
+                            vec_width=1, dtype=T.i32,
+                        ))
+                        for sp in range_constexpr(4)
+                    ],
+                    fx.Int32,
+                )
+                scales = [
+                    (
+                        fx.Int32(bo.buffer_load(
+                            s_rsrc, atom_mxfp4_scale_index(row, kc * 4 + sp, K // 32),
+                            vec_width=1, dtype=T.i8,
+                        )) << fx.Int32(23)
+                    ).bitcast(fx.Float32)
+                    for sp in range_constexpr(4)
+                ]
+            else:
+                raw = fx.Vector(bo.buffer_load(
+                    w_rsrc, ((rg * (K // 128) + kc) * 64 + ln) * 4,
+                    vec_width=4, dtype=T.i32,
+                ))
+                packed_scale = fx.Int32(bo.buffer_load(
+                    s_rsrc, row * (K // 128) + kc, vec_width=1, dtype=T.i32
+                ))
+                scales = [
+                    ((packed_scale.shrui(fx.Int32(sp * 8)) & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
+                    for sp in range_constexpr(4)
+                ]
             return ("mxfp4", (raw, scales), coef, b_word + (lane // 16) * 4)
 
         def unit_mxfp4_bf16(w_rsrc, s_rsrc, rg, kc, K, b_word, coef, ln=None):

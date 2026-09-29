@@ -65,7 +65,10 @@ def prepare_glm5_weights(W: LayerWeights, attention_weight: AttentionWeight | st
     if atom_experts:
         packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
         packed["w_r"] = pack_bf16(t["w_r"])
-        packed.update(dict(zip(("w_ug", "s_ug", "w_dn", "s_dn"), prepare_mxfp4_expert_storage(W))))
+        packed.update(dict(zip(
+            ("w_ug", "s_ug", "w_dn", "s_dn"),
+            prepare_mxfp4_expert_storage(W, canonical=False),
+        )))
         return packed
     return pack_layer_weights(
         t,
@@ -133,6 +136,11 @@ class Glm5MonoKernel:
         self.output_heads = output_heads
         t = W.t
         self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
+        self.atom_experts = (
+            self.expert_mxfp4
+            and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+            and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+        )
         self.packed = dict(
             prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
         )
@@ -196,6 +204,7 @@ class Glm5MonoKernel:
             with_indexer=with_indexer,
             index_max_seq=index_max_seq,
             expert_mxfp4=self.expert_mxfp4,
+            atom_experts=self.atom_experts,
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
             kv_cache_dtype=self.kv_cache_dtype,
