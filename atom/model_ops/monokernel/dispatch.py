@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from atom.model_ops.monokernel.config import GLM5_GRAPH_BATCHES, glm5_tp_config
+from atom.model_ops.monokernel.config import GLM5_GRAPH_BATCHES, glm5_attention_heads, glm5_tp_config
 
 MODES = ("off", "auto", "mono", "staged")
 SAMPLES = (4, 8)
@@ -46,7 +46,8 @@ def normalize_mode(mode: str) -> str:
 
 
 def glm52_native_config(
-    *, samples: int, tp_size: int, kv_cache_dtype: str, mtp: bool, query_length: int
+    *, samples: int, tp_size: int, kv_cache_dtype: str, mtp: bool,
+    query_length: int, dcp_size: int = 1,
 ):
     """Return the canonical eligible GLM-5 shard geometry, or ``None``."""
 
@@ -56,10 +57,18 @@ def glm52_native_config(
         return None
     if query_length <= 0 or samples % query_length or samples // query_length not in GLM5_GRAPH_BATCHES:
         return None
-    if query_length == 6:
-        return config if tp_size == 4 and kv_cache_dtype == "fp8" and mtp else None
+    if query_length in (4, 5, 6):
+        valid_dcp = (
+            (query_length == 6 and dcp_size == 1)
+            or (query_length == 5 and dcp_size in (1, 4))
+            or (query_length == 4 and dcp_size == 4)
+        )
+        if tp_size == 4 and kv_cache_dtype == "fp8" and mtp and valid_dcp:
+            glm5_attention_heads(tp_size, dcp_size)
+            return config
+        return None
     if query_length == 1:
-        return config if tp_size == 8 and kv_cache_dtype == "bf16" and not mtp and samples in SAMPLES else None
+        return config if tp_size == 8 and dcp_size == 1 and kv_cache_dtype == "bf16" and not mtp and samples in SAMPLES else None
     return None
 
 
@@ -82,11 +91,14 @@ def select_backend(
     external_indexer: bool = True,
     cache_layout: str = "atom",
     query_length: int = 1,
+    dcp_size: int = 1,
 ) -> str | None:
     """Return a production backend name, or ``None`` for baseline fallback."""
 
     mode = normalize_mode(mode)
-    if mode == "off" or not native or not decode or dpa or dcp or plugin:
+    if dcp != (dcp_size > 1):
+        return None
+    if mode == "off" or not native or not decode or dpa or plugin:
         return None
     if model == "glm52":
         if (
@@ -96,6 +108,7 @@ def select_backend(
                 kv_cache_dtype=kv_cache_dtype,
                 mtp=mtp,
                 query_length=query_length,
+                dcp_size=dcp_size,
             )
             and has_moe
             and external_indexer
@@ -105,6 +118,8 @@ def select_backend(
             return "mono"
         return None
     if model == "kimi_k3":
+        if dcp:
+            return None
         if (
             tp_size != 8
             or kv_cache_dtype not in ("bf16", "fp8")

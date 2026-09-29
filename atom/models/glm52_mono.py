@@ -22,6 +22,7 @@ from atom.model_ops.monokernel.config import (
     KvCacheLayout,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
+    glm5_attention_heads,
     glm5_kernel_samples,
     glm5_tp_config,
 )
@@ -76,8 +77,16 @@ def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     return view
 
 
-def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
+def _dequant_batched(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    scale = scale.float()
+    while scale.ndim < weight.ndim:
+        scale = scale.unsqueeze(-1)
+    return (weight.float() * scale).to(torch.bfloat16)
+
+
+def _layer_weights(layer, rank: int, npes: int, dcp_size: int = 1) -> LayerWeights:
     cfg = glm5_tp_config(npes)
+    attention_heads = glm5_attention_heads(npes, dcp_size)
     attn = layer.self_attn
     moe = layer.mlp
     experts = moe.experts
@@ -144,6 +153,12 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         value_dim=cfg.v_dim,
         kv_lora=cfg.kv_lora,
     )
+    if dcp_size > 1:
+        impl = _attention_impl(layer)
+        _need(getattr(impl, "qrep_enabled", False), "DCP query replication")
+        qrep_uk = _dequant_batched(impl.W_K_qrep, impl.W_K_qrep_scale)
+        _need(qrep_uk.shape == (attention_heads, cfg.kv_lora, cfg.nope_dim), "QREP W_K geometry")
+        w_uk = qrep_uk.contiguous().view(attention_heads * cfg.kv_lora, cfg.nope_dim)
     bias = moe.gate.e_score_correction_bias
     _need(bias is not None and bias.dtype is torch.float32, "router correction bias must be FP32")
     _need(bias.shape == (cfg.n_experts,) and bias.is_contiguous(), "router correction bias layout")
@@ -162,7 +177,7 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         "w_q_b": linear_bf16(
             attn.q_b_proj,
             name="q_b_proj",
-            logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.pe_dim),
+            logical_rows=attention_heads * (cfg.nope_dim + cfg.pe_dim),
             logical_cols=cfg.q_lora,
         ),
         "w_uk": w_uk,
@@ -186,7 +201,7 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         "s_dn": s_dn,
     }
     return LayerWeights(
-        cfg.local_heads,
+        attention_heads,
         tensors,
         cfg,
         rank,
@@ -223,7 +238,8 @@ def _shared_sparse_buffer(layers) -> torch.Tensor:
 
 
 class _GlmLayerOp:
-    def __init__(self, weights: LayerWeights, samples: int, topk: int, kv_cache_dtype: str, prepared_weights, runtime) -> None:
+    def __init__(self, weights: LayerWeights, samples: int, topk: int, kv_cache_dtype: str,
+                 prepared_weights, runtime, dcp_size: int) -> None:
         from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
 
         rank = get_tensor_model_parallel_rank()
@@ -242,6 +258,7 @@ class _GlmLayerOp:
             kv_cache_dtype=kv_cache_dtype,
             prepared_weights=prepared_weights,
             runtime=runtime,
+            dcp_size=dcp_size,
         )
 
     def close(self) -> None:
@@ -268,6 +285,7 @@ class Glm52MonoDecode:
 
         config = atom_config.hf_config
         tp_size = atom_config.tensor_parallel_size
+        self._dcp_size = atom_config.decode_context_parallel_size
         spec = atom_config.speculative_config
         self._query_length = 1 if spec is None else spec.num_speculative_tokens + 1
         is_mtp = spec is not None and spec.method == "mtp"
@@ -277,14 +295,15 @@ class Glm52MonoDecode:
             kv_cache_dtype=atom_config.kv_cache_dtype,
             mtp=is_mtp,
             query_length=self._query_length,
+            dcp_size=self._dcp_size,
         )
-        self._required = shard is not None and self._query_length == 6
+        self._required = shard is not None and self._query_length in (4, 5, 6)
         checks = (
             (shard is not None, "native geometry"),
             (getattr(config, "model_type", None) == "glm_moe_dsa", "model type"),
             (atom_config.parallel_config.data_parallel_size == 1, "DP"),
             (not atom_config.enable_dp_attention, "DPA"),
-            (atom_config.decode_context_parallel_size == 1, "DCP"),
+            (self._dcp_size in (1, 4), "DCP geometry"),
             (atom_config.prefill_context_parallel_size == 1, "PCP"),
             (atom_config.pipeline_parallel_size == 1, "PP"),
             (not atom_config.enable_expert_parallel, "EP"),
@@ -350,6 +369,8 @@ class Glm52MonoDecode:
             if indexer is not None and not layer.self_attn.skip_topk:
                 if self._required and not getattr(indexer, "_indexer_fp4", False):
                     raise MonoUnsupported("GLM-5.2 required MonoKernel configuration failed: FP4 index cache")
+                if self._dcp_size > 1 and not getattr(_attention_impl(layer), "qrep_enabled", False):
+                    raise MonoUnsupported("GLM-5.2 required MonoKernel configuration failed: DCP QREP")
                 seen_full_indexer = True
             elif not seen_full_indexer:
                 if self._required:
@@ -392,12 +413,13 @@ class Glm52MonoDecode:
                 "glm52", self._mode, samples=samples, tp_size=npes,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
                 mtp=(self._atom_config.speculative_config is not None and self._atom_config.speculative_config.method == "mtp"),
-                query_length=query_length, has_moe=True, external_indexer=True, cache_layout="atom",
+                query_length=query_length, dcp_size=self._dcp_size,
+                has_moe=True, external_indexer=True, cache_layout="atom",
             )
             _need(backend == "mono", "layer backend")
             for layer in layers:
                 if layer.layer_idx not in self._weights:
-                    weights = _layer_weights(layer, rank, npes)
+                    weights = _layer_weights(layer, rank, npes, self._dcp_size)
                     mapped.append((layer.layer_idx, weights, prepare_glm5_weights(weights, AttentionWeight.BF16)))
         except (MonoUnsupported, ValueError) as error:
             validation_error = error
@@ -426,7 +448,7 @@ class Glm52MonoDecode:
                     continue
                 owned = _GlmLayerOp(
                     self._weights[layer.layer_idx], chunk_samples, self._atom_config.hf_config.index_topk,
-                    self._atom_config.kv_cache_dtype, self._prepared[layer.layer_idx], runtime,
+                    self._atom_config.kv_cache_dtype, self._prepared[layer.layer_idx], runtime, self._dcp_size,
                 )
                 if runtime is None:
                     runtime = owned.op
@@ -472,7 +494,7 @@ class Glm52MonoDecode:
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
             mtp=(self._atom_config.speculative_config is not None and self._atom_config.speculative_config.method == "mtp"),
             dpa=self._atom_config.enable_dp_attention,
-            dcp=self._atom_config.decode_context_parallel_size > 1,
+            dcp=self._dcp_size > 1, dcp_size=self._dcp_size,
             plugin=is_plugin_mode(), query_length=query_length,
         ) != "mono":
             return self._unsupported(f"shape S={samples} q={query_length}")
@@ -502,6 +524,14 @@ class Glm52MonoDecode:
                 if dtype is not None
             }
             for layer in self._mono_layers():
+                impl = _attention_impl(layer)
+                if self._dcp_size > 1:
+                    indptr = impl.dcp_sparse_kv_indptr_buffer
+                    _need(
+                        indptr is not None and indptr.dtype is torch.int32
+                        and indptr.numel() >= samples + 1 and indptr.is_contiguous(),
+                        f"layer {layer.layer_idx} DCP sparse indptr",
+                    )
                 cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"].k_cache
                 expected_dtype = (
                     cache.dtype in fp8_dtypes
@@ -564,6 +594,9 @@ class Glm52MonoDecode:
             state = hidden if residual is None else hidden + residual
             self._refresh_indexer(layer, state, positions)
             attn = layer.self_attn
+            layer_indptr = sparse_indptr
+            if self._dcp_size > 1:
+                layer_indptr = _attention_impl(layer).dcp_sparse_kv_indptr_buffer[: samples + 1]
             cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"].k_cache
             hidden = owned.op.forward(
                 state,
@@ -576,7 +609,7 @@ class Glm52MonoDecode:
                 layer=0,
                 positions=positions,
                 slot_mapping=slot_mapping,
-                sparse_kv_indptr=sparse_indptr,
+                sparse_kv_indptr=layer_indptr,
             )
             residual = None
         state = hidden if residual is None else hidden + residual

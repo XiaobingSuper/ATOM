@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import ast
+import math
 import subprocess
 import sys
 import types
@@ -16,6 +17,7 @@ from atom.model_ops.monokernel.config import (
     KimiDecodeGeometry,
     conv_state_offset,
     conv_state_shape,
+    glm5_attention_heads,
     glm5_kernel_samples,
     glm5_tp_config,
 )
@@ -384,7 +386,7 @@ def test_native_decode_flag(monkeypatch):
         {"decode": False},
         {"mtp": True},
         {"dpa": True},
-        {"dcp": True},
+        {"dcp": True, "dcp_size": 4},
         {"plugin": True},
         {"kv_cache_dtype": "fp8"},
         {"external_indexer": False},
@@ -540,6 +542,7 @@ def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
         )
         value._mode = "auto"
         value._required = False
+        value._dcp_size = 1
         value._shard = glm5_tp_config(8)
         value._ops, value._weights, value._prepared, value._runtimes = {}, {}, {}, {}
         value._refused, value._announced = set(), set()
@@ -574,21 +577,34 @@ def test_model_specific_backend_selection():
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
 
 
-def test_glm_c8_geometry_and_full_graph_ladder():
+def test_glm_all_agentx_bands_and_graph_ladder():
     tp8, tp4 = glm5_tp_config(8), glm5_tp_config(4)
     assert (tp8.local_heads, tp8.inter) == (8, 256)
     assert (tp4.local_heads, tp4.inter) == (16, 512)
-    assert tp8.local_heads * 8 == tp4.local_heads * 4
-    assert tp8.inter * 8 == tp4.inter * 4
+    assert glm5_attention_heads(4, 1) == 16
+    assert glm5_attention_heads(4, 4) == 64
+    assert glm_layout.sparse_keys_per_task(4, 16) == 64
+    assert glm_layout.sparse_keys_per_task(4, 64) == 32
     assert tp4.n_experts + tp4.num_shared_experts == 257
-    for batch in GLM5_GRAPH_BATCHES:
-        samples = batch * 6
-        assert select_backend(
-            "glm52", "auto", samples=samples, tp_size=4, kv_cache_dtype="fp8",
-            mtp=True, query_length=6,
-        ) == "mono"
-        chunk = glm5_kernel_samples(samples, 6)
-        assert chunk in (6, 12) and chunk % 6 == 0 and samples % chunk == 0
+    bands = ((6, 1), (5, 1), (5, 4), (4, 4))
+    for query_length, dcp_size in bands:
+        for batch in GLM5_GRAPH_BATCHES:
+            samples = batch * query_length
+            assert select_backend(
+                "glm52", "auto", samples=samples, tp_size=4,
+                kv_cache_dtype="fp8", mtp=True, query_length=query_length,
+                dcp=dcp_size > 1, dcp_size=dcp_size,
+            ) == "mono"
+            chunk = glm5_kernel_samples(samples, query_length)
+            assert chunk % query_length == 0 and samples % chunk == 0
+    assert select_backend(
+        "glm52", "auto", samples=24, tp_size=4, kv_cache_dtype="fp8",
+        mtp=True, query_length=6, dcp=True, dcp_size=4,
+    ) is None
+    assert select_backend(
+        "glm52", "auto", samples=16, tp_size=4, kv_cache_dtype="fp8",
+        mtp=True, query_length=4, dcp_size=1,
+    ) is None
 
 
 def test_glm_q6_sparse_rows_are_intra_request_causal():
@@ -619,6 +635,40 @@ def test_glm_tp4_symmetric_and_split_schedule_contracts():
     ))
     assert stages["split"] == samples * 2 * (2048 // 32)
     assert stages["ug"] >= samples * 9 * (cfg.inter // glm_layout.UG_TILE)
+    _, dcp_symmetric = glm_layout.layout(
+        10, glm5_attention_heads(4, 4), 4, 2048,
+        inter=cfg.inter, output_heads=cfg.local_heads, dcp_size=4,
+    )
+    assert dcp_symmetric["_dcp_part_stride"] > 0
+    assert dcp_symmetric["dcp"] < dcp_symmetric["_bytes"]
+
+    weights = glm_layout.dcp_softmax_weights([1.0, 2.0, -1.0, 0.5], [2.0, 1.0, 4.0, 3.0])
+    assert sum(weights) == pytest.approx(1.0)
+    empty_rank = glm_layout.dcp_softmax_weights([-1e30, 2.0], [0.0, 1.0])
+    assert empty_rank == pytest.approx([0.0, 1.0])
+    assert glm_layout.dcp_softmax_weights([0.0] * 4, [0.0] * 4) == [0.0] * 4
+    merged = sum(weight * value for weight, value in zip(weights, [3.0, 5.0, 7.0, 11.0]))
+    numerator = sum(
+        total * math.exp(maximum - 2.0) * value
+        for maximum, total, value in zip([1.0, 2.0, -1.0, 0.5], [2.0, 1.0, 4.0, 3.0], [3.0, 5.0, 7.0, 11.0])
+    )
+    denominator = sum(
+        total * math.exp(maximum - 2.0)
+        for maximum, total in zip([1.0, 2.0, -1.0, 0.5], [2.0, 1.0, 4.0, 3.0])
+    )
+    assert merged == pytest.approx(numerator / denominator)
+    indices = {
+        glm_layout.dcp_summary_index(source, sample, tile, item, 10, 256)
+        for source in range(4)
+        for sample in range(10)
+        for tile in range(256)
+        for item in (0, glm_layout.DCP_SUMMARY_PAIRS - 1)
+    }
+    assert len(indices) == 4 * 10 * 256 * 2
+    for rank in range(4):
+        owned = [tile for tile in range(256) if glm_layout.dcp_uv_owner(tile, 16, rank)]
+        assert len(owned) == 64
+        assert {glm_layout.dcp_local_uv_tile(tile, 16) for tile in owned} == set(range(64))
 
 
 def test_glm_required_c8_decode_does_not_fallback():
@@ -709,6 +759,15 @@ def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
         "safe_row": 17,
         "write_cache": True,
     }
+    dcp_remote = glm_layout.paged_row_contract(
+        physical, [0, 1], 0, slot_mapping=[-1]
+    )
+    assert dcp_remote["active"] and not dcp_remote["write_cache"]
+    dcp_owner_empty = glm_layout.paged_row_contract(
+        physical, [0, 0], 0, slot_mapping=[17]
+    )
+    assert not dcp_owner_empty["active"] and dcp_owner_empty["write_cache"]
+
     for sample in range(1, 4):
         padded = glm_layout.paged_row_contract(physical, indptr, sample)
         assert padded == {
@@ -836,6 +895,22 @@ def test_glm_recipe_per_token_fp8_attention_mapping():
     assert torch.equal(w_uv.view(2, 6, 64), by_head[:, 2:])
 
 
+def test_glm_qrep_batched_dequantization():
+    import torch
+
+    module = _glm_mono_module()
+    weight = torch.tensor(
+        [[[1.0, -2.0]], [[3.0, -4.0]]], dtype=torch.float8_e4m3fn
+    )
+    scale = torch.tensor([0.5, 2.0])
+    restored = module._dequant_batched(weight, scale)
+    assert restored.dtype is torch.bfloat16
+    assert torch.equal(
+        restored.float(),
+        torch.tensor([[[0.5, -1.0]], [[6.0, -8.0]]]),
+    )
+
+
 def test_glm_default_off_does_not_inspect_runtime_config():
     runner = _glm_mono_module().Glm52MonoDecode(None, object(), "off")
     assert runner._enabled is False
@@ -902,6 +977,68 @@ def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
     assert not module.Glm52MonoDecode(causal_lm, atom_config, "auto")._enabled
 
 
+def test_glm_dcp_band_requires_qrep(monkeypatch):
+    module = _glm_mono_module()
+    cfg = glm5_tp_config(4)
+    hf_config = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        hidden_size=cfg.hidden,
+        num_attention_heads=cfg.local_heads * 4,
+        q_lora_rank=cfg.q_lora,
+        kv_lora_rank=cfg.kv_lora,
+        qk_rope_head_dim=cfg.pe_dim,
+        qk_nope_head_dim=cfg.nope_dim,
+        v_head_dim=cfg.v_dim,
+        n_routed_experts=cfg.n_experts,
+        num_experts_per_tok=cfg.top_k,
+        n_shared_experts=cfg.num_shared_experts,
+        index_topk=2048,
+        routed_scaling_factor=cfg.route_scale,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        norm_topk_prob=True,
+        rms_norm_eps=module.EPS,
+        moe_intermediate_size=cfg.inter * 4,
+    )
+    atom_config = SimpleNamespace(
+        hf_config=hf_config,
+        tensor_parallel_size=4,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_dp_attention=False,
+        decode_context_parallel_size=4,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        speculative_config=SimpleNamespace(method="mtp", num_speculative_tokens=4),
+        kv_cache_dtype="fp8",
+    )
+    impl = SimpleNamespace(qrep_enabled=True)
+    indexer = SimpleNamespace(_indexer_fp4=True)
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(experts=object()),
+        self_attn=SimpleNamespace(
+            indexer=indexer,
+            skip_topk=False,
+            mla_attn=SimpleNamespace(impl=impl),
+        ),
+    )
+    causal_lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[layer], start_layer=0, end_layer=1)
+    )
+    monkeypatch.setattr(module, "is_plugin_mode", lambda: False)
+    monkeypatch.setattr(
+        module,
+        "envs",
+        SimpleNamespace(ATOM_USE_TRITON_MLA_SHUFFLE_KV=False, ATOM_MLA_PAGE_SIZE=1),
+    )
+    assert module.Glm52MonoDecode(causal_lm, atom_config, "auto")._enabled
+    impl.qrep_enabled = False
+    with pytest.raises(module.MonoUnsupported, match="DCP QREP"):
+        module.Glm52MonoDecode(causal_lm, atom_config, "auto")
+
+
 def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     import torch
 
@@ -911,6 +1048,7 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     runner._enabled = True
     runner._mode = "auto"
     runner._required = False
+    runner._dcp_size = 1
     runner._shard = glm5_tp_config(8)
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=8,
@@ -962,6 +1100,7 @@ def test_glm_c8_full_graph_padding_dispatches_q6(monkeypatch):
     samples, active = 16 * 6, 8 * 6
     runner = object.__new__(module.Glm52MonoDecode)
     runner._enabled, runner._mode, runner._required = True, "auto", True
+    runner._dcp_size = 1
     runner._shard = glm5_tp_config(4)
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=4, kv_cache_dtype="fp8",
