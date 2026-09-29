@@ -64,7 +64,7 @@ def _preshuffled_mxfp4_linear(source):
     packed, scale = quantize_mxfp4(source)
     rows = source.shape[0]
     fp4_dtype = torch.float4_e2m1fn_x2
-    shuffled_weight = _preshuffle_linear_weight(packed)
+    shuffled_weight = _preshuffle_linear_weight(packed).view(fp4_dtype)
     shuffled_weight.is_shuffled = True
     groups = scale.shape[1]
     shuffled_scale = (
