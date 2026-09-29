@@ -66,10 +66,27 @@ def select_backend(
     has_moe: bool = True,
     external_indexer: bool = True,
     cache_layout: str = "atom",
+    segment: str = "layer",
 ) -> str | None:
     """Return a production backend name, or ``None`` for baseline fallback."""
 
     mode = normalize_mode(mode)
+    if model == "glm52" and segment == "moe":
+        if (
+            mode in ("auto", "staged")
+            and native
+            and decode
+            and samples > 0
+            and tp_size == 4
+            and kv_cache_dtype == "fp8"
+            and not dpa
+            and not plugin
+            and has_moe
+            and external_indexer
+            and cache_layout == "atom"
+        ):
+            return "staged_moe"
+        return None
     if (
         mode == "off"
         or not native

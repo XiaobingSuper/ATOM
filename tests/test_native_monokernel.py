@@ -400,6 +400,42 @@ def test_model_specific_backend_selection():
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
 
 
+@pytest.mark.parametrize(("rows", "mtp", "dcp"), ((48, True, False), (80, True, True)))
+def test_glm_agentic_selects_moe_stage_for_flattened_rows(rows, mtp, dcp):
+    common = dict(
+        samples=rows,
+        tp_size=4,
+        kv_cache_dtype="fp8",
+        mtp=mtp,
+        dcp=dcp,
+        segment="moe",
+    )
+
+    assert select_backend("glm52", "auto", **common) == "staged_moe"
+    assert select_backend("glm52", "staged", **common) == "staged_moe"
+    assert select_backend("glm52", "mono", **common) is None
+    assert select_backend("glm52", "auto", **common, plugin=True) is None
+
+
+def test_glm_shard_geometry_derives_from_tensor_parallel_size():
+    from atom.model_ops.monokernel.config import (
+        glm5_decode_shape,
+        glm5_shard_config,
+    )
+
+    tp8 = glm5_shard_config(8)
+    tp4 = glm5_shard_config(4)
+    assert (tp8.local_heads, tp8.inter) == (8, 256)
+    assert (tp4.local_heads, tp4.inter) == (16, 512)
+    with pytest.raises(ValueError, match="TP size"):
+        glm5_shard_config(3)
+
+    c4_mtp5 = glm5_decode_shape(running_bs=8, query_len=6)
+    assert (c4_mtp5.rows, c4_mtp5.tiles, c4_mtp5.tail_rows) == (48, 6, 8)
+    c10_mtp4 = glm5_decode_shape(running_bs=20, query_len=5)
+    assert (c10_mtp4.rows, c10_mtp4.tiles, c10_mtp4.tail_rows) == (100, 13, 4)
+
+
 def test_glm_layout_covers_only_requested_decode_batches():
     for samples in (4, 8):
         scratch, symmetric = glm_layout.layout(samples, 8, 8, 2048)

@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 
@@ -237,6 +237,47 @@ GLM5_CONFIG = LayerConfig(
     route_scale=2.5,
     local_heads=8,
 )
+
+GLM5_GLOBAL_HEADS = 64
+GLM5_GLOBAL_EXPERT_INTER = 2048
+
+
+def glm5_shard_config(tp_size: int) -> LayerConfig:
+    """Derive GLM-5.2's attention and expert shard geometry."""
+
+    if tp_size not in (4, 8):
+        raise ValueError(f"GLM-5.2 native TP size must be 4 or 8, got {tp_size}")
+    return replace(
+        GLM5_CONFIG,
+        local_heads=GLM5_GLOBAL_HEADS // tp_size,
+        inter=GLM5_GLOBAL_EXPERT_INTER // tp_size,
+    )
+
+
+@dataclass(frozen=True)
+class GlmDecodeShape:
+    """Separate request, query, and flattened-token dimensions for MTP."""
+
+    running_bs: int
+    query_len: int
+    rows: int
+    tiles: int
+    tail_rows: int
+
+
+def glm5_decode_shape(
+    running_bs: int,
+    query_len: int,
+    *,
+    tile_rows: int = 8,
+) -> GlmDecodeShape:
+    if running_bs <= 0 or query_len <= 0 or tile_rows <= 0:
+        raise ValueError("GLM-5.2 decode dimensions must be positive")
+    rows = running_bs * query_len
+    tiles = (rows + tile_rows - 1) // tile_rows
+    tail_rows = rows - (tiles - 1) * tile_rows
+    return GlmDecodeShape(running_bs, query_len, rows, tiles, tail_rows)
+
 
 KIMI_K3_CONFIG = LayerConfig(
     name="kimi_k3",
