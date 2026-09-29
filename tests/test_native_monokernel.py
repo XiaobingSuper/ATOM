@@ -446,6 +446,92 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
     assert captured[0]["conv_state_layout"] is ConvStateLayout.TIME_MAJOR
 
 
+def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
+    module = _kimi_mono_module()
+    rank = [0]
+    messages = []
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank[0])
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
+    )
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "_KimiLayerOp", lambda *_args: object())
+    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
+
+    def runner():
+        value = object.__new__(module.KimiMonoDecode)
+        value._mode = "auto"
+        value._atom_config = SimpleNamespace(kv_cache_dtype="bf16")
+        value._ops = {}
+        value._weights = {}
+        value._refused = set()
+        value._announced = set()
+        return value
+
+    layers = [
+        SimpleNamespace(layer_idx=layer_idx, is_linear_attn=True, block_sparse_moe=object())
+        for layer_idx in (1, 2)
+    ]
+    rank_zero = runner()
+    rank_zero._op(layers[0], 4)
+    rank_zero._op(layers[0], 4)
+    rank_zero._op(layers[1], 4)
+    rank[0] = 1
+    runner()._op(layers[0], 4)
+
+    assert messages == [("Kimi-K3 MonoKernel on: backend=%s S=%d", "staged", 4)]
+
+
+def test_glm_announces_samples_once_on_rank_zero(monkeypatch):
+    module = _glm_mono_module()
+    rank = [0]
+    messages = []
+    layers = [SimpleNamespace(layer_idx=layer_idx) for layer_idx in (1, 2)]
+
+    class FakeOwned:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: rank[0])
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object()))
+    monkeypatch.setattr(module, "_bf16_vector", lambda tensor, *_args: tensor)
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "_GlmLayerOp", lambda *_args: FakeOwned())
+    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
+
+    def runner():
+        value = object.__new__(module.Glm52MonoDecode)
+        value._lm = SimpleNamespace(model=SimpleNamespace(norm=SimpleNamespace(weight=object())))
+        value._atom_config = SimpleNamespace(hf_config=SimpleNamespace(index_topk=2048))
+        value._mode = "auto"
+        value._ops = {}
+        value._refused = set()
+        value._announced = set()
+        value._mono_layers = lambda: layers
+        return value
+
+    rank_zero = runner()
+    assert rank_zero._prepare(4)
+    assert rank_zero._prepare(4)
+    assert rank_zero._prepare(8)
+    rank[0] = 1
+    assert runner()._prepare(4)
+
+    assert messages == [
+        ("GLM-5.2 MonoKernel on: S=%d", 4),
+        ("GLM-5.2 MonoKernel on: S=%d", 8),
+    ]
+    rank_zero.close()
+    assert rank_zero._announced == set()
+
+
 def test_model_specific_backend_selection():
     common = dict(samples=8, tp_size=8, kv_cache_dtype="fp8")
     assert select_backend("glm52", "auto", **common) is None
@@ -749,9 +835,11 @@ def test_kimi_runner_close_is_idempotent():
     runner._ops = {(1, 4, "staged"): owned}
     runner._weights = {}
     runner._refused = set()
+    runner._announced = {("staged", 4)}
     runner.close()
     runner.close()
     assert owned.calls == 1
+    assert runner._announced == set()
 
 
 def test_kimi_default_off_does_not_inspect_runtime_config():

@@ -209,6 +209,7 @@ class KimiMonoDecode:
         self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
         self._refused: set[tuple[int, int, str]] = set()
+        self._announced: set[tuple[str, int]] = set()
         self._enabled = mode != "off"
         if not self._enabled:
             return
@@ -299,6 +300,10 @@ class KimiMonoDecode:
                 assert weights is not None
                 self._weights[layer.layer_idx] = weights
                 self._ops[key] = _KimiLayerOp(layer, weights, samples, backend)
+                announcement = (backend, samples)
+                if rank == 0 and announcement not in self._announced:
+                    logger.info("Kimi-K3 MonoKernel on: backend=%s S=%d", backend, samples)
+                    self._announced.add(announcement)
             except (MonoUnsupported, ValueError) as error:
                 self._refused.add(key)
                 logger.warning(
@@ -363,3 +368,4 @@ class KimiMonoDecode:
         self._ops.clear()
         self._weights.clear()
         self._refused.clear()
+        self._announced.clear()

@@ -250,6 +250,7 @@ class Glm52MonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int], _GlmLayerOp] = {}
         self._refused: set[int] = set()
+        self._announced: set[int] = set()
         self._enabled = mode != "off"
         if not self._enabled:
             return
@@ -382,6 +383,9 @@ class Glm52MonoDecode:
             self._refused.add(samples)
             logger.warning("GLM-5.2 MonoKernel fallback before launch: %s", error)
             return False
+        if rank == 0 and samples not in self._announced:
+            logger.info("GLM-5.2 MonoKernel on: S=%d", samples)
+            self._announced.add(samples)
         return True
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
@@ -516,3 +520,4 @@ class Glm52MonoDecode:
             owned.close()
         self._ops.clear()
         self._refused.clear()
+        self._announced.clear()
