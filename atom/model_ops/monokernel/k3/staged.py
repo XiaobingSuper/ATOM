@@ -714,6 +714,25 @@ class _KimiK3MlaPath:
             self.symmetric_allreduce.close()
         self.attention.close()
 
+    def release_packed_sources(self) -> None:
+        """Keep only tensors read by the selected fused runtime path."""
+
+        keep = {
+            "bias",
+            "g_in",
+            "g_latent",
+            "g_mlp_res",
+            "g_post",
+            "g_self_res",
+            "w_mlp_res",
+            "w_self_res",
+        }
+        self.t = {name: value for name, value in self.t.items() if name in keep}
+        self.W = None
+        release = getattr(self.attention, "release_packed_sources", None)
+        if callable(release):
+            release()
+
     def __enter__(self):
         return self
 

@@ -415,54 +415,62 @@ class KimiMonoDecode:
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
-        mapped = []
-        validation_error = None
-        try:
-            for layer, backend, key in specs:
-                weights = self._weights.get(layer.layer_idx)
-                if weights is None:
-                    weights = _layer_weights(layer, rank, npes)
-                mapped.append((layer, backend, key, weights))
-        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
-            validation_error = error
-        try:
-            tp_uniform_local_validation(
-                validation_error,
-                group=tp.cpu_group,
-                world_size=npes,
-                context=f"Kimi-K3 S{samples} weight mapping failed",
-            )
-        except MonoUnsupported as error:
-            self._refused.update(key for _, _, key in specs)
-            logger.warning("Kimi-K3 MonoKernel fallback before launch: %s", error)
-            return False
-
         made = []
         try:
-            for layer, backend, key, weights in mapped:
-                self._weights[layer.layer_idx] = weights
+            for layer, backend, key in specs:
                 if key in self._ops:
                     continue
+                validation_error = None
+                weights = None
+                try:
+                    weights = self._weights.get(layer.layer_idx)
+                    if weights is None:
+                        weights = _layer_weights(layer, rank, npes)
+                except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+                    validation_error = error
+                tp_uniform_local_validation(
+                    validation_error,
+                    group=tp.cpu_group,
+                    world_size=npes,
+                    context=f"Kimi-K3 layer {layer.layer_idx} weight mapping failed",
+                )
+                assert weights is not None
+                self._weights[layer.layer_idx] = weights
                 reduction_key = (samples, backend)
                 attention_reduce, moe_reduce = self._reductions.get(
                     reduction_key,
                     (None, None),
                 )
-                self._ops[key] = _KimiLayerOp(
-                    layer,
-                    weights,
-                    samples,
-                    backend,
-                    attention_symmetric_allreduce=attention_reduce,
-                    moe_symmetric_allreduce=moe_reduce,
-                    state_dtype=state_dtype,
+                owned = None
+                construction_error = None
+                try:
+                    owned = _KimiLayerOp(
+                        layer,
+                        weights,
+                        samples,
+                        backend,
+                        attention_symmetric_allreduce=attention_reduce,
+                        moe_symmetric_allreduce=moe_reduce,
+                        state_dtype=state_dtype,
+                    )
+                except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+                    construction_error = error
+                tp_uniform_local_validation(
+                    construction_error,
+                    group=tp.cpu_group,
+                    world_size=npes,
+                    context=f"Kimi-K3 layer {layer.layer_idx} construction failed",
                 )
+                assert owned is not None
+                self._ops[key] = owned
                 if reduction_key not in self._reductions:
-                    op = self._ops[key].op
+                    op = owned.op
                     self._reductions[reduction_key] = (
                         op.attention.symmetric_allreduce,
                         op.symmetric_allreduce,
                     )
+                owned.op.release_packed_sources()
+                self._weights.pop(layer.layer_idx, None)
                 made.append(key)
         except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
             for key in reversed(made):

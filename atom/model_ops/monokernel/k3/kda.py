@@ -538,6 +538,28 @@ class KimiK3KdaAttention:
     def advance_step(self) -> None:
         self.step.add_(1)
 
+    def release_packed_sources(self) -> None:
+        """Drop dense source snapshots after their packed artifacts are built."""
+
+        keep = {
+            "bias",
+            "g_in",
+            "g_kda_out",
+            "g_latent",
+            "g_mlp_res",
+            "g_post",
+            "g_self_res",
+            "kda_a_log",
+            "kda_dt_bias",
+            "w_kda_conv",
+            "w_kda_fb",
+            "w_kda_o",
+            "w_mlp_res",
+            "w_self_res",
+        }
+        self.t = {name: value for name, value in self.t.items() if name in keep}
+        self.W = None
+
     def close(self) -> None:
         if self.symmetric_allreduce is not None:
             self.symmetric_allreduce.close()
