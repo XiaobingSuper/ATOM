@@ -37,9 +37,10 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 _NATIVE_BUCKETS = 2  # S4 and S8
-# Persistent padded KDA projections plus packed staged-MoE artifacts. Dense
-# source snapshots are released immediately after packing.
-_PACKED_RESERVE_PER_LAYER = 192 << 20
+# Immutable projections/MoE weights are shared by S4/S8. Each bucket retains
+# only graph-stable activation/scratch workspaces.
+_PACKED_RESERVE_PER_LAYER = 256 << 20
+_WORKSPACE_RESERVE_PER_LAYER_BUCKET = 32 << 20
 
 
 def _need(ok: bool, what: str) -> None:
@@ -223,6 +224,7 @@ class _KimiLayerOp:
         moe_symmetric_allreduce=None,
         state_dtype: torch.dtype = torch.float32,
         defer_collectives: bool = False,
+        packed_artifacts: dict[str, object] | None = None,
     ) -> None:
         from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
         from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
@@ -245,6 +247,7 @@ class _KimiLayerOp:
             moe_symmetric_allreduce=moe_symmetric_allreduce,
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
+            packed_artifacts=packed_artifacts,
         )
 
     def initialize_collectives(self, attention=None, moe=None):
@@ -260,6 +263,7 @@ class KimiMonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int, str, torch.dtype], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
+        self._packed_artifacts: dict[int, dict[str, object]] = {}
         self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
         self._refused: set[tuple[int, int, str, torch.dtype]] = set()
         self._stats = MonoRouteStats("kimi_k3")
@@ -317,8 +321,10 @@ class KimiMonoDecode:
             return 0
         return (
             len(self._layer_specs(4))
-            * _NATIVE_BUCKETS
-            * _PACKED_RESERVE_PER_LAYER
+            * (
+                _PACKED_RESERVE_PER_LAYER
+                + _NATIVE_BUCKETS * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
+            )
         )
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
@@ -460,6 +466,7 @@ class KimiMonoDecode:
                 self._weights[layer.layer_idx] = weights
                 owned = None
                 construction_error = None
+                packed_artifacts = self._packed_artifacts.get(layer.layer_idx)
                 try:
                     owned = _KimiLayerOp(
                         layer,
@@ -468,6 +475,7 @@ class KimiMonoDecode:
                         backend,
                         state_dtype=state_dtype,
                         defer_collectives=True,
+                        packed_artifacts=packed_artifacts,
                     )
                 except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
                     construction_error = error
@@ -478,6 +486,10 @@ class KimiMonoDecode:
                     context=f"Kimi-K3 layer {layer.layer_idx} rank-local construction failed",
                 )
                 assert owned is not None
+                if packed_artifacts is None:
+                    self._packed_artifacts[layer.layer_idx] = (
+                        owned.op.packed_artifacts()
+                    )
                 owned.op.release_packed_sources()
                 self._weights.pop(layer.layer_idx, None)
                 pending.append((key, backend, owned))
@@ -619,4 +631,5 @@ class KimiMonoDecode:
         self._close_reductions()
         self._ops.clear()
         self._weights.clear()
+        getattr(self, "_packed_artifacts", {}).clear()
         self._refused.clear()

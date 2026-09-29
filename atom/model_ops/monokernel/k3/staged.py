@@ -77,6 +77,7 @@ class _KimiK3MlaPath:
         moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
         defer_collectives: bool = False,
+        packed_artifacts: dict[str, object] | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -112,6 +113,7 @@ class _KimiK3MlaPath:
         self.routed_hidden = config.routed_hidden
         self.shared_inter = config.shared_inter
         self.hidden_shard = config.hidden // npes
+        packed_artifacts = packed_artifacts or {}
 
         expected = {
             "w_r",
@@ -153,6 +155,7 @@ class _KimiK3MlaPath:
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
+            packed_artifacts=packed_artifacts.get("attention"),
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -177,21 +180,74 @@ class _KimiK3MlaPath:
         )
 
         self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
-        self.w_router = pack_bf16(self.t["w_r"])
-        latent_weight, self.s_latent_down = quantize_mxfp8(self.t["w_latent_down"])
-        shared_weight, self.s_shared_ug = quantize_mxfp8(self.t["w_shared_ug"])
-        shared_down_weight, self.s_shared_dn = quantize_mxfp8(self.t["w_shared_dn"])
-        latent_up_weight, self.s_latent_up = quantize_mxfp8(self.t["w_latent_up"])
-        self.latent_projection = Mxfp8Linear(latent_weight, self.s_latent_down, samples)
-        self.shared_projection = Mxfp8Linear(shared_weight, self.s_shared_ug, samples)
+        if packed_artifacts:
+            required = {
+                "w_router",
+                "w_latent_down",
+                "s_latent_down",
+                "w_shared_ug",
+                "s_shared_ug",
+                "w_shared_dn",
+                "s_shared_dn",
+                "w_latent_up",
+                "s_latent_up",
+            }
+            missing = sorted(required.difference(packed_artifacts))
+            if missing:
+                raise ValueError(
+                    f"missing shared Kimi packed artifacts: {', '.join(missing)}"
+                )
+            self.w_router = packed_artifacts["w_router"]
+            self.latent_projection = Mxfp8Linear.from_packed(
+                packed_artifacts["w_latent_down"],
+                packed_artifacts["s_latent_down"],
+                n=self.routed_hidden,
+                k=config.hidden,
+                rows=samples,
+            )
+            self.shared_projection = Mxfp8Linear.from_packed(
+                packed_artifacts["w_shared_ug"],
+                packed_artifacts["s_shared_ug"],
+                n=2 * self.shared_inter,
+                k=config.hidden,
+                rows=samples,
+            )
+            self.w_shared_dn = packed_artifacts["w_shared_dn"]
+            self.s_shared_dn = packed_artifacts["s_shared_dn"]
+            self.w_latent_up = packed_artifacts["w_latent_up"]
+            self.s_latent_up = packed_artifacts["s_latent_up"]
+        else:
+            self.w_router = pack_bf16(self.t["w_r"])
+            latent_weight, latent_scale = quantize_mxfp8(
+                self.t["w_latent_down"]
+            )
+            shared_weight, shared_scale = quantize_mxfp8(
+                self.t["w_shared_ug"]
+            )
+            shared_down_weight, shared_down_scale = quantize_mxfp8(
+                self.t["w_shared_dn"]
+            )
+            latent_up_weight, latent_up_scale = quantize_mxfp8(
+                self.t["w_latent_up"]
+            )
+            self.latent_projection = Mxfp8Linear(
+                latent_weight,
+                latent_scale,
+                samples,
+            )
+            self.shared_projection = Mxfp8Linear(
+                shared_weight,
+                shared_scale,
+                samples,
+            )
+            self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
+            self.s_shared_dn = pack_mxfp8_scale(shared_down_scale)
+            self.w_latent_up = pack_mxfp8_weight(latent_up_weight)
+            self.s_latent_up = pack_mxfp8_scale(latent_up_scale)
         self.w_latent_down = self.latent_projection.weight
         self.s_latent_down = self.latent_projection.scale
         self.w_shared_ug = self.shared_projection.weight
         self.s_shared_ug = self.shared_projection.scale
-        self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
-        self.s_shared_dn = pack_mxfp8_scale(self.s_shared_dn)
-        self.w_latent_up = pack_mxfp8_weight(latent_up_weight)
-        self.s_latent_up = pack_mxfp8_scale(self.s_latent_up)
 
         # At most one padded BM tile is needed per selected route: there can be
         # no more active experts than routes.  The old ``routes + E*(BM-1)``
@@ -265,6 +321,20 @@ class _KimiK3MlaPath:
         if reduce_group is None:
             raise ValueError("the Kimi-K3 staged path requires a GPU-capable TP reduce_group")
 
+    def packed_artifacts(self) -> dict[str, object]:
+        return {
+            "attention": self.attention.packed_artifacts(),
+            "w_router": self.w_router,
+            "w_latent_down": self.w_latent_down,
+            "s_latent_down": self.s_latent_down,
+            "w_shared_ug": self.w_shared_ug,
+            "s_shared_ug": self.s_shared_ug,
+            "w_shared_dn": self.w_shared_dn,
+            "s_shared_dn": self.s_shared_dn,
+            "w_latent_up": self.w_latent_up,
+            "s_latent_up": self.s_latent_up,
+        }
+
     def _build_fused_tail(self):
         if self.symmetric_allreduce is None or not self.fuse_shared_experts:
             return None
@@ -329,6 +399,7 @@ class _KimiK3MlaPath:
         attention_symmetric_allreduce,
         state_dtype: torch.dtype,
         defer_collectives: bool,
+        packed_artifacts: dict[str, torch.Tensor] | None,
     ):
         if attention_symmetric_allreduce is not None:
             raise ValueError("Kimi-K3 MLA does not accept a KDA all-reduce")
@@ -339,6 +410,7 @@ class _KimiK3MlaPath:
             conv_state_layout,
             state_dtype,
             defer_collectives,
+            packed_artifacts,
         )
         return KimiK3MlaAttention(
             weights,
@@ -804,6 +876,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         attention_symmetric_allreduce,
         state_dtype: torch.dtype,
         defer_collectives: bool,
+        packed_artifacts: dict[str, torch.Tensor] | None,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -822,6 +895,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             symmetric_allreduce=attention_symmetric_allreduce,
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
+            packed_artifacts=packed_artifacts,
         )
 
     def forward(

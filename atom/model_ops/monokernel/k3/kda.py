@@ -96,6 +96,7 @@ class KimiK3KdaAttention:
         symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
         defer_collectives: bool = False,
+        packed_artifacts: dict[str, torch.Tensor] | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -183,13 +184,16 @@ class KimiK3KdaAttention:
             device=device,
         )
         self.fused_input = self.fused_input_storage[:, :fused_width]
-        self.w_kda_in_padded = torch.zeros(
-            padded_fused_width,
-            config.hidden,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
+        packed_artifacts = packed_artifacts or {}
+        self.w_kda_in_padded = packed_artifacts.get("w_kda_in_padded")
+        if self.w_kda_in_padded is None:
+            self.w_kda_in_padded = torch.zeros(
+                padded_fused_width,
+                config.hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
         self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
@@ -215,9 +219,12 @@ class KimiK3KdaAttention:
         self.attn_res_blocks = -1
         self.block_write_idx = -1
         self.fuse_moe = False
-        self.moe_packed: dict[str, torch.Tensor] = {}
-        self.w_kda_in_packed = None
-        self.w_kda_o_packed = None
+        self.moe_packed: dict[str, torch.Tensor] = packed_artifacts.get(
+            "moe_packed",
+            {},
+        )
+        self.w_kda_in_packed = packed_artifacts.get("w_kda_in_packed")
+        self.w_kda_o_packed = packed_artifacts.get("w_kda_o_packed")
         if (
             reduce_backend == "symmetric"
             and single_launch_attention
@@ -243,6 +250,15 @@ class KimiK3KdaAttention:
             raise ValueError("Kimi-K3 MTP currently requires FP32 state")
         if reduce_group is None:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
+
+    def packed_artifacts(self) -> dict[str, torch.Tensor]:
+        artifacts = {"w_kda_in_padded": self.w_kda_in_padded}
+        if self.w_kda_in_packed is not None:
+            artifacts["w_kda_in_packed"] = self.w_kda_in_packed
+            artifacts["w_kda_o_packed"] = self.w_kda_o_packed
+        if self.moe_packed:
+            artifacts["moe_packed"] = self.moe_packed
+        return artifacts
 
     def initialize_symmetric_allreduce(
         self,
@@ -294,7 +310,7 @@ class KimiK3KdaAttention:
         self.fuse_moe = fuse_moe
         device = self.t["w_kda_in"].device
         self._pack_monokernel_projections()
-        if fuse_moe:
+        if fuse_moe and not self.moe_packed:
             latent_down, latent_down_scale = quantize_mxfp8(self.t["w_latent_down"])
             shared_up, shared_up_scale = quantize_mxfp8(self.t["w_shared_ug"])
             shared_down, shared_down_scale = quantize_mxfp8(self.t["w_shared_dn"])

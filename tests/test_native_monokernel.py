@@ -1005,7 +1005,18 @@ def test_kimi_memory_reserve_tracks_persistent_packed_artifacts():
     runner._enabled = True
     runner._layer_specs = lambda _samples: [object(), object(), object()]
 
-    assert runner.memory_reserve_bytes() == 3 * 2 * (192 << 20)
+    assert runner.memory_reserve_bytes() == 3 * (
+        (256 << 20) + 2 * (32 << 20)
+    )
+
+
+def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():
+    source = (
+        Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
+    ).read_text()
+
+    assert "self._packed_artifacts" in source
+    assert "packed_artifacts=packed_artifacts" in source
 
 
 def test_kimi_default_off_does_not_inspect_runtime_config():
