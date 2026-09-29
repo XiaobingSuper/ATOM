@@ -60,9 +60,20 @@ def _kda_state_pool_supported(cache) -> bool:
         and conv_state.dtype is torch.bfloat16
         and conv_state.is_contiguous()
         and recurrent_state.shape == (slots, cfg.local_heads, cfg.v_dim, cfg.v_dim)
-        and recurrent_state.dtype is torch.float32
+        and recurrent_state.dtype in (torch.float16, torch.float32)
         and recurrent_state.is_contiguous()
     )
+
+
+def _kda_state_dtype(model, fwd) -> torch.dtype | None:
+    for layer in model.layers[model.start_layer : model.end_layer]:
+        if not getattr(layer, "is_linear_attn", False):
+            continue
+        cache = fwd.kv_cache_data.get(f"layer_{layer.layer_idx}")
+        state = None if cache is None else getattr(cache, "v_cache", None)
+        if isinstance(state, torch.Tensor):
+            return state.dtype
+    return None
 
 
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
@@ -208,6 +219,7 @@ class _KimiLayerOp:
         *,
         attention_symmetric_allreduce=None,
         moe_symmetric_allreduce=None,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
         from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
         from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
@@ -228,6 +240,7 @@ class _KimiLayerOp:
             conv_state_layout=ConvStateLayout.TIME_MAJOR,
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             moe_symmetric_allreduce=moe_symmetric_allreduce,
+            state_dtype=state_dtype,
         )
 
     def close(self) -> None:
@@ -241,10 +254,10 @@ class KimiMonoDecode:
         self._lm = causal_lm
         self._atom_config = atom_config
         self._mode = mode
-        self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
+        self._ops: dict[tuple[int, int, str, torch.dtype], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
         self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
-        self._refused: set[tuple[int, int, str]] = set()
+        self._refused: set[tuple[int, int, str, torch.dtype]] = set()
         self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
         if not self._enabled:
@@ -343,6 +356,7 @@ class KimiMonoDecode:
         model = getattr(getattr(self, "_lm", None), "model", None)
         if model is None:
             return True
+        state_dtype = None
         for layer in model.layers[model.start_layer : model.end_layer]:
             if not layer.is_linear_attn or not hasattr(layer, "block_sparse_moe"):
                 continue
@@ -352,11 +366,19 @@ class KimiMonoDecode:
                 return self._fallback("state_cache", samples)
             if not _kda_state_pool_supported(cache):
                 return self._fallback("state_layout", samples)
-        if not self._prepare(samples):
+            if state_dtype is None:
+                state_dtype = cache.v_cache.dtype
+            elif cache.v_cache.dtype is not state_dtype:
+                return self._fallback("mixed_state_dtype", samples)
+        if state_dtype is None or not self._prepare(samples, state_dtype):
             return self._fallback("prepare", samples)
         return True
 
-    def _layer_specs(self, samples: int):
+    def _layer_specs(
+        self,
+        samples: int,
+        state_dtype: torch.dtype = torch.float32,
+    ):
         model = self._lm.model
         specs = []
         for layer in model.layers[model.start_layer : model.end_layer]:
@@ -370,11 +392,17 @@ class KimiMonoDecode:
                 has_moe=hasattr(layer, "block_sparse_moe"),
             )
             if backend is not None:
-                specs.append((layer, backend, (layer.layer_idx, samples, backend)))
+                specs.append(
+                    (
+                        layer,
+                        backend,
+                        (layer.layer_idx, samples, backend, state_dtype),
+                    )
+                )
         return specs
 
-    def _prepare(self, samples: int) -> bool:
-        specs = self._layer_specs(samples)
+    def _prepare(self, samples: int, state_dtype: torch.dtype) -> bool:
+        specs = self._layer_specs(samples, state_dtype)
         if not specs:
             return False
         if all(key in self._ops for _, _, key in specs):
@@ -427,6 +455,7 @@ class KimiMonoDecode:
                     backend,
                     attention_symmetric_allreduce=attention_reduce,
                     moe_symmetric_allreduce=moe_reduce,
+                    state_dtype=state_dtype,
                 )
                 if reduction_key not in self._reductions:
                     op = self._ops[key].op
@@ -451,7 +480,12 @@ class KimiMonoDecode:
         )
         return True
 
-    def _op(self, layer, samples: int) -> _KimiLayerOp:
+    def _op(
+        self,
+        layer,
+        samples: int,
+        state_dtype: torch.dtype,
+    ) -> _KimiLayerOp:
         backend = select_backend(
             "kimi_k3",
             self._mode,
@@ -463,7 +497,7 @@ class KimiMonoDecode:
         )
         if backend is None:
             raise MonoUnsupported("layer fallback")
-        key = (layer.layer_idx, samples, backend)
+        key = (layer.layer_idx, samples, backend, state_dtype)
         try:
             return self._ops[key]
         except KeyError as error:
@@ -481,6 +515,7 @@ class KimiMonoDecode:
         if md is None:
             md = fwd.attn_metadata.gdn_metadata
         samples = input_ids.numel()
+        state_dtype = _kda_state_dtype(model, fwd) or torch.float32
         backend = select_backend(
             "kimi_k3",
             self._mode,
@@ -494,7 +529,7 @@ class KimiMonoDecode:
         pending = pending2 = None
         for layer in model.layers[model.start_layer : model.end_layer]:
             try:
-                owned = self._op(layer, samples)
+                owned = self._op(layer, samples, state_dtype)
             except MonoUnsupported:
                 hidden, pending, pending2, blocks = layer(
                     positions,

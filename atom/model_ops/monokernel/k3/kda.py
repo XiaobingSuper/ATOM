@@ -92,6 +92,7 @@ class KimiK3KdaAttention:
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         symmetric_allreduce: SymmetricBf16Allreduce | None = None,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -108,6 +109,8 @@ class KimiK3KdaAttention:
             raise ValueError(f"unsupported reduce backend {reduce_backend!r}; expected 'symmetric' or 'nccl'")
         if not isinstance(conv_state_layout, ConvStateLayout):
             raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
+        if state_dtype not in (torch.float16, torch.float32):
+            raise ValueError(f"state_dtype must be float16 or float32, got {state_dtype}")
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
             raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], " f"got {launches_per_step}")
 
@@ -122,6 +125,7 @@ class KimiK3KdaAttention:
         self.launches_per_step = launches_per_step
         self.mtp = mtp
         self.conv_state_layout = conv_state_layout
+        self.state_dtype = state_dtype
         self.local_projection = config.local_heads * _HEAD_DIM
 
         expected = {
@@ -179,7 +183,7 @@ class KimiK3KdaAttention:
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
         self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
-        self.core = KimiK3KdaRecurrence(samples, conv_state_layout)
+        self.core = KimiK3KdaRecurrence(samples, conv_state_layout, state_dtype)
         if reduce_backend == "symmetric":
             self.symmetric_allreduce = (
                 symmetric_allreduce
@@ -205,7 +209,11 @@ class KimiK3KdaAttention:
         self.moe_packed: dict[str, torch.Tensor] = {}
         self.w_kda_in_packed = None
         self.w_kda_o_packed = None
-        if self.symmetric_allreduce is not None and single_launch_attention:
+        if (
+            self.symmetric_allreduce is not None
+            and single_launch_attention
+            and state_dtype is torch.float32
+        ):
             monokernel_input = torch.zeros(
                 _MONOKERNEL_INPUT_ROWS,
                 config.hidden,
@@ -229,7 +237,7 @@ class KimiK3KdaAttention:
                 conv_state_layout=conv_state_layout,
             )
         elif mtp:
-            raise ValueError("Kimi-K3 MTP requires the single-launch attention path")
+            raise ValueError("Kimi-K3 MTP currently requires FP32 state")
         if reduce_group is None:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
 
@@ -366,11 +374,11 @@ class KimiK3KdaAttention:
         )
         if (
             recurrent_state.shape != expected_recurrent_state
-            or recurrent_state.dtype != torch.float32
+            or recurrent_state.dtype != self.state_dtype
             or not recurrent_state.is_contiguous()
         ):
             raise ValueError(
-                "recurrent_state must be contiguous FP32 "
+                f"recurrent_state must be contiguous {self.state_dtype} "
                 f"{list(expected_recurrent_state)}"
             )
 

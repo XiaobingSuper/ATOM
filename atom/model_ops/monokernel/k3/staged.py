@@ -75,6 +75,7 @@ class _KimiK3MlaPath:
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         attention_symmetric_allreduce=None,
         moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -148,6 +149,7 @@ class _KimiK3MlaPath:
             mtp=mtp,
             conv_state_layout=conv_state_layout,
             attention_symmetric_allreduce=attention_symmetric_allreduce,
+            state_dtype=state_dtype,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -289,10 +291,11 @@ class _KimiK3MlaPath:
         mtp: bool,
         conv_state_layout: ConvStateLayout,
         attention_symmetric_allreduce,
+        state_dtype: torch.dtype,
     ):
         if attention_symmetric_allreduce is not None:
             raise ValueError("Kimi-K3 MLA does not accept a KDA all-reduce")
-        del reduce_group, reduce_backend, mtp, conv_state_layout
+        del reduce_group, reduce_backend, mtp, conv_state_layout, state_dtype
         return KimiK3MlaAttention(
             weights,
             samples,
@@ -736,6 +739,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         mtp: bool,
         conv_state_layout: ConvStateLayout,
         attention_symmetric_allreduce,
+        state_dtype: torch.dtype,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -752,6 +756,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             mtp=mtp,
             conv_state_layout=conv_state_layout,
             symmetric_allreduce=attention_symmetric_allreduce,
+            state_dtype=state_dtype,
         )
 
     def forward(

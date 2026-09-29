@@ -27,7 +27,10 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         reduce_group=None,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        state_dtype: torch.dtype = torch.float32,
     ) -> None:
+        if state_dtype is not torch.float32:
+            raise ValueError("Kimi-K3 single-launch MonoKernel requires FP32 state")
         super().__init__(
             weights,
             samples,
@@ -42,6 +45,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             reduce_backend="symmetric",
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            state_dtype=state_dtype,
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)
 

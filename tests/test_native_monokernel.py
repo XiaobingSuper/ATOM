@@ -875,7 +875,7 @@ def test_kimi_supports_rejects_multi_token_decode(monkeypatch):
     )
 
 
-def test_kimi_state_pool_contract_requires_bf16_conv_and_fp32_recurrence():
+def test_kimi_state_pool_contract_accepts_agentic_fp16_recurrence():
     import torch
 
     module = _kimi_mono_module()
@@ -897,6 +897,8 @@ def test_kimi_state_pool_contract_requires_bf16_conv_and_fp32_recurrence():
     )
 
     assert module._kda_state_pool_supported(cache)
+    cache.v_cache = cache.v_cache.to(torch.float16)
+    assert module._kda_state_pool_supported(cache)
     cache.v_cache = cache.v_cache.to(torch.bfloat16)
     assert not module._kda_state_pool_supported(cache)
     cache.v_cache = torch.zeros(
@@ -915,6 +917,27 @@ def test_kimi_state_pool_contract_requires_bf16_conv_and_fp32_recurrence():
     assert not module._kda_state_pool_supported(cache)
 
 
+def test_kimi_state_dtype_skips_mla_cache_without_v_tensor():
+    import torch
+
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=4, is_linear_attn=False),
+        SimpleNamespace(layer_idx=5, is_linear_attn=True),
+    ]
+    model = SimpleNamespace(layers=layers, start_layer=0, end_layer=2)
+    fwd = SimpleNamespace(
+        kv_cache_data={
+            "layer_4": SimpleNamespace(v_cache=None),
+            "layer_5": SimpleNamespace(
+                v_cache=torch.empty(1, dtype=torch.float16)
+            ),
+        }
+    )
+
+    assert module._kda_state_dtype(model, fwd) is torch.float16
+
+
 def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
     import torch
 
@@ -924,12 +947,22 @@ def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
     runner._enabled = True
     runner._mode = "auto"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
-    runner._lm = SimpleNamespace(
-        model=SimpleNamespace(layers=[], start_layer=0, end_layer=0)
+    layer = SimpleNamespace(
+        layer_idx=1,
+        is_linear_attn=True,
+        block_sparse_moe=object(),
     )
-    monkeypatch.setattr(module, "get_forward_context", lambda: _kimi_decode_context(samples))
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[layer], start_layer=0, end_layer=1)
+    )
+    context = _kimi_decode_context(samples)
+    context.kv_cache_data = {
+        "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float32))
+    }
+    monkeypatch.setattr(module, "_kda_state_pool_supported", lambda _cache: True)
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
     calls = []
-    runner._prepare = lambda value: calls.append(value) or False
+    runner._prepare = lambda rows, dtype: calls.append((rows, dtype)) or False
     args = (
         torch.arange(samples),
         torch.arange(samples, dtype=torch.int64),
@@ -938,10 +971,10 @@ def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
     )
 
     assert not runner.supports(*args)
-    assert calls == [samples]
-    runner._prepare = lambda value: calls.append(value) or True
+    assert calls == [(samples, torch.float32)]
+    runner._prepare = lambda rows, dtype: calls.append((rows, dtype)) or True
     assert runner.supports(*args)
-    assert calls == [samples, samples]
+    assert calls == [(samples, torch.float32), (samples, torch.float32)]
 
 
 @pytest.mark.parametrize(("samples", "actual_tokens"), ((4, 3), (8, 5)))
