@@ -220,7 +220,7 @@ class KimiMonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
-        self._prepared: dict[int, KimiK3PreparedWeights] = {}
+        self._prepared: dict[tuple[int, str], KimiK3PreparedWeights] = {}
         self._refused: set[tuple[int, int, str]] = set()
         self._announced: set[tuple[str, int]] = set()
         self._enabled = mode != "off"
@@ -312,11 +312,12 @@ class KimiMonoDecode:
                 )
                 assert weights is not None
                 self._weights[layer.layer_idx] = weights
-                prepared = self._prepared.get(layer.layer_idx)
+                prepared_key = (layer.layer_idx, backend)
+                prepared = self._prepared.get(prepared_key)
                 preparation_error = None
                 if prepared is None:
                     try:
-                        prepared = prepare_kimi_k3_weights(weights)
+                        prepared = prepare_kimi_k3_weights(weights, backend)
                     except (MonoUnsupported, ValueError) as error:
                         preparation_error = error
                     tp_uniform_local_validation(
@@ -326,9 +327,9 @@ class KimiMonoDecode:
                         context=f"layer {layer.layer_idx} weight preparation failed",
                     )
                     assert prepared is not None
-                    self._prepared[layer.layer_idx] = prepared
+                    self._prepared[prepared_key] = prepared
                 else:
-                    prepared.validate_source(weights)
+                    prepared.validate_source(weights, backend)
                 self._ops[key] = _KimiLayerOp(layer, weights, prepared, samples, backend)
                 announcement = (backend, samples)
                 if rank == 0 and announcement not in self._announced:

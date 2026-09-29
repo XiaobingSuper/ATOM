@@ -841,7 +841,7 @@ def test_kimi_runner_close_is_idempotent():
     owned = Owned()
     runner._ops = {(1, 4, "staged"): owned}
     runner._weights = {}
-    runner._prepared = {1: object()}
+    runner._prepared = {(1, "staged"): object()}
     runner._refused = set()
     runner._announced = {("staged", 4)}
     runner.close()
@@ -870,7 +870,7 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
         },
     )
     validations = []
-    prepared.validate_source = lambda weights: validations.append(weights)
+    prepared.validate_source = lambda weights, backend=None: validations.append((weights, backend))
     weights = module.LayerWeights(1, {"source": torch.zeros(1)})
     preparations = []
 
@@ -903,7 +903,11 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
     runner._announced = set()
     layer = SimpleNamespace(layer_idx=3, is_linear_attn=True, block_sparse_moe=object())
     monkeypatch.setattr(module, "_layer_weights", lambda *_args: weights)
-    monkeypatch.setattr(module, "prepare_kimi_k3_weights", lambda w: (preparations.append(w) or prepared))
+    monkeypatch.setattr(
+        module,
+        "prepare_kimi_k3_weights",
+        lambda weights, backend: (preparations.append((weights, backend)) or prepared),
+    )
     monkeypatch.setattr(module, "_KimiLayerOp", Owned)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
@@ -914,8 +918,8 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
     op4 = runner._op(layer, 4)
     op8 = runner._op(layer, 8)
 
-    assert preparations == [weights]
-    assert validations == [weights]
+    assert preparations == [(weights, "staged")]
+    assert validations == [(weights, "staged")]
     assert op4.weights is op8.weights is weights
     assert op4.prepared is op8.prepared is prepared
     assert [x.data_ptr() for x in op4.static] == [x.data_ptr() for x in op8.static]
@@ -1320,3 +1324,68 @@ def test_glm_fused_shared_expert_storage_is_zero_copy():
 
     for output, name in zip(prepared, ("w_ug", "s_ug", "w_dn", "s_dn")):
         assert output.data_ptr() == tensors[name].data_ptr()
+
+
+def test_kimi_preparation_is_backend_specific(monkeypatch):
+    import torch
+
+    from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
+    from atom.model_ops.monokernel.k3 import prepared as prepared_module
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    cfg = KIMI_K3_CONFIG
+    projection = cfg.local_heads * cfg.v_dim
+    fused_width = 4 * projection + cfg.local_heads + cfg.v_dim
+    tensors = {
+        "w_kda_in": torch.empty(fused_width, cfg.hidden, dtype=torch.bfloat16, device="meta"),
+        "w_kda_o": torch.empty(cfg.hidden, projection, dtype=torch.bfloat16, device="meta"),
+        "w_r": torch.empty(cfg.n_experts, cfg.hidden, dtype=torch.bfloat16, device="meta"),
+        "w_latent_down": torch.empty(cfg.routed_hidden, cfg.hidden, dtype=torch.bfloat16, device="meta"),
+        "w_shared_ug": torch.empty(2 * cfg.shared_inter, cfg.hidden, dtype=torch.bfloat16, device="meta"),
+        "w_shared_dn": torch.empty(cfg.hidden, cfg.shared_inter, dtype=torch.bfloat16, device="meta"),
+        "w_latent_up": torch.empty(cfg.hidden // 8, cfg.routed_hidden, dtype=torch.bfloat16, device="meta"),
+        "w_ug": torch.empty(1, device="meta"),
+        "s_ug": torch.empty(1, device="meta"),
+        "w_dn": torch.empty(1, device="meta"),
+        "s_dn": torch.empty(1, device="meta"),
+    }
+    weights = LayerWeights(cfg.local_heads, tensors, cfg, rank=0, npes=8)
+    packed_shapes = []
+
+    def pack_bf16(tensor):
+        packed_shapes.append(tuple(tensor.shape))
+        return torch.zeros(1, dtype=torch.uint8)
+
+    monkeypatch.setattr(prepared_module, "pack_bf16", pack_bf16)
+    monkeypatch.setattr(
+        prepared_module,
+        "quantize_mxfp8",
+        lambda tensor: (
+            torch.zeros(1, dtype=torch.uint8),
+            torch.zeros(1, dtype=torch.uint8),
+        ),
+    )
+    monkeypatch.setattr(prepared_module, "pack_mxfp8_weight", lambda _tensor: torch.zeros(1, dtype=torch.uint8))
+    monkeypatch.setattr(prepared_module, "pack_mxfp8_scale", lambda _tensor: torch.zeros(1, dtype=torch.uint8))
+    monkeypatch.setattr(
+        prepared_module,
+        "prepare_mxfp4_expert_storage",
+        lambda _weights: tuple(torch.zeros(1, dtype=torch.uint8) for _ in range(4)),
+    )
+
+    staged = prepared_module.prepare_kimi_k3_weights(weights, "staged")
+    assert packed_shapes == [(cfg.n_experts, cfg.hidden)]
+    assert staged.w_kda_in_packed is None
+    assert staged.w_kda_o_packed is None
+
+    packed_shapes.clear()
+    mono = prepared_module.prepare_kimi_k3_weights(weights, "mono")
+    assert packed_shapes == [
+        (prepared_module.MONOKERNEL_INPUT_ROWS, cfg.hidden),
+        (cfg.hidden, projection),
+        (cfg.n_experts, cfg.hidden),
+    ]
+    assert mono.w_kda_in_packed is not None
+    assert mono.w_kda_o_packed is not None
+    with pytest.raises(ValueError, match="backend"):
+        staged.validate_source(weights, "mono")

@@ -45,6 +45,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             mtp=mtp,
             conv_state_layout=conv_state_layout,
             prepared_weights=prepared_weights,
+            prepared_backend="mono",
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)
 

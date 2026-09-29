@@ -29,12 +29,13 @@ class PreparedMxfp8Weight:
 @dataclass(frozen=True)
 class KimiK3PreparedWeights:
     source: LayerWeights
+    backend: str
     rank: int
     npes: int
     source_ptrs: tuple[tuple[str, int], ...]
     w_kda_in_padded: torch.Tensor
-    w_kda_in_packed: torch.Tensor
-    w_kda_o_packed: torch.Tensor
+    w_kda_in_packed: torch.Tensor | None
+    w_kda_o_packed: torch.Tensor | None
     w_router: torch.Tensor
     w_ug: torch.Tensor
     s_ug: torch.Tensor
@@ -45,7 +46,9 @@ class KimiK3PreparedWeights:
     shared_down: PreparedMxfp8Weight
     latent_up: PreparedMxfp8Weight
 
-    def validate_source(self, weights: LayerWeights) -> None:
+    def validate_source(self, weights: LayerWeights, backend: str | None = None) -> None:
+        if backend is not None and backend != self.backend:
+            raise ValueError(f"prepared Kimi backend is {self.backend!r}, requested {backend!r}")
         if weights is not self.source:
             raise ValueError("prepared Kimi weights belong to a different LayerWeights")
         if weights.config != KIMI_K3_CONFIG or weights.rank != self.rank or weights.npes != self.npes:
@@ -65,9 +68,11 @@ def _prepare_mxfp8(weight: torch.Tensor) -> PreparedMxfp8Weight:
     )
 
 
-def prepare_kimi_k3_weights(weights: LayerWeights) -> KimiK3PreparedWeights:
+def prepare_kimi_k3_weights(weights: LayerWeights, backend: str) -> KimiK3PreparedWeights:
     if weights.config != KIMI_K3_CONFIG:
         raise ValueError(f"expected Kimi-K3 weights, got {weights.config.name!r}")
+    if backend not in {"staged", "mono"}:
+        raise ValueError(f"unsupported Kimi prepared backend {backend!r}")
     tensors = weights.t
     config = weights.config
     projection = config.local_heads * config.v_dim
@@ -85,23 +90,29 @@ def prepare_kimi_k3_weights(weights: LayerWeights) -> KimiK3PreparedWeights:
         device=tensors["w_kda_in"].device,
     )
     w_kda_in_padded[:fused_width].copy_(tensors["w_kda_in"])
-    monokernel_input = torch.zeros(
-        MONOKERNEL_INPUT_ROWS,
-        config.hidden,
-        dtype=torch.bfloat16,
-        device=tensors["w_kda_in"].device,
-    )
-    monokernel_input[:fused_width].copy_(tensors["w_kda_in"])
+    w_kda_in_packed = None
+    w_kda_o_packed = None
+    if backend == "mono":
+        monokernel_input = torch.zeros(
+            MONOKERNEL_INPUT_ROWS,
+            config.hidden,
+            dtype=torch.bfloat16,
+            device=tensors["w_kda_in"].device,
+        )
+        monokernel_input[:fused_width].copy_(tensors["w_kda_in"])
+        w_kda_in_packed = pack_bf16(monokernel_input)
+        w_kda_o_packed = pack_bf16(tensors["w_kda_o"])
     w_ug, s_ug, w_dn, s_dn = prepare_mxfp4_expert_storage(weights)
     source_ptrs = tuple((name, tensor.data_ptr()) for name, tensor in sorted(tensors.items()))
     return KimiK3PreparedWeights(
         source=weights,
+        backend=backend,
         rank=weights.rank,
         npes=weights.npes,
         source_ptrs=source_ptrs,
         w_kda_in_padded=w_kda_in_padded,
-        w_kda_in_packed=pack_bf16(monokernel_input),
-        w_kda_o_packed=pack_bf16(tensors["w_kda_o"]),
+        w_kda_in_packed=w_kda_in_packed,
+        w_kda_o_packed=w_kda_o_packed,
         w_router=pack_bf16(tensors["w_r"]),
         w_ug=w_ug,
         s_ug=s_ug,

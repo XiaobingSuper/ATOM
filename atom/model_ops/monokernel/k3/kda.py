@@ -93,6 +93,7 @@ class KimiK3KdaAttention:
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         prepared_weights: KimiK3PreparedWeights | None = None,
+        prepared_backend: str = "staged",
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -125,7 +126,7 @@ class KimiK3KdaAttention:
         self.conv_state_layout = conv_state_layout
         self.local_projection = config.local_heads * _HEAD_DIM
         if prepared_weights is not None:
-            prepared_weights.validate_source(weights)
+            prepared_weights.validate_source(weights, prepared_backend)
         self.prepared_weights = prepared_weights
 
         expected = {
@@ -209,6 +210,14 @@ class KimiK3KdaAttention:
         self.moe_packed: dict[str, torch.Tensor] = {}
         self.w_kda_in_packed = None if prepared_weights is None else prepared_weights.w_kda_in_packed
         self.w_kda_o_packed = None if prepared_weights is None else prepared_weights.w_kda_o_packed
+        if prepared_backend == "mono" and (
+            self.w_kda_in_packed is None or self.w_kda_o_packed is None
+        ):
+            raise ValueError("mono prepared weights require packed KDA input/output")
+        if single_launch_attention and prepared_weights is not None and (
+            self.w_kda_in_packed is None or self.w_kda_o_packed is None
+        ):
+            raise ValueError("single-launch KDA attention requires packed input/output weights")
         if self.symmetric_allreduce is not None and single_launch_attention:
             monokernel_input = torch.zeros(
                 MONOKERNEL_INPUT_ROWS,

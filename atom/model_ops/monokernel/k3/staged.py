@@ -69,6 +69,7 @@ class _KimiK3MlaPath:
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         prepared_weights: KimiK3PreparedWeights | None = None,
+        prepared_backend: str = "staged",
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -104,7 +105,7 @@ class _KimiK3MlaPath:
         self.shared_inter = config.shared_inter
         self.hidden_shard = config.hidden // npes
         if prepared_weights is not None:
-            prepared_weights.validate_source(weights)
+            prepared_weights.validate_source(weights, prepared_backend)
         self.prepared_weights = prepared_weights
 
         expected = {
@@ -145,6 +146,7 @@ class _KimiK3MlaPath:
             mtp=mtp,
             conv_state_layout=conv_state_layout,
             prepared_weights=prepared_weights,
+            prepared_backend=prepared_backend,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -297,8 +299,9 @@ class _KimiK3MlaPath:
         mtp: bool,
         conv_state_layout: ConvStateLayout,
         prepared_weights: KimiK3PreparedWeights | None,
+        prepared_backend: str,
     ):
-        del reduce_group, reduce_backend, mtp, conv_state_layout, prepared_weights
+        del reduce_group, reduce_backend, mtp, conv_state_layout, prepared_weights, prepared_backend
         return KimiK3MlaAttention(
             weights,
             samples,
@@ -742,6 +745,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         mtp: bool,
         conv_state_layout: ConvStateLayout,
         prepared_weights: KimiK3PreparedWeights | None,
+        prepared_backend: str,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -754,10 +758,11 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             reduce_backend=reduce_backend,
             # The persistent attention kernel wins at S<=4.  At S=8 the
             # staged GEMMs retain better occupancy and remain the faster path.
-            single_launch_attention=samples <= 4 or mtp,
+            single_launch_attention=(prepared_weights is None and samples <= 4) or mtp,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
             prepared_weights=prepared_weights,
+            prepared_backend=prepared_backend,
         )
 
     def forward(
