@@ -700,8 +700,9 @@ def test_glm_chunk12_covers_routing_expert_tiles_and_down_lds():
     assert routed == list(range(12))
     assert expert_tiles == list(range(512))
     assert [
-        glm_layout.split_acc_head(lane_group, element)
-        for lane_group in range(4)
+        glm_layout.split_acc_head(group, lane_group, element)
+        for group in range(2)
+        for lane_group in range(2)
         for element in range(4)
     ] == list(range(16))
     assert [glm_layout.split_score_column(wave, 0) for wave in range(8)] == list(range(8))
@@ -1723,7 +1724,7 @@ def test_shared_bf16_linear_is_unchanged():
     assert torch.equal(shard, weight[16:])
 
 
-def test_atom_expert_storage_is_zero_copy(monkeypatch):
+def test_atom_expert_storage_is_canonicalized():
     import torch
 
     from atom.model_ops.monokernel.config import Mxfp4ScaleLayout, Mxfp4WeightLayout
@@ -1747,21 +1748,20 @@ def test_atom_expert_storage_is_zero_copy(monkeypatch):
         mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
     )
 
-    def unexpected_pack(_tensor):
-        raise AssertionError("ATOM storage must bypass packing")
-
-    monkeypatch.setattr(packing, "pack_a16w4_weight", unexpected_pack)
-    monkeypatch.setattr(packing, "pack_a16w4_scale", unexpected_pack)
     prepared = prepare_mxfp4_expert_storage(weights)
 
     for output, name in zip(prepared, ("w_ug", "s_ug", "w_dn", "s_dn")):
-        assert output.data_ptr() == tensors[name].data_ptr()
+        assert output.data_ptr() != tensors[name].data_ptr()
+        if name.startswith("w_"):
+            assert output.numel() == tensors[name].numel()
+        else:
+            assert output.numel() <= tensors[name].numel()
     defaults = LayerWeights(heads=1, t={}, config=config)
     assert defaults.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE
     assert defaults.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE
 
 
-def test_glm_fused_shared_expert_storage_is_zero_copy():
+def test_glm_fused_shared_expert_storage_is_canonicalized():
     import torch
 
     from atom.model_ops.monokernel.config import Mxfp4ScaleLayout, Mxfp4WeightLayout
@@ -1796,7 +1796,11 @@ def test_glm_fused_shared_expert_storage_is_zero_copy():
     prepared = prepare_mxfp4_expert_storage(weights)
 
     for output, name in zip(prepared, ("w_ug", "s_ug", "w_dn", "s_dn")):
-        assert output.data_ptr() == tensors[name].data_ptr()
+        assert output.data_ptr() != tensors[name].data_ptr()
+        if name.startswith("w_"):
+            assert output.numel() == tensors[name].numel()
+        else:
+            assert output.numel() <= tensors[name].numel()
 
 
 def test_kimi_preparation_is_backend_specific(monkeypatch):

@@ -38,10 +38,10 @@ INDEX_KEYS_PER_TASK = 64
 DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
 
 
-def split_acc_head(lane_group: int, element: int):
+def split_acc_head(head_group, lane_group: int, element: int):
     """Map one split-PV MFMA row to its local attention head."""
 
-    return lane_group * 4 + element
+    return head_group * WAVES + lane_group * 4 + element
 
 
 def split_score_column(wave: int, lane: int):

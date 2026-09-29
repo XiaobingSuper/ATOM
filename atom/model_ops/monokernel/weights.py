@@ -237,54 +237,44 @@ def prepare_mxfp4_expert_storage(weights: LayerWeights) -> tuple[torch.Tensor, .
     tensors = weights.t
     experts = config.n_experts if weights.physical_experts is None else weights.physical_experts
     expert_hidden = config.hidden if config.routed_hidden is None else config.routed_hidden
-    ug_rows = experts * 2 * config.inter
-    dn_rows = experts * expert_hidden
-    if weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM:
-        w_ug = atom_mxfp4_storage_view(
-            tensors["w_ug"],
-            name="w_ug",
-            logical_rows=ug_rows,
-            logical_k=expert_hidden,
-            scale=False,
-        )
-        w_dn = atom_mxfp4_storage_view(
-            tensors["w_dn"],
-            name="w_dn",
-            logical_rows=dn_rows,
-            logical_k=config.inter,
-            scale=False,
-        )
-    elif weights.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE:
-        from atom.model_ops.monokernel.packing import pack_a16w4_weight
+    ug_rows = 2 * config.inter
+    dn_rows = expert_hidden
 
-        w_ug = pack_a16w4_weight(tensors["w_ug"])
-        w_dn = pack_a16w4_weight(tensors["w_dn"])
-    else:
-        raise ValueError(f"unsupported MXFP4 weight layout {weights.mxfp4_weight_layout!r}")
+    from atom.model_ops.monokernel.packing import pack_mxfp4
 
-    if weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM:
-        s_ug = atom_mxfp4_storage_view(
-            tensors["s_ug"],
-            name="s_ug",
-            logical_rows=ug_rows,
-            logical_k=expert_hidden,
-            scale=True,
-        )
-        s_dn = atom_mxfp4_storage_view(
-            tensors["s_dn"],
-            name="s_dn",
-            logical_rows=dn_rows,
-            logical_k=config.inter,
-            scale=True,
-        )
-    elif weights.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE:
-        from atom.model_ops.monokernel.packing import pack_a16w4_scale
+    def values(name: str, rows: int, k: int) -> torch.Tensor:
+        tensor = tensors[name]
+        if weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM:
+            packed = atom_mxfp4_storage_view(
+                tensor, name=name, logical_rows=experts * rows, logical_k=k, scale=False
+            )
+            shuffled = packed.view(experts, rows, k // 2)
+            shuffled.is_shuffled = True
+            tensor = _unshuffle_linear_weight(shuffled)
+        elif weights.mxfp4_weight_layout is not Mxfp4WeightLayout.NATIVE:
+            raise ValueError(f"unsupported MXFP4 weight layout {weights.mxfp4_weight_layout!r}")
+        return pack_mxfp4(tensor)
 
-        s_ug = pack_a16w4_scale(tensors["s_ug"])
-        s_dn = pack_a16w4_scale(tensors["s_dn"])
-    else:
-        raise ValueError(f"unsupported MXFP4 scale layout {weights.mxfp4_scale_layout!r}")
-    return w_ug, s_ug, w_dn, s_dn
+    def scales(name: str, rows: int, k: int) -> torch.Tensor:
+        tensor = tensors[name]
+        groups = k // 32
+        if weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM:
+            packed = atom_mxfp4_storage_view(
+                tensor, name=name, logical_rows=experts * rows, logical_k=k, scale=True
+            )
+            tensor = _unshuffle_linear_scale(
+                packed, experts=experts, rows=rows, groups=groups
+            )
+        elif weights.mxfp4_scale_layout is not Mxfp4ScaleLayout.NATIVE:
+            raise ValueError(f"unsupported MXFP4 scale layout {weights.mxfp4_scale_layout!r}")
+        return tensor.view(torch.uint8).contiguous().view(-1)
+
+    return (
+        values("w_ug", ug_rows, expert_hidden),
+        scales("s_ug", ug_rows, expert_hidden),
+        values("w_dn", dn_rows, config.inter),
+        scales("s_dn", dn_rows, config.inter),
+    )
 
 
 __all__ = [
