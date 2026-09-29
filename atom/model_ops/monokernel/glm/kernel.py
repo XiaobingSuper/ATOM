@@ -1977,14 +1977,15 @@ def build_glm5_monokernel(
             stamp("router", tt, 4)
 
         def dn_route(bs):
-            """Expert-down routing (wave s -> sample s): expert ids -> keys[s * 9 + slot],
-            route weights -> dnw[]; the scores must have landed."""
-            if wave < S:
-                e, w = route_top8(wave, bs=bs)
-                if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane (slot lane + 1)
-                    q = wave * MOE_SLOTS + (lane + 1) % MOE_SLOTS
-                    lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
-                    lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
+            """Expert-down routing: one whole wave per sample, in wave-sized batches."""
+            for sample_batch in range_constexpr((S + WAVES - 1) // WAVES):
+                route_sample = wave + sample_batch * WAVES
+                if route_sample < S:
+                    e, w = route_top8(route_sample, bs=bs)
+                    if lane < MOE_SLOTS:  # slot 0: the shared expert, then pick lane (slot lane + 1)
+                        q = route_sample * MOE_SLOTS + (lane + 1) % MOE_SLOTS
+                        lds_st(keys, q, (lane == TOP_K).select(fx.Int32(SHARED_EXPERT), e))
+                        lds_st(dnw, q, (lane == TOP_K).select(fx.Float32(1.0), w))
 
         # ================================ 9. expert up/gate + SiLU
         # 2 row groups (16 gate + 16 up rows) x 96 chunks: 4 waves per group, 24 chunks each
@@ -2169,110 +2170,112 @@ def build_glm5_monokernel(
                         put(mb("prob"), 0, fx.Float32(1.0))
                 stamp("ug", u, 4)
         elif const_expr(S > 1):
-            # One eight-intermediate tile per CTA.  Shared-expert weights feed
-            # all sample columns of one MFMA, while routed-expert weights are
+            # One eight-intermediate tile per CTA and task round. Shared-expert weights
+            # feed all sample columns of one MFMA, while routed-expert weights are
             # prefetched one sample ahead.  This avoids the segmented partial
             # tiles and mailbox reduction used by the older S=2/4 schedule.
             UG8 = 8
             UG8_UNITS = (HIDDEN // 128) // WAVES
             XW = HIDDEN // 4
-            u = fx.Int32(start("ug"))
-            c = u % (I // UG8)
-            has_sh = u < I // UG8
-            slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), u // (I // UG8))
-            w_rg = ((lane % 16) // 8) * (I // 16) + c // 2
-            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
-            s_rg = (lane // 32) * (I // 16) + c // 2
-
-            def ug8_units(e, sample, live=None):
-                if const_expr(live is None):
-                    rw = _rsrc(w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES))
-                    rs = _rsrc(s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES))
-                else:
-                    rw = bo.create_buffer_resource_from_addr(
-                        w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
-                        num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
-                    )
-                    rs = bo.create_buffer_resource_from_addr(
-                        s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
-                        num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
-                    )
-                sn = n_sel() if sample is None else fx.Int32(sample)
-                units = []
-                for cc in range_constexpr(UG8_UNITS):
-                    unit = wave * UG8_UNITS + cc
-                    kc = unit * 2
-                    if const_expr(expert_mxfp4):
-                        units.append(
-                            unit_mxfp4(
-                                rw,
-                                rs,
-                                w_rg,
-                                unit,
-                                HIDDEN,
-                                sn * XW + unit * 32,
-                                lambda unit=unit, sn=sn: lds_ld(misc, 8 + sn * XQ_BLOCKS + unit),
-                                w_ln,
-                            )
-                        )
-                        continue
-                    wv = [
-                        fx.Vector(
-                            bo.buffer_load(rw, ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4, vec_width=4, dtype=T.i32)
-                        )
-                        for j in range(2)
-                    ]
-                    sc = ld_f32(rs, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2)
-                    units.append(
-                        (
-                            "f8f8",
-                            wv,
-                            lambda sc=sc, kc=kc, sn=sn: sc * lds_ld(misc, 8 + sn * XQ_BLOCKS + kc // 2),
-                            sn * XW + kc * 16 + (lane // 16) * 4,
-                        )
-                    )
-                return units
-
-            def ug8_emit(sample, shared):
-                if tid < (S if shared else 1) * UG8 // 2:
-                    n = tid // (UG8 // 2)
-                    r = (tid % (UG8 // 2)) * 2
-                    g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
-                    v0 = lds_ld(outs, n * 16 + UG8 + r)
-                    v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
-                    sn = n if shared else fx.Int32(sample)
-                    sl = fx.Int32(0) if shared else slot
-                    put2(
-                        mb("mid"),
-                        (sn * MOE_SLOTS + sl) * I + c * UG8 + r,
-                        g0 * _rcp(1.0 + _exp(-g0)) * v0,
-                        g1 * _rcp(1.0 + _exp(-g1)) * v1,
-                    )
-                if (c == 0) & (tid < S if shared else tid == 0):
-                    sn = tid if shared else fx.Int32(sample)
-                    sl = fx.Int32(0) if shared else slot
-                    put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
-                    put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
-
             dn_route(load_bias())
             gpu.barrier()
-            shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
-            cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
             stage_xq(list(range(S)))
             gpu.barrier()
-            if has_sh:
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
-                gpu.barrier()
-                ug8_emit(0, True)
-            for sample in range_constexpr(S):
-                stamp("ug", sample * G + u, 0)
-                pre = cur
-                if const_expr(sample + 1 < S):
-                    cur = ug8_units(_uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)), sample + 1)
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
-                gpu.barrier()
-                ug8_emit(sample, False)
-                stamp("ug", sample * G + u, 4)
+            u0 = start("ug")
+            for task_round in range_constexpr((I + G - 1) // G):
+                u = fx.Int32(u0 + task_round * G)
+                c = u % (I // UG8)
+                has_sh = u < I // UG8
+                slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), u // (I // UG8))
+                w_rg = ((lane % 16) // 8) * (I // 16) + c // 2
+                w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+                s_rg = (lane // 32) * (I // 16) + c // 2
+
+                def ug8_units(e, sample, live=None):
+                    if const_expr(live is None):
+                        rw = _rsrc(w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES))
+                        rs = _rsrc(s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES))
+                    else:
+                        rw = bo.create_buffer_resource_from_addr(
+                            w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
+                            num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
+                        )
+                        rs = bo.create_buffer_resource_from_addr(
+                            s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
+                            num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
+                        )
+                    sn = n_sel() if sample is None else fx.Int32(sample)
+                    units = []
+                    for cc in range_constexpr(UG8_UNITS):
+                        unit = wave * UG8_UNITS + cc
+                        kc = unit * 2
+                        if const_expr(expert_mxfp4):
+                            units.append(
+                                unit_mxfp4(
+                                    rw,
+                                    rs,
+                                    w_rg,
+                                    unit,
+                                    HIDDEN,
+                                    sn * XW + unit * 32,
+                                    lambda unit=unit, sn=sn: lds_ld(misc, 8 + sn * XQ_BLOCKS + unit),
+                                    w_ln,
+                                )
+                            )
+                            continue
+                        wv = [
+                            fx.Vector(
+                                bo.buffer_load(rw, ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4, vec_width=4, dtype=T.i32)
+                            )
+                            for j in range(2)
+                        ]
+                        sc = ld_f32(rs, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2)
+                        units.append(
+                            (
+                                "f8f8",
+                                wv,
+                                lambda sc=sc, kc=kc, sn=sn: sc * lds_ld(misc, 8 + sn * XQ_BLOCKS + kc // 2),
+                                sn * XW + kc * 16 + (lane // 16) * 4,
+                            )
+                        )
+                    return units
+
+                def ug8_emit(sample, shared):
+                    if tid < (S if shared else 1) * UG8 // 2:
+                        n = tid // (UG8 // 2)
+                        r = (tid % (UG8 // 2)) * 2
+                        g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
+                        v0 = lds_ld(outs, n * 16 + UG8 + r)
+                        v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
+                        sn = n if shared else fx.Int32(sample)
+                        sl = fx.Int32(0) if shared else slot
+                        put2(
+                            mb("mid"),
+                            (sn * MOE_SLOTS + sl) * I + c * UG8 + r,
+                            g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                            g1 * _rcp(1.0 + _exp(-g1)) * v1,
+                        )
+                    if (c == 0) & (tid < S if shared else tid == 0):
+                        sn = tid if shared else fx.Int32(sample)
+                        sl = fx.Int32(0) if shared else slot
+                        put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
+                        put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
+
+                shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
+                cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
+                if has_sh:
+                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
+                    gpu.barrier()
+                    ug8_emit(0, True)
+                for sample in range_constexpr(S):
+                    stamp("ug", sample * G + u, 0)
+                    pre = cur
+                    if const_expr(sample + 1 < S):
+                        cur = ug8_units(_uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)), sample + 1)
+                    reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                    gpu.barrier()
+                    ug8_emit(sample, False)
+                    stamp("ug", sample * G + u, 4)
 
         elif const_expr(ug_split(S, I) is not None):
             # S = 2, 4 (the router already quantized every sample's activation): job 0 is
@@ -2346,7 +2349,7 @@ def build_glm5_monokernel(
                         put(mb("prob"), shared.select(tid, s_u) * MOE_SLOTS + slot, prob)
 
             stamp("ug", bid, 5)
-            dn_route(load_bias())  # every sample's top-8 (waves < S in parallel), for up/gate and down
+            dn_route(load_bias())  # every sample's top-8, in wave-sized batches
             gpu.barrier()
             stamp("ug", bid, 6)
             cur = ug_job(0)
