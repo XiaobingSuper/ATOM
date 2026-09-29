@@ -270,7 +270,7 @@ class Glm52MonoDecode:
             (atom_config.kv_cache_dtype == "bf16", "KV dtype"),
             (not is_plugin_mode(), "plugin mode"),
             (not envs.ATOM_USE_TRITON_MLA_SHUFFLE_KV, "shuffled MLA cache"),
-            (envs.ATOM_MLA_PAGE_SIZE is None, "segmented MLA cache"),
+            (envs.ATOM_MLA_PAGE_SIZE == 1, "segmented MLA cache"),
         )
         for ok, why in checks:
             if not ok:

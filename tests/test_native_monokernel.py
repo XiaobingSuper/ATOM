@@ -740,6 +740,65 @@ def test_glm_default_off_does_not_inspect_runtime_config():
     assert runner._ops == {}
 
 
+def test_glm_default_page_size_accepted_and_segmented_refused(monkeypatch):
+    module = _glm_mono_module()
+    cfg = module.GLM5_CONFIG
+    hf_config = SimpleNamespace(
+        model_type="glm_moe_dsa",
+        hidden_size=cfg.hidden,
+        q_lora_rank=cfg.q_lora,
+        kv_lora_rank=cfg.kv_lora,
+        qk_rope_head_dim=cfg.pe_dim,
+        qk_nope_head_dim=cfg.nope_dim,
+        v_head_dim=cfg.v_dim,
+        n_routed_experts=cfg.n_experts,
+        num_experts_per_tok=cfg.top_k,
+        n_shared_experts=cfg.num_shared_experts,
+        index_topk=2048,
+        routed_scaling_factor=cfg.route_scale,
+        scoring_func="sigmoid",
+        topk_method="noaux_tc",
+        norm_topk_prob=True,
+        rms_norm_eps=module.EPS,
+        moe_intermediate_size=cfg.inter * 8,
+    )
+    atom_config = SimpleNamespace(
+        hf_config=hf_config,
+        tensor_parallel_size=8,
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        enable_dp_attention=False,
+        decode_context_parallel_size=1,
+        prefill_context_parallel_size=1,
+        pipeline_parallel_size=1,
+        enable_expert_parallel=False,
+        enable_tbo=False,
+        enable_tbo_decode=False,
+        speculative_config=None,
+        kv_cache_dtype="bf16",
+    )
+    layer = SimpleNamespace(
+        mlp=SimpleNamespace(experts=object()),
+        self_attn=SimpleNamespace(indexer=object(), skip_topk=False),
+    )
+    causal_lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[layer], start_layer=0, end_layer=1)
+    )
+    monkeypatch.setattr(module, "is_plugin_mode", lambda: False)
+
+    monkeypatch.setattr(
+        module,
+        "envs",
+        SimpleNamespace(
+            ATOM_USE_TRITON_MLA_SHUFFLE_KV=False,
+            ATOM_MLA_PAGE_SIZE=1,
+        ),
+    )
+    assert module.Glm52MonoDecode(causal_lm, atom_config, "auto")._enabled
+
+    module.envs.ATOM_MLA_PAGE_SIZE = 2
+    assert not module.Glm52MonoDecode(causal_lm, atom_config, "auto")._enabled
+
+
 def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     import torch
 
