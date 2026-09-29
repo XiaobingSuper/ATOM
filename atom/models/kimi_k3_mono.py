@@ -256,6 +256,7 @@ class _KimiLayerOp:
         prepared_weights: KimiK3PreparedWeights | None,
         geometry: KimiDecodeGeometry,
         backend: str,
+        kind: str,
     ) -> None:
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
@@ -271,15 +272,21 @@ class _KimiLayerOp:
             "conv_state_rows": geometry.conv_state_rows,
             "state_dtype": torch.float16,
         }
-        from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
+        if kind == "kda":
+            from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
 
-        self.op = _KimiK3KdaStagedPath(
-            weights,
-            geometry.q,
-            prepared_weights=prepared_weights,
-            **common,
-        )
+            self.op = _KimiK3KdaStagedPath(
+                weights,
+                geometry.q,
+                prepared_weights=prepared_weights,
+                **common,
+            )
+        else:
+            from atom.model_ops.monokernel.k3.staged import _KimiK3FusedTail
+
+            self.op = _KimiK3FusedTail(weights, geometry.q, **common)
         self.q = geometry.q
+        self.kind = kind
         self._outputs: dict[int, torch.Tensor] = {}
 
     def output(self, geometry: KimiDecodeGeometry, hidden: torch.Tensor) -> torch.Tensor:
@@ -297,18 +304,19 @@ class _KimiLayerOp:
 
 
 class KimiMonoDecode:
-    """Exact AgentX C1 decode with staged KDA and explicit baseline layers."""
+    """Exact AgentX C1 decode with staged KDA and a baseline-MLA fused tail."""
 
     def __init__(self, causal_lm, atom_config, mode: str) -> None:
         self._lm = causal_lm
         self._atom_config = atom_config
         self._mode = mode
-        self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
-        self._weights: dict[int, LayerWeights] = {}
-        self._prepared: dict[tuple[int, str], KimiK3PreparedWeights] = {}
+        self._ops: dict[tuple[int, int, str, str], _KimiLayerOp] = {}
+        self._weights: dict[tuple[int, str], LayerWeights] = {}
+        self._prepared: dict[tuple[int, str, bool], KimiK3PreparedWeights] = {}
         self._chains: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        self._refused: set[tuple[int, int, str]] = set()
-        self._announced: set[tuple[str, int]] = set()
+        self._refused: set[tuple[int, int, str, str]] = set()
+        self._announced: set[tuple[str, str, int]] = set()
+        self._prebuilt = False
         self._enabled = mode != "off"
         if not self._enabled:
             return
@@ -442,21 +450,25 @@ class KimiMonoDecode:
         self,
         layer,
         geometry: KimiDecodeGeometry,
+        kind: str,
     ) -> _KimiLayerOp:
-        backend = select_backend(
-            "kimi_k3",
-            self._mode,
-            samples=geometry.tokens,
-            tp_size=8,
-            kv_cache_dtype=self._atom_config.kv_cache_dtype,
-            mtp=geometry.q > 1,
-            q=geometry.q,
-            is_kda=True,
-            has_moe=True,
-        )
-        if backend is None:
-            raise RuntimeError("expected Kimi C1 KDA backend is unavailable")
-        key = (layer.layer_idx, geometry.q, backend)
+        backend = "tail"
+        if kind == "kda":
+            selected = select_backend(
+                "kimi_k3",
+                self._mode,
+                samples=geometry.tokens,
+                tp_size=8,
+                kv_cache_dtype=self._atom_config.kv_cache_dtype,
+                mtp=geometry.q > 1,
+                q=geometry.q,
+                is_kda=True,
+                has_moe=True,
+            )
+            if selected is None:
+                raise RuntimeError("expected Kimi C1 KDA backend is unavailable")
+            backend = selected
+        key = (layer.layer_idx, geometry.q, backend, kind)
         if key in self._refused:
             raise RuntimeError(f"layer {layer.layer_idx} native construction was refused")
         if key in self._ops:
@@ -467,11 +479,13 @@ class KimiMonoDecode:
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
-        weights = self._weights.get(layer.layer_idx)
+        weight_key = (layer.layer_idx, kind)
+        weights = self._weights.get(weight_key)
         validation_error = None
         if weights is None:
             try:
-                weights = _layer_weights(layer, rank, npes)
+                mapper = _layer_weights if kind == "kda" else _tail_weights
+                weights = mapper(layer, rank, npes)
             except (MonoUnsupported, ValueError) as error:
                 validation_error = error
         try:
@@ -482,41 +496,45 @@ class KimiMonoDecode:
                 context=f"layer {layer.layer_idx} weight mapping failed",
             )
             assert weights is not None
-            self._weights[layer.layer_idx] = weights
-            prepared_key = (layer.layer_idx, backend)
-            prepared = self._prepared.get(prepared_key)
-            preparation_error = None
-            if prepared is None:
-                try:
-                    prepared = prepare_kimi_k3_weights(
-                        weights,
-                        backend,
-                        mtp=geometry.q > 1,
+            self._weights[weight_key] = weights
+            prepared = None
+            if kind == "kda":
+                prepared_key = (layer.layer_idx, backend, geometry.q > 1)
+                prepared = self._prepared.get(prepared_key)
+                preparation_error = None
+                if prepared is None:
+                    try:
+                        prepared = prepare_kimi_k3_weights(
+                            weights,
+                            backend,
+                            mtp=geometry.q > 1,
+                        )
+                    except (MonoUnsupported, ValueError) as error:
+                        preparation_error = error
+                    tp_uniform_local_validation(
+                        preparation_error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=f"layer {layer.layer_idx} weight preparation failed",
                     )
-                except (MonoUnsupported, ValueError) as error:
-                    preparation_error = error
-                tp_uniform_local_validation(
-                    preparation_error,
-                    group=tp.cpu_group,
-                    world_size=npes,
-                    context=f"layer {layer.layer_idx} weight preparation failed",
-                )
-                assert prepared is not None
-                self._prepared[prepared_key] = prepared
-            else:
-                prepared.validate_source(weights, backend)
+                    assert prepared is not None
+                    self._prepared[prepared_key] = prepared
+                else:
+                    prepared.validate_source(weights, backend)
             owned = _KimiLayerOp(
                 layer,
                 weights,
                 prepared,
                 geometry,
                 backend,
+                kind,
             )
             self._ops[key] = owned
-            announcement = (backend, geometry.q)
+            announcement = (kind, backend, geometry.q)
             if rank == 0 and announcement not in self._announced:
                 logger.info(
-                    "Kimi-K3 MonoKernel on: path=kda backend=%s q=%d",
+                    "Kimi-K3 MonoKernel on: path=%s backend=%s q=%d",
+                    kind,
                     backend,
                     geometry.q,
                 )
@@ -525,8 +543,27 @@ class KimiMonoDecode:
         except (MonoUnsupported, ValueError) as error:
             self._refused.add(key)
             raise RuntimeError(
-                f"Kimi C1 layer {layer.layer_idx} cannot use staged KDA: {error}"
+                f"Kimi C1 layer {layer.layer_idx} cannot use {kind}: {error}"
             ) from error
+
+    def prepare(self) -> None:
+        """Construct exact-C1 weights before KV memory is budgeted."""
+
+        if not self._enabled or self._prebuilt:
+            return
+        geometry = KimiDecodeGeometry(
+            groups=1,
+            q=_C1_Q,
+            conv_state_rows=_C1_CONV_ROWS,
+            state_dtype="fp16",
+            replay_mode=False,
+        )
+        model = self._lm.model
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            if not hasattr(layer, "block_sparse_moe"):
+                continue
+            self._op(layer, geometry, "kda" if layer.is_linear_attn else "tail")
+        self._prebuilt = True
 
     @staticmethod
     def _require_blocks(blocks: torch.Tensor | None) -> torch.Tensor:
@@ -578,6 +615,29 @@ class KimiMonoDecode:
             )
         return output
 
+    def _run_tail(
+        self,
+        owned: _KimiLayerOp,
+        geometry: KimiDecodeGeometry,
+        prefix_sum: torch.Tensor | None,
+        blocks: torch.Tensor,
+        attention_delta: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        output = owned.output(geometry, attention_delta)
+        for group in range(geometry.groups):
+            start = group * geometry.q
+            end = start + geometry.q
+            prefix = None if prefix_sum is None else prefix_sum[start:end]
+            owned.op.forward_from_attention(
+                prefix,
+                blocks[start:end],
+                attention_delta[start:end],
+                x_out=output[start:end],
+                epoch_layer=layer_idx,
+            )
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -611,7 +671,7 @@ class KimiMonoDecode:
 
         for layer in model.layers[model.start_layer : model.end_layer]:
             has_moe = hasattr(layer, "block_sparse_moe")
-            if not has_moe or not layer.is_linear_attn:
+            if not has_moe:
                 hidden, pending, pending2, blocks = layer(
                     positions,
                     hidden,
@@ -623,25 +683,49 @@ class KimiMonoDecode:
 
             hook_input = hidden
             hook_kwargs = {"pending_add": pending, "pending_add2": pending2}
-            hidden, pending, pending2 = resolve_attn_res_prefix(
-                hidden, pending, pending2
-            )
-            blocks = self._require_blocks(blocks)
-            owned = self._op(layer, geometry)
-            blocks = self._ensure_block_capacity(
-                hidden, blocks, owned.op.block_write_idx
-            )
-            cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
-            hidden = self._run_kda(
-                owned,
-                geometry,
-                hidden,
-                blocks,
-                cache,
-                state_indices,
-                accepted,
-                layer.layer_idx,
-            )
+            if layer.is_linear_attn:
+                hidden, pending, pending2 = resolve_attn_res_prefix(
+                    hidden, pending, pending2
+                )
+                blocks = self._require_blocks(blocks)
+                owned = self._op(layer, geometry, "kda")
+                blocks = self._ensure_block_capacity(
+                    hidden, blocks, owned.op.block_write_idx
+                )
+                cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
+                hidden = self._run_kda(
+                    owned,
+                    geometry,
+                    hidden,
+                    blocks,
+                    cache,
+                    state_indices,
+                    accepted,
+                    layer.layer_idx,
+                )
+            else:
+                attention_input, prefix_sum = layer.self_attention_attn_res(
+                    hidden, blocks, pending, pending2
+                )
+                blocks, prefix_sum = layer.self_attention_attn_res.maybe_close_block(
+                    prefix_sum, blocks
+                )
+                blocks = self._require_blocks(blocks)
+                attention_delta = layer.self_attn(positions, attention_input)
+                if attention_delta.shape != hidden.shape:
+                    raise RuntimeError(
+                        f"MLA layer {layer.layer_idx} changed graph rows from "
+                        f"{hidden.shape[0]} to {attention_delta.shape[0]}"
+                    )
+                owned = self._op(layer, geometry, "tail")
+                hidden = self._run_tail(
+                    owned,
+                    geometry,
+                    prefix_sum,
+                    blocks,
+                    attention_delta,
+                    layer.layer_idx,
+                )
             pending = pending2 = None
             hidden, pending, pending2, blocks = _run_layer_hooks(
                 layer,
@@ -662,3 +746,4 @@ class KimiMonoDecode:
         self._chains.clear()
         self._refused.clear()
         self._announced.clear()
+        self._prebuilt = False

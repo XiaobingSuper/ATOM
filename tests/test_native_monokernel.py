@@ -445,6 +445,7 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch):
         prepared_weights=object(),
         geometry=geometry,
         backend="staged",
+        kind="kda",
     )
 
     assert captured[0]["conv_state_layout"] is ConvStateLayout.TIME_MAJOR
@@ -496,14 +497,14 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
     ]
     rank_zero = runner()
     geometry = KimiDecodeGeometry(4, 1, 10, "fp16", False)
-    rank_zero._op(layers[0], geometry)
-    rank_zero._op(layers[0], geometry)
-    rank_zero._op(layers[1], geometry)
+    rank_zero._op(layers[0], geometry, "kda")
+    rank_zero._op(layers[0], geometry, "kda")
+    rank_zero._op(layers[1], geometry, "kda")
     rank[0] = 1
-    runner()._op(layers[0], geometry)
+    runner()._op(layers[0], geometry, "kda")
 
     assert messages == [
-        ("Kimi-K3 MonoKernel on: path=kda backend=%s q=%d", "staged", 1)
+        ("Kimi-K3 MonoKernel on: path=%s backend=%s q=%d", "kda", "staged", 1)
     ]
 
 
@@ -1050,12 +1051,13 @@ def test_kimi_runner_close_is_idempotent():
 
     runner = object.__new__(KimiMonoDecode)
     owned = Owned()
-    runner._ops = {(1, 1, "staged"): owned}
+    runner._ops = {(1, 1, "staged", "kda"): owned}
     runner._weights = {}
-    runner._prepared = {(1, "staged"): object()}
+    runner._prepared = {(1, "staged", False): object()}
     runner._chains = {(1, 1): (object(), object())}
     runner._refused = set()
-    runner._announced = {("staged", 4)}
+    runner._announced = {("kda", "staged", 4)}
+    runner._prebuilt = True
     runner.close()
     runner.close()
     assert owned.calls == 1
@@ -1089,7 +1091,7 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
 
     class Owned:
         def __init__(
-            self, _layer, layer_weights, prepared_weights, geometry, _backend
+            self, _layer, layer_weights, prepared_weights, geometry, _backend, _kind
         ):
             self.weights = layer_weights
             self.prepared = prepared_weights
@@ -1133,10 +1135,10 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
     monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: False)
 
     op4 = runner._op(
-        layer, KimiDecodeGeometry(4, 1, 10, "fp16", False)
+        layer, KimiDecodeGeometry(4, 1, 10, "fp16", False), "kda"
     )
     op8 = runner._op(
-        layer, KimiDecodeGeometry(8, 1, 10, "fp16", False)
+        layer, KimiDecodeGeometry(8, 1, 10, "fp16", False), "kda"
     )
 
     assert preparations == [(weights, "staged", False)]
@@ -1149,12 +1151,46 @@ def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
     assert runner._prepared == {}
 
 
+def test_kimi_prebuilds_kda_and_mla_tail_once():
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=0, is_linear_attn=True),
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=2,
+            is_linear_attn=False,
+            block_sparse_moe=object(),
+        ),
+    ]
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._prebuilt = False
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, start_layer=0, end_layer=3)
+    )
+    seen = []
+    runner._op = lambda layer, geometry, kind: seen.append(
+        (layer.layer_idx, geometry.groups, geometry.q, kind)
+    )
+
+    runner.prepare()
+    runner.prepare()
+
+    assert seen == [(1, 1, 8, "kda"), (2, 1, 8, "tail")]
+    assert runner._prebuilt
+
+
 def test_kimi_default_off_does_not_inspect_runtime_config():
     KimiMonoDecode = _kimi_mono_module().KimiMonoDecode
     runner = KimiMonoDecode(None, object(), "off")
     assert runner._enabled is False
     assert runner._ops == {}
     assert runner._prepared == {}
+    assert runner._prebuilt is False
 
 
 @pytest.mark.parametrize("samples", (4, 8))
@@ -1800,7 +1836,7 @@ def test_kimi_c1_runs_one_q8_chain_per_request_and_publishes_aux(monkeypatch):
     assert torch.equal(aux[0], hidden)
 
 
-def test_kimi_mla_and_dense_layers_stay_on_baseline(monkeypatch):
+def test_kimi_mla_uses_baseline_attention_and_fused_tail(monkeypatch):
     import torch
 
     module = _kimi_mono_module()
@@ -1815,13 +1851,30 @@ def test_kimi_mla_and_dense_layers_stay_on_baseline(monkeypatch):
     )
     events = []
 
-    class Layer(torch.nn.Module):
-        def __init__(self, *, linear, moe):
+    class PreAttn:
+        def __call__(self, hidden, blocks, pending, pending2):
+            events.append(("pre", pending, pending2))
+            return hidden + 1, hidden
+
+        @staticmethod
+        def maybe_close_block(prefix, blocks):
+            return torch.cat((blocks, prefix[:, None]), dim=1), None
+
+    class MlaLayer(torch.nn.Module):
+        def __init__(self):
             super().__init__()
-            self.layer_idx = len(events)
-            self.is_linear_attn = linear
-            if moe:
-                self.block_sparse_moe = object()
+            self.layer_idx = 12
+            self.is_linear_attn = False
+            self.block_sparse_moe = object()
+            self.self_attention_attn_res = PreAttn()
+            self.self_attn = lambda _positions, hidden: hidden + 2
+
+        def forward(self, *_args, **_kwargs):
+            raise AssertionError("MLA+MoE must use the hybrid tail")
+
+    class DenseLayer(torch.nn.Module):
+        layer_idx = 13
+        is_linear_attn = True
 
         def forward(
             self,
@@ -1832,15 +1885,33 @@ def test_kimi_mla_and_dense_layers_stay_on_baseline(monkeypatch):
             pending_add,
             pending_add2,
         ):
-            events.append((self.is_linear_attn, hasattr(self, "block_sparse_moe")))
-            assert pending_add is None and pending_add2 is None
+            events.append(("dense", pending_add, pending_add2))
             return hidden + 1, None, None, blocks
 
-    mla = Layer(linear=False, moe=True)
-    dense = Layer(linear=True, moe=False)
+    mla = MlaLayer()
+    dense = DenseLayer()
     captures = []
     mla.register_forward_hook(
         lambda _module, _args, output: captures.append(output[0].clone())
+    )
+
+    class Tail:
+        @staticmethod
+        def forward_from_attention(
+            prefix,
+            blocks,
+            attention_delta,
+            *,
+            x_out,
+            **_kwargs,
+        ):
+            events.append(("tail", prefix, blocks.shape[1]))
+            x_out.copy_(attention_delta + 3)
+            return x_out
+
+    owned = SimpleNamespace(
+        op=Tail(),
+        output=lambda _geometry, hidden: torch.empty_like(hidden),
     )
     model = SimpleNamespace(
         get_input_embeddings=lambda _ids: pytest.fail("inputs_embeds must be used"),
@@ -1852,7 +1923,12 @@ def test_kimi_mla_and_dense_layers_stay_on_baseline(monkeypatch):
     runner = object.__new__(module.KimiMonoDecode)
     runner._lm = SimpleNamespace(model=model)
     runner._chains = {}
-    runner._op = lambda *_args: pytest.fail("baseline layers must not build native ops")
+
+    def get_op(_layer, _geometry, kind):
+        assert kind == "tail"
+        return owned
+
+    runner._op = get_op
     context = SimpleNamespace(
         context=SimpleNamespace(is_prefill=False),
         ubatch_slices=None,
@@ -1864,10 +1940,10 @@ def test_kimi_mla_and_dense_layers_stay_on_baseline(monkeypatch):
 
     output = runner.forward(torch.arange(samples), torch.arange(samples), inputs)
 
-    assert events == [(False, True), (True, False)]
-    assert torch.equal(output, torch.full_like(output, 2))
+    assert torch.equal(output, torch.full_like(output, 7))
+    assert events[-2:] == [("tail", None, 1), ("dense", None, None)]
     assert len(captures) == 1
-    assert torch.equal(captures[0], torch.full_like(output, 1))
+    assert torch.equal(captures[0], torch.full_like(output, 6))
 
 
 def test_kimi_block_close_prefix_handoff():

@@ -1836,6 +1836,7 @@ class KimiLinearForCausalLM(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        self._mono.prepare()
         if self._mono.supports(
             input_ids,
             positions,

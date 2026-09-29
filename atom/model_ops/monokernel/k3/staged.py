@@ -742,6 +742,81 @@ class _KimiK3MlaPath:
         self.close()
 
 
+class _TailClock:
+    def __init__(self, device: torch.device) -> None:
+        self.step = torch.zeros(1, dtype=torch.int32, device=device)
+
+    def advance_step(self) -> None:
+        self.step.add_(1)
+
+    def close(self) -> None:
+        pass
+
+
+class _KimiK3FusedTail(_KimiK3MlaPath):
+    """AttnRes/router/latent-MoE tail fed by baseline MLA attention."""
+
+    def _build_attention(
+        self,
+        weights: LayerWeights,
+        samples: int,
+        **_kwargs,
+    ) -> _TailClock:
+        del samples
+        return _TailClock(weights.t["w_r"].device)
+
+    def forward_from_attention(
+        self,
+        prefix_sum: torch.Tensor | None,
+        block_residual: torch.Tensor,
+        attention_delta: torch.Tensor,
+        *,
+        x_out: torch.Tensor | None = None,
+        epoch_layer: int = 0,
+        advance: bool = True,
+    ) -> torch.Tensor:
+        if (
+            block_residual.ndim != 3
+            or block_residual.shape[0] != self.S
+            or block_residual.shape[2] != self.config.hidden
+        ):
+            raise ValueError(
+                "block_residual must have shape "
+                f"[{self.S}, blocks, {self.config.hidden}], got {tuple(block_residual.shape)}"
+            )
+        if block_residual.shape[1] <= self.block_write_idx:
+            raise ValueError(
+                f"block_residual needs index {self.block_write_idx}, "
+                f"got {block_residual.shape[1]} blocks"
+            )
+        if attention_delta.shape != (self.S, self.config.hidden):
+            raise ValueError(
+                f"attention_delta must have shape [{self.S}, {self.config.hidden}]"
+            )
+
+        post_prefix = attention_delta if self.is_block_write_layer else prefix_sum
+        if post_prefix is None:
+            raise ValueError("an open AttnRes block needs a running prefix")
+        post_delta = None if self.is_block_write_layer else attention_delta
+        self.post_attn_res(
+            post_prefix,
+            post_prefix if post_delta is None else post_delta,
+            block_residual,
+            self.t["g_mlp_res"],
+            self.t["w_mlp_res"],
+            self.t["g_post"],
+            self.updated_prefix,
+            self.moe_input,
+            self.latent_projection.activation,
+            self.latent_projection.activation_scale,
+        )
+        target = self.output if x_out is None else x_out
+        self._moe(self.moe_input, epoch_layer, self.updated_prefix, target)
+        if advance:
+            self.advance_step()
+        return target
+
+
 class _KimiK3KdaStagedPath(_KimiK3MlaPath):
     """Internal staged Kimi-K3 KDA + latent-MoE reference path."""
 
