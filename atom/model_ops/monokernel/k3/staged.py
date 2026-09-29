@@ -38,7 +38,10 @@ from atom.model_ops.monokernel.k3.torch_fusions import (
 )
 from atom.model_ops.monokernel.mxfp8_linear import Mxfp8Linear
 from atom.model_ops.monokernel.symmetric_allreduce import SymmetricBf16Allreduce
-from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
+from atom.model_ops.monokernel.weights import (
+    LayerWeights,
+    prepare_aiter_mxfp4_expert_storage,
+)
 
 _TP_SIZE = 8
 _ROUTING_TILE_M = 16
@@ -181,7 +184,7 @@ class _KimiK3MlaPath:
             from atom.model_ops.monokernel.formats import quantize_mxfp8
             from atom.model_ops.monokernel.packing import pack_bf16, pack_mxfp8_scale, pack_mxfp8_weight
 
-            self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
+            self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_aiter_mxfp4_expert_storage(weights)
             self.w_router = pack_bf16(self.t["w_r"])
             latent_weight, self.s_latent_down = quantize_mxfp8(self.t["w_latent_down"])
             shared_weight, self.s_shared_ug = quantize_mxfp8(self.t["w_shared_ug"])

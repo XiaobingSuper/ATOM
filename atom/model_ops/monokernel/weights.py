@@ -304,9 +304,35 @@ def prepare_mxfp4_expert_storage(
     )
 
 
+def prepare_aiter_mxfp4_expert_storage(weights: LayerWeights) -> tuple[torch.Tensor, ...]:
+    if (
+        weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+        and weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+    ):
+        return prepare_mxfp4_expert_storage(weights, canonical=False)
+    if (
+        weights.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE
+        and weights.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE
+    ):
+        from atom.model_ops.monokernel.packing import (
+            pack_a16w4_scale,
+            pack_a16w4_weight,
+        )
+
+        tensors = weights.t
+        return (
+            pack_a16w4_weight(tensors["w_ug"]),
+            pack_a16w4_scale(tensors["s_ug"]),
+            pack_a16w4_weight(tensors["w_dn"]),
+            pack_a16w4_scale(tensors["s_dn"]),
+        )
+    raise ValueError("AITER MXFP4 storage requires matching value/scale layouts")
+
+
 __all__ = [
     "LayerWeights",
     "atom_mxfp4_storage_view",
     "linear_bf16",
+    "prepare_aiter_mxfp4_expert_storage",
     "prepare_mxfp4_expert_storage",
 ]

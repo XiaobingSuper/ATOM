@@ -1724,11 +1724,15 @@ def test_shared_bf16_linear_is_unchanged():
     assert torch.equal(shard, weight[16:])
 
 
-def test_atom_expert_storage_is_canonicalized():
+def test_atom_expert_storage_matches_consumer_abi():
     import torch
 
     from atom.model_ops.monokernel.config import Mxfp4ScaleLayout, Mxfp4WeightLayout
-    from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
+    from atom.model_ops.monokernel.weights import (
+        LayerWeights,
+        prepare_aiter_mxfp4_expert_storage,
+        prepare_mxfp4_expert_storage,
+    )
     from atom.model_ops.monokernel import packing
 
     config = SimpleNamespace(name="test", n_experts=2, inter=128, routed_hidden=128)
@@ -1756,6 +1760,9 @@ def test_atom_expert_storage_is_canonicalized():
             assert output.numel() == tensors[name].numel()
         else:
             assert output.numel() <= tensors[name].numel()
+    aiter_prepared = prepare_aiter_mxfp4_expert_storage(weights)
+    for output, name in zip(aiter_prepared, ("w_ug", "s_ug", "w_dn", "s_dn")):
+        assert output.data_ptr() == tensors[name].data_ptr()
     defaults = LayerWeights(heads=1, t={}, config=config)
     assert defaults.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE
     assert defaults.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE
@@ -1846,7 +1853,7 @@ def test_kimi_preparation_is_backend_specific(monkeypatch):
     monkeypatch.setattr(prepared_module, "pack_mxfp8_scale", lambda _tensor: torch.zeros(1, dtype=torch.uint8))
     monkeypatch.setattr(
         prepared_module,
-        "prepare_mxfp4_expert_storage",
+        "prepare_aiter_mxfp4_expert_storage",
         lambda _weights: tuple(torch.zeros(1, dtype=torch.uint8) for _ in range(4)),
     )
 
@@ -2443,3 +2450,39 @@ def test_kimi_fold_pending_values():
     third = torch.full((2, 3), 3.0)
     assert torch.equal(module.fold_kimi_pending(first, second, third), first + second + third)
     assert torch.equal(module.fold_kimi_pending(None, first, second), first + second)
+
+
+def test_kimi_attn_res_adds_delta_on_gfx950():
+    import torch
+
+    if not torch.cuda.is_available() or "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
+        pytest.skip("requires gfx950")
+
+    from atom.model_ops.monokernel.k3.attn_res import KimiK3AttnRes
+
+    samples, hidden = 1, 7168
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    make = lambda *shape: torch.randn(
+        *shape,
+        generator=generator,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    prefix = make(samples, hidden)
+    delta = make(samples, hidden)
+    blocks = make(samples, 1, hidden)
+    weights = tuple(make(hidden) for _ in range(3))
+    updated = torch.empty_like(prefix)
+    output = torch.empty_like(prefix)
+
+    KimiK3AttnRes(samples, hidden, 1, True, -1)(
+        prefix,
+        delta,
+        blocks,
+        *weights,
+        updated,
+        output,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(updated, (prefix.float() + delta.float()).to(torch.bfloat16))

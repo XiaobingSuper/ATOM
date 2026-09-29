@@ -18,7 +18,7 @@ from atom.model_ops.monokernel.packing import (
 )
 from atom.model_ops.monokernel.weights import (
     LayerWeights,
-    prepare_mxfp4_expert_storage,
+    prepare_aiter_mxfp4_expert_storage,
 )
 
 MONOKERNEL_INPUT_ROWS = 6400
@@ -103,7 +103,7 @@ def _prepare_tail_kwargs(weights: LayerWeights, backend: str) -> dict:
     missing = sorted(required.difference(tensors))
     if missing:
         raise ValueError(f"missing Kimi tail weights: {', '.join(missing)}")
-    w_ug, s_ug, w_dn, s_dn = prepare_mxfp4_expert_storage(weights)
+    w_ug, s_ug, w_dn, s_dn = prepare_aiter_mxfp4_expert_storage(weights)
     source_ptrs = tuple(
         (name, tensor.data_ptr()) for name, tensor in sorted(tensors.items())
     )
