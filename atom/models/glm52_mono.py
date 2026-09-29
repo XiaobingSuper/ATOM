@@ -475,6 +475,7 @@ class Glm52MonoDecode:
                     binding.layer.mlp.gate,
                     binding.layer.mlp.gate.e_score_correction_bias,
                     workspace,
+                    binding.layer.mlp.experts,
                     reduce_results=binding.layer.mlp.reduce_results,
                 )
                 for binding, weights in mapped

@@ -1,5 +1,30 @@
 # Native Decode MonoKernel Handoff
 
+> Current status (2026-09-29): implementation and the focused/device gates in
+> this document are complete on `feat/monokernel-integration`. The old cluster
+> blocker and continuation checklist later in this file are retained as
+> historical context and are superseded by this status block.
+>
+> - Kimi-K3 real weights: staged DCP1/FP32 and Agentic DCP8/FP16 graph decode,
+>   plus explicit mono S4 graph/S8 eager, all returned the expected `333`.
+> - GLM-5.2 real weights: TP4 FP8-KV staged MoE passed no-MTP, MTP5, and
+>   DCP4+MTP4; graph supersets cover every C2–C48 recipe bucket and returned
+>   `333` without forced acceptance.
+> - Focused suite: `79 passed`; compileall, `git diff --check`, and IDE lints
+>   are clean. The untracked `diff.diff` remains untouched.
+> - Performance: Kimi candidate reduced GPU work/launch count in the recorded
+>   C32 trace. GLM's first A16W4 stage regressed S8 TPOT by ~49%; profile showed
+>   slower expert GEMM plus generic top-k launches. The retained stage uses the
+>   production A4W4 expert pipeline and fused FP32 biased top-k instead:
+>   dummy S8 is 9.2–9.4 ms vs 9.3 ms baseline, and real Agentic C2 median TPOT
+>   is 4.20 ms vs 4.05 ms baseline (within the non-regression gate, not a
+>   speedup claim).
+> - Remaining performance boundary: the large 2× layer gains from FlyDSL #1204
+>   are whole-layer TP8/contiguous-cache results. Agentic GLM keeps FP8 paged
+>   attention/IndexShare/MTP/DCP outside the staged MoE segment, so this branch
+>   must not claim those whole-layer gains. Kimi MLA layers likewise retain
+>   ATOM's paged attention path; KDA layers are the native accelerated segment.
+
 ## Goal and ownership decision
 
 Continue the MI355 integration of the fused decode-layer kernels from
@@ -30,9 +55,10 @@ not rebase, open a PR, or claim validation until the GPU gates below pass.
 is stable, defaults to `off`, and accepts only:
 
 - `off`: byte-for-byte existing ATOM path.
-- `auto`: Kimi selects `staged`; GLM selects `mono` when all gates pass.
+- `auto`: Kimi selects `staged`; GLM selects TP4 `staged_moe` for Agentic
+  deployments and the legacy TP8 `mono` where its stricter gates pass.
 - `mono`: request the single-launch backend where supported.
-- `staged`: request the Kimi staged backend; GLM refuses it and falls back.
+- `staged`: request Kimi staged KDA or GLM TP4 staged MoE.
 
 Unsupported models, layers, forwards, layouts, or deployment modes use the
 baseline path. Do not infer enablement from tensor dtype or shape and do not
@@ -61,10 +87,11 @@ Relevant dispatch and wiring:
 - Native TP8 decode for exactly S=4 or S=8 KDA+MoE layers.
 - Both `staged` and `mono` KDA backends are present; `auto` selects `staged`.
 - Deployment construction accepts BF16 or FP8 KV cache. The native path handles
-  KDA state; full-attention MLA layers and every unsupported layer/forward stay
-  on the baseline ATOM MLA/model path.
-- Prefill, speculative decode, non-S4/S8 batches, non-TP8, DP/DPA, PP, plugins,
-  graph-time construction, and failed rank-local weight mappings fall back.
+  FP16 or FP32 KDA state and TP8+DCP8; full-attention MLA layers stay on the
+  baseline ATOM paged-attention path.
+- Prefill, ReplaySSM/speculative decode, non-S4/S8 batches, non-TP8, DP/DPA,
+  PP, plugins, graph-time construction, and failed rank-local mappings fall
+  back.
 
 Primary files are `atom/model_ops/monokernel/k3/` and
 `atom/models/kimi_k3_mono.py`. The unchanged production launch authority is
@@ -72,24 +99,26 @@ Primary files are `atom/model_ops/monokernel/k3/` and
 
 ### GLM-5.2
 
-- Native TP8 decode for exactly S=4 or S=8 MoE layers.
-- BF16 fused paged MLA cache only, using ATOM physical cache rows,
-  `slot_mapping`, and `sparse_kv_indptr`.
-- ATOM remains the external indexer owner. Full IndexShare layers refresh the
-  indexer; following shared layers reuse the same physical sparse-index buffer.
-- Graph padding is designed to be safe: inactive padded rows use a safe row,
-  contribute no sparse context, and do not write the cache.
-- GLM FP8 KV cache, MTP/speculative decode, DPA, DCP, plugins, staged mode,
-  shuffled/segmented MLA cache, and unsupported parallel/layout modes are
-  explicitly refused and use baseline ATOM.
+- Agentic TP4 `staged_moe` wraps the existing 75 `DeepseekV2MoE` modules
+  without changing parameter names. It uses FP32 biased routing, 256 routed
+  MXFP4 experts plus the physically fused shared expert, and the production
+  A4W4 expert pipeline.
+- Existing FP8 KV, full/shared IndexShare, MTP acceptance, DCP/QREP/LSE merge,
+  residual, and fused next-layer TP-reduce/RMSNorm contracts remain baseline
+  owned. Flattened MoE rows are prepared before graph capture.
+- The exact C2–C48 Agentic graph matrix is supported. Plugins, prefill, TP/EP
+  layouts outside the declared stage contract, and failed all-rank mappings
+  retain the original MoE forward.
+- The legacy TP8/BF16 whole-layer S4/S8 path remains available for functional
+  comparison. Its external-indexer, padded-row, and physical-cache safeguards
+  are unchanged.
 
 Primary files are `atom/model_ops/monokernel/glm/` and
 `atom/models/glm52_mono.py`. Recipe context is in `recipes/GLM-5.md` and
-`recipes/Agentic-GLM-5.2.md`; the currently published GLM recipes use
-FP8 KV, MTP/DPA/DCP, or unsupported TP constraints and therefore do not route
-through this first-stage path.
+`recipes/Agentic-GLM-5.2.md`; the published TP4 FP8-KV/MTP/DCP recipe now
+routes its MoE segment through `staged_moe`.
 
-## Evidence already measured
+## Historical baseline evidence
 
 These are dummy/single-layer gates, not end-to-end performance claims:
 
@@ -123,7 +152,7 @@ That pytest result was before later model-adapter and paged-cache additions. The
 current focused tests, full suite, and final GPU tests have not run and remain
 required.
 
-## Current blocker
+## Historical blocker (resolved)
 
 After the SPUR controller restart, scheduler authentication is invalid for both
 `gyu` and `xiaobizh` on the login nodes. The exact administrator-facing error is:
@@ -138,7 +167,7 @@ health still reachable, so the allocation may survive, but this is not shell
 access. It was created as a plain `sleep` allocation and no user `sshd` was
 started on port 22200; system port 22 does not admit these users.
 
-## Exact continuation order
+## Historical continuation order (superseded)
 
 1. Ask the cluster administrator to restore `spurauthd` or reissue SPUR
    credentials for both users. Verify `squeue`, `srun`, and `sbatch`, not only
@@ -192,7 +221,7 @@ started on port 22200; system port 22 does not admit these users.
     run that published launch and workload unchanged for the same-node,
     real-weight, graph-mode flag-only `off`/`auto` A/B.
 
-## Unverified gates and claim boundary
+## Historical claim boundary (superseded)
 
 - Latest adapter code has not completed focused pytest or GPU compilation.
 - Kimi BF16/FP8 deployment routing, actual checkpoint weight mapping, mixed

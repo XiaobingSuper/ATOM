@@ -525,8 +525,6 @@ def test_glm_tp4_staged_moe_workspace_tracks_flattened_rows():
     shapes = workspace_shapes(48)
 
     assert shapes["routes"] == (48, 9)
-    assert shapes["sorted"] == (48 * 9 * 16,)
-    assert shapes["intermediate"] == (48 * 9 * 16, 512)
     assert shapes["output"] == (48, 6144)
 
 
@@ -553,6 +551,20 @@ def test_glm_staged_moe_wrapper_preserves_parameter_names():
     assert tuple(name for name, _ in moe.named_parameters()) == names_before
     assert original.__self__ is moe
     assert moe._glm52_staged_key == "glm52.stage.3"
+
+
+def test_glm_staged_moe_uses_fused_fp32_router():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "staged_moe.py"
+    ).read_text()
+
+    assert "biased_grouped_topk_hip(" in source
+    assert "torch.topk(" not in source
 
 
 def test_glm_shard_geometry_derives_from_tensor_parallel_size():

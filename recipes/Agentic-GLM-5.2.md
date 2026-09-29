@@ -27,6 +27,12 @@ For a MonoKernel A/B, export
 candidate. Cold-start each arm and keep every other environment variable,
 server argument, workload input, and random seed identical.
 
+On the TP4 Agentic launches below, `auto` keeps FP8 MLA, IndexShare, MTP, and
+DCP on their existing ATOM path and replaces only the MoE segment. A healthy
+startup logs `backend=staged_moe` for every captured flattened-row bucket and
+`layers=75`. This is not the legacy TP8 whole-layer MonoKernel, so do not apply
+the upstream whole-layer latency numbers to these runs.
+
 ## 1. Start the ATOM Server
 
 ### PD Disaggregated Deployment (1P1D)
