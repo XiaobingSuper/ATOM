@@ -788,6 +788,15 @@ def test_kimi_runner_close_is_idempotent():
     assert owned.calls == 1
 
 
+def test_kimi_memory_reserve_tracks_persistent_packed_artifacts():
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._layer_specs = lambda _samples: [object(), object(), object()]
+
+    assert runner.memory_reserve_bytes() == 3 * 2 * (192 << 20)
+
+
 def test_kimi_default_off_does_not_inspect_runtime_config():
     KimiMonoDecode = _kimi_mono_module().KimiMonoDecode
     runner = KimiMonoDecode(None, object(), "off")

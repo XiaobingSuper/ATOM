@@ -37,7 +37,9 @@ from atom.utils.forward_context import get_forward_context
 logger = logging.getLogger("atom")
 
 _NATIVE_BUCKETS = 2  # S4 and S8
-_PACKED_RESERVE_PER_LAYER = 320 << 20
+# Persistent padded KDA projections plus packed staged-MoE artifacts. Dense
+# source snapshots are released immediately after packing.
+_PACKED_RESERVE_PER_LAYER = 192 << 20
 
 
 def _need(ok: bool, what: str) -> None:
