@@ -344,13 +344,17 @@ def build_glm5_monokernel(
 
         def row_position(s):
             if const_expr(use_atom_kv_cache):
-                position = _uniform(fx.Int32(bo.buffer_load(_rsrc(positions), s, vec_width=1, dtype=T.i64)))
+                position = _uniform(
+                    fx.Int32(bo.buffer_load(_rsrc(positions), s * 2, vec_width=1, dtype=T.i32))
+                )
                 return row_active(s).select(position, fx.Int32(0))
             return pos0 + s
 
         def row_slot(s):
             if const_expr(use_atom_kv_cache):
-                return _uniform(fx.Int32(bo.buffer_load(_rsrc(slot_mapping), s, vec_width=1, dtype=T.i64)))
+                return _uniform(
+                    fx.Int32(bo.buffer_load(_rsrc(slot_mapping), s * 2, vec_width=1, dtype=T.i32))
+                )
             return pos0 + s
 
         def lds_ld(ptr, i):

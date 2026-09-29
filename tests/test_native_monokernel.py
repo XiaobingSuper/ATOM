@@ -284,6 +284,58 @@ def test_scaled_mfma_uses_flydsl_v0341_operand_abi():
     assert scaled_calls
 
 
+def test_glm_int64_metadata_uses_low_int32_words_for_all_rows():
+    import torch
+
+    values = torch.tensor([7, 129, -1, 2**31 - 1], dtype=torch.int64)
+    words = values.view(torch.int32)
+
+    assert values.dtype is torch.int64
+    assert torch.equal(words[::2], values.to(torch.int32))
+    assert words[1].item() == 0
+    assert words[2].item() == 129
+
+
+def test_glm_kernel_indexes_int64_metadata_as_word_offsets():
+    kernel = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    )
+    tree = ast.parse(kernel.read_text())
+    for helper_name, pointer_name in (
+        ("row_position", "positions"),
+        ("row_slot", "slot_mapping"),
+    ):
+        helper = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name
+        )
+        load = next(
+            node
+            for node in ast.walk(helper)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "buffer_load"
+        )
+        resource = load.args[0]
+        assert isinstance(resource, ast.Call)
+        assert isinstance(resource.args[0], ast.Name)
+        assert resource.args[0].id == pointer_name
+        offset = load.args[1]
+        assert isinstance(offset, ast.BinOp) and isinstance(offset.op, ast.Mult)
+        assert isinstance(offset.left, ast.Name) and offset.left.id == "s"
+        assert isinstance(offset.right, ast.Constant) and offset.right.value == 2
+        dtype = next(keyword.value for keyword in load.keywords if keyword.arg == "dtype")
+        assert isinstance(dtype, ast.Attribute)
+        assert isinstance(dtype.value, ast.Name) and dtype.value.id == "T"
+        assert dtype.attr == "i32"
+
+
 def test_native_decode_flag(monkeypatch):
     from atom.utils import envs
 
