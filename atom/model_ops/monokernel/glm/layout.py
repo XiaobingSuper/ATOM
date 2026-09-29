@@ -35,6 +35,12 @@ INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
 
 
+def split_acc_head(head_group, lane_group: int, element: int):
+    """Map one split-PV accumulator row to its local attention head."""
+
+    return head_group * WAVES + lane_group * 4 + element
+
+
 def sparse_cache_rows(
     sparse_kv_indices,
     *,

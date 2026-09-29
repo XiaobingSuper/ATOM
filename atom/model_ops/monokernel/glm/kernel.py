@@ -96,6 +96,7 @@ from atom.model_ops.monokernel.glm.layout import (
     dn_tile,
     layout,
     sparse_keys_per_task,
+    split_acc_head,
     stage_tasks,
     ug_split,
 )
@@ -1745,9 +1746,9 @@ def build_glm5_monokernel(
                     b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
                     c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
                     c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                if lane < 32:  # rows (heads) 4 * (lane // 16) + e < 8
+                if lane < 32:
                     for e in range_constexpr(4):
-                        hh = (lane // 16) * 4 + e
+                        hh = split_acc_head(head_group, lane // 16, e)
                         put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
             if lane == 0:  # written last: the merge's readiness hint
                 put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
@@ -2539,7 +2540,10 @@ def build_glm5_monokernel(
                     fx.Vector.from_elements([v0, v1], fx.Float32).to(fx.BFloat16), _rsrc(x_out), s * HIDDEN + row
                 )
 
-            peer_reduce("ffn", t, mb("a"), store_x, tile=DN_TILE)
+            def residual_a(s, row):
+                return bf2_f32(get(mb("a"), (s * HIDDEN + row) // 2))
+
+            peer_reduce("ffn", t, residual_a, store_x, tile=DN_TILE)
             gpu.barrier()
             stamp("down", t, 4)
 

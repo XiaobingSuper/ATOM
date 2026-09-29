@@ -634,6 +634,12 @@ def test_glm_chunk12_covers_routing_and_expert_tiles():
     expert_tiles = [cta + task_round * 256 for task_round in range(2) for cta in range(256)]
     assert routed == list(range(12))
     assert expert_tiles == list(range(512))
+    assert [
+        glm_layout.split_acc_head(group, lane_group, element)
+        for group in range(2)
+        for lane_group in range(2)
+        for element in range(4)
+    ] == list(range(16))
 
 
 def test_glm_layout_covers_only_requested_decode_batches():
