@@ -223,15 +223,7 @@ class KimiK3KdaAttention:
             and single_launch_attention
             and state_dtype is torch.float32
         ):
-            monokernel_input = torch.zeros(
-                _MONOKERNEL_INPUT_ROWS,
-                config.hidden,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            monokernel_input[:fused_width].copy_(self.t["w_kda_in"])
-            self.w_kda_in_packed = pack_bf16(monokernel_input)
-            self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
+            self._pack_monokernel_projections()
             self.monokernel_scratch = torch.zeros(
                 monokernel_scratch_nbytes(samples, mtp=mtp),
                 dtype=torch.uint8,
@@ -251,6 +243,21 @@ class KimiK3KdaAttention:
         if reduce_group is None:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
 
+    def _pack_monokernel_projections(self) -> None:
+        if self.w_kda_in_packed is not None:
+            return
+
+        fused_width = 4 * self.local_projection + self.config.local_heads + _HEAD_DIM
+        monokernel_input = torch.zeros(
+            _MONOKERNEL_INPUT_ROWS,
+            self.config.hidden,
+            dtype=torch.bfloat16,
+            device=self.t["w_kda_in"].device,
+        )
+        monokernel_input[:fused_width].copy_(self.t["w_kda_in"])
+        self.w_kda_in_packed = pack_bf16(monokernel_input)
+        self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
+
     def configure_monokernel(self, layer_idx: int, *, fuse_moe: bool = False) -> None:
         """Specialize the single launch for both AttnRes mixers and latent-MoE."""
 
@@ -262,17 +269,7 @@ class KimiK3KdaAttention:
         self.fuse_attn_res = True
         self.fuse_moe = fuse_moe
         device = self.t["w_kda_in"].device
-        if self.w_kda_in_packed is None:
-            fused_width = 4 * self.local_projection + self.config.local_heads + _HEAD_DIM
-            monokernel_input = torch.zeros(
-                _MONOKERNEL_INPUT_ROWS,
-                self.config.hidden,
-                dtype=torch.bfloat16,
-                device=device,
-            )
-            monokernel_input[:fused_width].copy_(self.t["w_kda_in"])
-            self.w_kda_in_packed = pack_bf16(monokernel_input)
-            self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
+        self._pack_monokernel_projections()
         if fuse_moe:
             latent_down, latent_down_scale = quantize_mxfp8(self.t["w_latent_down"])
             shared_up, shared_up_scale = quantize_mxfp8(self.t["w_shared_ug"])

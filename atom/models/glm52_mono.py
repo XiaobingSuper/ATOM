@@ -85,6 +85,29 @@ def _physical_expert_count(experts) -> int:
     return GLM5_CONFIG.n_experts + GLM5_CONFIG.num_shared_experts
 
 
+def _mxfp4_expert_tensors(experts, config, physical_experts: int) -> dict[str, torch.Tensor]:
+    tensors = {
+        "w_ug": _atom_byte_view(experts.w13_weight),
+        "s_ug": experts.w13_weight_scale.view(torch.uint8),
+        "w_dn": _atom_byte_view(experts.w2_weight),
+        "s_dn": experts.w2_weight_scale.view(torch.uint8),
+    }
+    for name, logical_rows, logical_k, scale in (
+        ("w_ug", physical_experts * 2 * config.inter, config.hidden, False),
+        ("s_ug", physical_experts * 2 * config.inter, config.hidden, True),
+        ("w_dn", physical_experts * config.hidden, config.inter, False),
+        ("s_dn", physical_experts * config.hidden, config.inter, True),
+    ):
+        atom_mxfp4_storage_view(
+            tensors[name],
+            name=name,
+            logical_rows=logical_rows,
+            logical_k=logical_k,
+            scale=scale,
+        )
+    return tensors
+
+
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     cfg = GLM5_CONFIG
     attn = layer.self_attn
@@ -103,38 +126,7 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         _need(norm.eps == EPS, f"{name} epsilon {norm.eps} != {EPS}")
         _bf16_vector(norm.weight, f"{name}.weight", size)
 
-    w_ug = _atom_byte_view(experts.w13_weight)
-    s_ug = experts.w13_weight_scale.view(torch.uint8)
-    w_dn = _atom_byte_view(experts.w2_weight)
-    s_dn = experts.w2_weight_scale.view(torch.uint8)
-    atom_mxfp4_storage_view(
-        w_ug,
-        name="w_ug",
-        logical_rows=physical_experts * 2 * cfg.inter,
-        logical_k=cfg.hidden,
-        scale=False,
-    )
-    atom_mxfp4_storage_view(
-        s_ug,
-        name="s_ug",
-        logical_rows=physical_experts * 2 * cfg.inter,
-        logical_k=cfg.hidden,
-        scale=True,
-    )
-    atom_mxfp4_storage_view(
-        w_dn,
-        name="w_dn",
-        logical_rows=physical_experts * cfg.hidden,
-        logical_k=cfg.inter,
-        scale=False,
-    )
-    atom_mxfp4_storage_view(
-        s_dn,
-        name="s_dn",
-        logical_rows=physical_experts * cfg.hidden,
-        logical_k=cfg.inter,
-        scale=True,
-    )
+    expert_tensors = _mxfp4_expert_tensors(experts, cfg, physical_experts)
 
     kv_b = linear_bf16(
         attn.kv_b_proj,
@@ -185,10 +177,7 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
             logical_cols=cfg.hidden,
         ),
         "bias": bias,
-        "w_ug": w_ug,
-        "s_ug": s_ug,
-        "w_dn": w_dn,
-        "s_dn": s_dn,
+        **expert_tensors,
     }
     return LayerWeights(
         cfg.local_heads,
@@ -211,26 +200,10 @@ def _staged_moe_weights(moe, rank: int, npes: int) -> LayerWeights:
     _need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
     _need(experts.intermediate_size_per_partition == cfg.inter, "expert width")
 
-    w_ug = _atom_byte_view(experts.w13_weight)
-    s_ug = experts.w13_weight_scale.view(torch.uint8)
-    w_dn = _atom_byte_view(experts.w2_weight)
-    s_dn = experts.w2_weight_scale.view(torch.uint8)
-    for tensor, name, rows, logical_k, scale in (
-        (w_ug, "w_ug", physical_experts * 2 * cfg.inter, cfg.hidden, False),
-        (s_ug, "s_ug", physical_experts * 2 * cfg.inter, cfg.hidden, True),
-        (w_dn, "w_dn", physical_experts * cfg.hidden, cfg.inter, False),
-        (s_dn, "s_dn", physical_experts * cfg.hidden, cfg.inter, True),
-    ):
-        atom_mxfp4_storage_view(
-            tensor,
-            name=name,
-            logical_rows=rows,
-            logical_k=logical_k,
-            scale=scale,
-        )
+    expert_tensors = _mxfp4_expert_tensors(experts, cfg, physical_experts)
     return LayerWeights(
         cfg.local_heads,
-        {"w_ug": w_ug, "s_ug": s_ug, "w_dn": w_dn, "s_dn": s_dn},
+        expert_tensors,
         cfg,
         rank,
         npes,
@@ -320,19 +293,19 @@ class Glm52MonoDecode:
 
         config = atom_config.hf_config
         staged_checks = (
-            (mode in ("auto", "staged"), "mode"),
-            (getattr(config, "model_type", None) == "glm_moe_dsa", "model type"),
-            (atom_config.tensor_parallel_size == 4, "not TP4"),
-            (atom_config.parallel_config.data_parallel_size == 1, "DP"),
-            (not atom_config.enable_dp_attention, "DPA"),
-            (atom_config.prefill_context_parallel_size == 1, "PCP"),
-            (atom_config.pipeline_parallel_size == 1, "PP"),
-            (not atom_config.enable_expert_parallel, "EP"),
-            (not atom_config.enable_tbo and not atom_config.enable_tbo_decode, "TBO"),
-            (atom_config.kv_cache_dtype == "fp8", "KV dtype"),
-            (not is_plugin_mode(), "plugin mode"),
+            mode in ("auto", "staged"),
+            getattr(config, "model_type", None) == "glm_moe_dsa",
+            atom_config.tensor_parallel_size == 4,
+            atom_config.parallel_config.data_parallel_size == 1,
+            not atom_config.enable_dp_attention,
+            atom_config.prefill_context_parallel_size == 1,
+            atom_config.pipeline_parallel_size == 1,
+            not atom_config.enable_expert_parallel,
+            not atom_config.enable_tbo and not atom_config.enable_tbo_decode,
+            atom_config.kv_cache_dtype == "fp8",
+            not is_plugin_mode(),
         )
-        if all(ok for ok, _ in staged_checks):
+        if all(staged_checks):
             try:
                 self._install_staged_moe()
             except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
