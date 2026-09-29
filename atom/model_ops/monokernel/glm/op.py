@@ -124,6 +124,11 @@ class Glm5MonoKernel:
         self.kv_cache_dtype = kv_cache_dtype
         t = W.t
         self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
+        self._launch_signature = (
+            samples, W.heads, npes, topk, launches_per_step, with_indexer,
+            index_max_seq, self.expert_mxfp4, self.attention_weight,
+            self.kv_cache_layout, kv_cache_dtype, W.config.inter, bool(timeline),
+        )
         self.packed = dict(
             prepare_glm5_weights(W, self.attention_weight) if prepared_weights is None else prepared_weights
         )
@@ -167,7 +172,11 @@ class Glm5MonoKernel:
             self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
             self.step = torch.zeros(1, dtype=torch.int32, device=dev)
         else:
-            if runtime.scr_layout != self.scr_layout or runtime.sym_layout != self.sym_layout:
+            if (
+                runtime.scr_layout != self.scr_layout
+                or runtime.sym_layout != self.sym_layout
+                or runtime._launch_signature != self._launch_signature
+            ):
                 raise ValueError("shared GLM runtime geometry mismatch")
             self.scratch = runtime.scratch
             self.peer_buffer = runtime.peer_buffer
@@ -175,21 +184,24 @@ class Glm5MonoKernel:
         self.sym_storage = self.peer_buffer.storage
         self.sym = self.peer_buffer.local_address
         self.peers = self.peer_buffer.addresses
-        self.launch = build_glm5_monokernel(
-            samples,
-            W.heads,
-            npes,
-            topk,
-            launches_per_step=launches_per_step,
-            with_indexer=with_indexer,
-            index_max_seq=index_max_seq,
-            expert_mxfp4=self.expert_mxfp4,
-            attention_weight=self.attention_weight,
-            kv_cache_layout=self.kv_cache_layout,
-            kv_cache_dtype=self.kv_cache_dtype,
-            inter=W.config.inter,
-            timeline=timeline,
-        )
+        if runtime is None:
+            self.launch = build_glm5_monokernel(
+                samples,
+                W.heads,
+                npes,
+                topk,
+                launches_per_step=launches_per_step,
+                with_indexer=with_indexer,
+                index_max_seq=index_max_seq,
+                expert_mxfp4=self.expert_mxfp4,
+                attention_weight=self.attention_weight,
+                kv_cache_layout=self.kv_cache_layout,
+                kv_cache_dtype=self.kv_cache_dtype,
+                inter=W.config.inter,
+                timeline=timeline,
+            )
+        else:
+            self.launch = runtime.launch
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
