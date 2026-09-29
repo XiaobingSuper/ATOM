@@ -542,6 +542,22 @@ def test_glm_empty_sparse_merge_avoids_divide_by_zero():
     assert "inv_den = (den > 0.0).select(_rcp(den), fx.Float32(0.0))" in source
 
 
+def test_glm_router_preserves_full_fp32_score_bits():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
+
+    assert "ok & fx.Int32(-256)" not in source
+    assert "winner = wave_umax_dpp" in source
+    assert "expert = 255 - winner" in source
+    assert source.count("fx.min(fx.Int32(topk), bound)") >= 2
+
+
 def test_glm_full_and_shared_layers_use_one_sparse_buffer():
     import torch
 
