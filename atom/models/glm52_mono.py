@@ -83,7 +83,8 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     experts = moe.experts
     physical_experts = cfg.n_experts + cfg.num_shared_experts
 
-    _need(experts.global_num_experts == physical_experts, "shared expert is not fused into ATOM expert storage")
+    _need(experts.global_num_experts == cfg.n_experts, "routed expert count")
+    _need(experts.local_num_experts == physical_experts, "shared expert is not fused into ATOM expert storage")
     _need(experts.num_fused_shared_experts == cfg.num_shared_experts, "fused shared-expert count")
     _need(not experts.use_ep, "expert parallelism")
     _need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
