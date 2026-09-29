@@ -1472,3 +1472,16 @@ def test_glm_fused_shared_expert_storage_is_zero_copy():
 
     for output, name in zip(prepared, ("w_ug", "s_ug", "w_dn", "s_dn")):
         assert output.data_ptr() == tensors[name].data_ptr()
+
+
+def test_glm_fused_shared_expert_keeps_routed_count_separate():
+    module = _glm_mono_module()
+    experts = SimpleNamespace(
+        global_num_experts=module.GLM5_CONFIG.n_experts,
+        num_fused_shared_experts=module.GLM5_CONFIG.num_shared_experts,
+    )
+
+    assert module._physical_expert_count(experts) == 257
+    experts.global_num_experts += 1
+    with pytest.raises(module.MonoUnsupported, match="routed expert count"):
+        module._physical_expert_count(experts)

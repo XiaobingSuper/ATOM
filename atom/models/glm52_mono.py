@@ -75,15 +75,21 @@ def _atom_byte_view(tensor: torch.Tensor) -> torch.Tensor:
     return view
 
 
+def _physical_expert_count(experts) -> int:
+    _need(experts.global_num_experts == GLM5_CONFIG.n_experts, "routed expert count")
+    _need(
+        experts.num_fused_shared_experts == GLM5_CONFIG.num_shared_experts,
+        "fused shared-expert count",
+    )
+    return GLM5_CONFIG.n_experts + GLM5_CONFIG.num_shared_experts
+
+
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     cfg = GLM5_CONFIG
     attn = layer.self_attn
     moe = layer.mlp
     experts = moe.experts
-    physical_experts = cfg.n_experts + cfg.num_shared_experts
-
-    _need(experts.global_num_experts == physical_experts, "shared expert is not fused into ATOM expert storage")
-    _need(experts.num_fused_shared_experts == cfg.num_shared_experts, "fused shared-expert count")
+    physical_experts = _physical_expert_count(experts)
     _need(not experts.use_ep, "expert parallelism")
     _need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
     _need(experts.intermediate_size_per_partition == cfg.inter, "expert width")
