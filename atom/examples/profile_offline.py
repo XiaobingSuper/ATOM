@@ -55,7 +55,9 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     llm = engine_args.create_engine()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=args.trust_remote_code
+    )
 
     if args.random_input:
         vocab_size = tokenizer.vocab_size

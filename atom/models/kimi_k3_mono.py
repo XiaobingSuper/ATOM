@@ -196,7 +196,16 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
 
 
 class _KimiLayerOp:
-    def __init__(self, layer, weights: LayerWeights, samples: int, mode: str) -> None:
+    def __init__(
+        self,
+        layer,
+        weights: LayerWeights,
+        samples: int,
+        mode: str,
+        *,
+        attention_symmetric_allreduce=None,
+        moe_symmetric_allreduce=None,
+    ) -> None:
         from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
         from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
 
@@ -213,8 +222,9 @@ class _KimiLayerOp:
             group=tp.cpu_group,
             reduce_group=tp.device_group,
             mtp=False,
-            launches_per_step=1,
             conv_state_layout=ConvStateLayout.TIME_MAJOR,
+            attention_symmetric_allreduce=attention_symmetric_allreduce,
+            moe_symmetric_allreduce=moe_symmetric_allreduce,
         )
 
     def close(self) -> None:
@@ -230,6 +240,7 @@ class KimiMonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
+        self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
         self._refused: set[tuple[int, int, str]] = set()
         self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
@@ -388,15 +399,44 @@ class KimiMonoDecode:
 
         made = []
         try:
-            for layer, backend, key, weights in mapped:
+            for index, (layer, backend, key, weights) in enumerate(mapped, start=1):
                 self._weights[layer.layer_idx] = weights
                 if key in self._ops:
                     continue
-                self._ops[key] = _KimiLayerOp(layer, weights, samples, backend)
+                if rank == 0:
+                    logger.info(
+                        "Kimi-K3 MonoKernel preparing: backend=%s S=%d layer=%d (%d/%d)",
+                        backend,
+                        samples,
+                        layer.layer_idx,
+                        index,
+                        len(mapped),
+                    )
+                reduction_key = (samples, backend)
+                attention_reduce, moe_reduce = self._reductions.get(
+                    reduction_key,
+                    (None, None),
+                )
+                self._ops[key] = _KimiLayerOp(
+                    layer,
+                    weights,
+                    samples,
+                    backend,
+                    attention_symmetric_allreduce=attention_reduce,
+                    moe_symmetric_allreduce=moe_reduce,
+                )
+                if reduction_key not in self._reductions:
+                    op = self._ops[key].op
+                    self._reductions[reduction_key] = (
+                        op.attention.symmetric_allreduce,
+                        op.symmetric_allreduce,
+                    )
                 made.append(key)
         except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
             for key in reversed(made):
                 self._ops.pop(key).close()
+            for _, backend, _ in specs:
+                self._reductions.pop((samples, backend), None)
             self._refused.update(key for _, _, key in specs)
             logger.warning("Kimi-K3 MonoKernel fallback before launch: %s", error)
             return False
@@ -477,7 +517,7 @@ class KimiMonoDecode:
                 state_indices,
                 cache.k_cache,
                 cache.v_cache,
-                epoch_layer=0,
+                epoch_layer=layer.layer_idx,
             )
         hidden, _ = model.output_attn_res(hidden, blocks, pending, pending2)
         return hidden
@@ -487,4 +527,5 @@ class KimiMonoDecode:
             owned.close()
         self._ops.clear()
         getattr(self, "_weights", {}).clear()
+        getattr(self, "_reductions", {}).clear()
         self._refused.clear()

@@ -91,6 +91,7 @@ class KimiK3KdaAttention:
         single_launch_attention: bool = True,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        symmetric_allreduce: SymmetricBf16Allreduce | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -179,16 +180,21 @@ class KimiK3KdaAttention:
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
         self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
         self.core = KimiK3KdaRecurrence(samples, conv_state_layout)
-        self.symmetric_allreduce = (
-            SymmetricBf16Allreduce(
-                (self.partial.numel(),),
-                rank=rank,
-                npes=npes,
-                group=group,
+        if reduce_backend == "symmetric":
+            self.symmetric_allreduce = (
+                symmetric_allreduce
+                if symmetric_allreduce is not None
+                else SymmetricBf16Allreduce(
+                    (self.partial.numel(),),
+                    rank=rank,
+                    npes=npes,
+                    group=group,
+                )
             )
-            if reduce_backend == "symmetric"
-            else None
-        )
+        else:
+            if symmetric_allreduce is not None:
+                raise ValueError("an injected KDA all-reduce requires reduce_backend='symmetric'")
+            self.symmetric_allreduce = None
         self.monokernel_launch = None
         self.monokernel_scratch = None
         self.monokernel_timeline = None
@@ -499,10 +505,10 @@ class KimiK3KdaAttention:
                     "peers": self.symmetric_allreduce.peer_buffer.addresses.data_ptr(),
                     "step": self.step.data_ptr(),
                     "rank": self.rank,
-                    "layer": 0,
+                    "layer": layer,
                     "npes": self.npes,
                     "max_pairs": self.symmetric_allreduce.max_pairs,
-                    "layer_slots": 1,
+                    "layer_slots": MAX_LAYERS_PER_STEP,
                 },
             )
         else:

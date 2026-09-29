@@ -73,6 +73,8 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        attention_symmetric_allreduce=None,
+        moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -145,6 +147,7 @@ class _KimiK3MlaPath:
             kv_cache_layout=kv_cache_layout,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            attention_symmetric_allreduce=attention_symmetric_allreduce,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -234,19 +237,24 @@ class _KimiK3MlaPath:
         self.output = torch.empty_like(self.shared_partial)
         self.attention_delta = torch.empty_like(self.shared_partial)
         self._profiler = CudaStageProfiler()
-        self.symmetric_allreduce = (
-            SymmetricBf16Allreduce(
-                (self.routed_partial.numel(), self.final_partial.numel()),
-                rank=rank,
-                npes=npes,
-                group=group,
-                final_hidden=config.hidden,
-                final_shard_width=self.hidden_shard,
-                rmsnorm_width=self.routed_hidden,
+        if reduce_backend == "symmetric":
+            self.symmetric_allreduce = (
+                moe_symmetric_allreduce
+                if moe_symmetric_allreduce is not None
+                else SymmetricBf16Allreduce(
+                    (self.routed_partial.numel(), self.final_partial.numel()),
+                    rank=rank,
+                    npes=npes,
+                    group=group,
+                    final_hidden=config.hidden,
+                    final_shard_width=self.hidden_shard,
+                    rmsnorm_width=self.routed_hidden,
+                )
             )
-            if reduce_backend == "symmetric"
-            else None
-        )
+        else:
+            if moe_symmetric_allreduce is not None:
+                raise ValueError("an injected MoE all-reduce requires reduce_backend='symmetric'")
+            self.symmetric_allreduce = None
         self.fused_tail = (
             FusedKimiK3Tail(
                 samples,
@@ -280,7 +288,10 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        attention_symmetric_allreduce,
     ):
+        if attention_symmetric_allreduce is not None:
+            raise ValueError("Kimi-K3 MLA does not accept a KDA all-reduce")
         del reduce_group, reduce_backend, mtp, conv_state_layout
         return KimiK3MlaAttention(
             weights,
@@ -724,6 +735,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        attention_symmetric_allreduce,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -739,6 +751,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             single_launch_attention=samples <= 4 or mtp,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            symmetric_allreduce=attention_symmetric_allreduce,
         )
 
     def forward(

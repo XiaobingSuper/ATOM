@@ -369,14 +369,21 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
         "get_tp_group",
         lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
     )
+    attention_reduce = object()
+    moe_reduce = object()
     module._KimiLayerOp(
         SimpleNamespace(layer_idx=1),
         weights=object(),
         samples=8,
         mode=mode,
+        attention_symmetric_allreduce=attention_reduce,
+        moe_symmetric_allreduce=moe_reduce,
     )
 
     assert captured[0]["conv_state_layout"] is ConvStateLayout.TIME_MAJOR
+    assert "launches_per_step" not in captured[0]
+    assert captured[0]["attention_symmetric_allreduce"] is attention_reduce
+    assert captured[0]["moe_symmetric_allreduce"] is moe_reduce
 
 
 def test_model_specific_backend_selection():
@@ -1005,12 +1012,14 @@ def test_per_layer_mailboxes_alternate_between_decode_steps():
         "tail": (root / "k3" / "tail.py").read_text(),
         "k3": (root / "k3" / "kernel.py").read_text(),
         "glm": (root / "glm" / "kernel.py").read_text(),
+        "gemm": (root / "gemm_a16w16.py").read_text(),
     }
 
     assert sources["symmetric"].count("slot = step_value & 1") == 3
     assert "slot = step_value & 1" in sources["tail"]
     assert "slot = step_value & 1" in sources["k3"]
     assert "peer_slot = step_value & 1" in sources["glm"]
+    assert "slot = step_value & 1" in sources["gemm"]
     for source in sources.values():
         assert "(step_value * LAYER_SLOTS + layer) & 1" not in source
         assert "(step_value * launches_per_step + layer) & 1" not in source
@@ -1080,6 +1089,18 @@ def test_model_runner_closes_monokernels_before_distributed_teardown():
     close_at = source.index("close_model_monokernels(self.model)")
     destroy_at = source.index("destroy_dist_env()", close_at)
     assert close_at < destroy_at
+
+
+def test_offline_profiler_forwards_tokenizer_remote_code_trust():
+    source = (
+        Path(__file__).parents[1] / "atom" / "examples" / "profile_offline.py"
+    ).read_text()
+
+    assert (
+        "AutoTokenizer.from_pretrained(\n"
+        "        args.model, trust_remote_code=args.trust_remote_code\n"
+        "    )"
+    ) in source
 
 
 def test_kimi_forward_uses_inputs_embeds(monkeypatch):

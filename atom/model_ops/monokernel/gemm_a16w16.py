@@ -762,7 +762,7 @@ def gemm_a16w16_gfx950_kernel(
         step_word = bo.buffer_load(step_rsrc, 0, vec_width=1, dtype=T.i32)
         step_value = fx.Int32(rocdl.readfirstlane(T.i32, fx.Int32(step_word).ir_value()))
         tag = step_value * param.allreduce_layer_slots + layer + 1
-        slot = (step_value * param.allreduce_layer_slots + layer) & 1
+        slot = step_value & 1
         base = fx.Int64(slot) * fx.Int64(slot_bytes)
 
         for peer_round in range_constexpr(peer_rounds):
