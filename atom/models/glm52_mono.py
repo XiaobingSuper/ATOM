@@ -367,8 +367,6 @@ class Glm52MonoDecode:
         for layer in layers:
             indexer = layer.self_attn.indexer
             if indexer is not None and not layer.self_attn.skip_topk:
-                if self._required and not getattr(indexer, "_indexer_fp4", False):
-                    raise MonoUnsupported("GLM-5.2 required MonoKernel configuration failed: FP4 index cache")
                 if self._dcp_size > 1 and not getattr(_attention_impl(layer), "qrep_enabled", False):
                     raise MonoUnsupported("GLM-5.2 required MonoKernel configuration failed: DCP QREP")
                 seen_full_indexer = True

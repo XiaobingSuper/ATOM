@@ -1021,7 +1021,7 @@ def test_glm_dcp_band_requires_qrep(monkeypatch):
         kv_cache_dtype="fp8",
     )
     impl = SimpleNamespace(qrep_enabled=True)
-    indexer = SimpleNamespace(_indexer_fp4=True)
+    indexer = SimpleNamespace()
     layer = SimpleNamespace(
         mlp=SimpleNamespace(experts=object()),
         self_attn=SimpleNamespace(
