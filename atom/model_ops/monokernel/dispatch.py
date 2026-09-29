@@ -96,13 +96,13 @@ def select_backend(
         or kv_cache_dtype not in ("bf16", "fp8")
         or mtp
         or dpa
-        or dcp
         or plugin
     ):
         return None
     if model == "glm52":
         if (
             kv_cache_dtype == "bf16"
+            and not dcp
             and has_moe
             and external_indexer
             and cache_layout == "atom"

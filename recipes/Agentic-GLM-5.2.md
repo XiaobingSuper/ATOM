@@ -22,6 +22,11 @@ The optimized single-node PD setup is documented below. For the general
 multi-node PD workflow, see
 [`mesh/Agentic-GLM-5.2.md`](mesh/Agentic-GLM-5.2.md).
 
+For a MonoKernel A/B, export
+`ATOM_NATIVE_DECODE_MONOKERNEL=off` for the baseline and `auto` for the
+candidate. Cold-start each arm and keep every other environment variable,
+server argument, workload input, and random seed identical.
+
 ## 1. Start the ATOM Server
 
 ### PD Disaggregated Deployment (1P1D)

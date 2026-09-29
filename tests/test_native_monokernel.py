@@ -396,6 +396,7 @@ def test_model_specific_backend_selection():
     assert select_backend("glm52", "staged", **glm_bf16) is None
     assert select_backend("kimi_k3", "auto", **common) == "staged"
     assert select_backend("kimi_k3", "mono", **common) == "mono"
+    assert select_backend("kimi_k3", "auto", **common, dcp=True) == "staged"
     assert select_backend("kimi_k3", "auto", **common, is_kda=False) is None
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
 
@@ -1156,9 +1157,11 @@ def test_close_model_monokernels_is_deduplicated_and_idempotent():
             self.calls += 1
 
     owned = Owned()
+    glm_owned = Owned()
     modules = [
         SimpleNamespace(_mono=owned),
         SimpleNamespace(_mono=owned),
+        SimpleNamespace(_glm52_mono=glm_owned),
         SimpleNamespace(),
     ]
     model = SimpleNamespace(modules=lambda: modules)
@@ -1167,8 +1170,10 @@ def test_close_model_monokernels_is_deduplicated_and_idempotent():
     close_model_monokernels(model)
 
     assert owned.calls == 1
+    assert glm_owned.calls == 1
     owned.memory_reserve_bytes = lambda: 123
-    assert model_monokernel_memory_reserve(model) == 123
+    glm_owned.memory_reserve_bytes = lambda: 456
+    assert model_monokernel_memory_reserve(model) == 579
 
 
 def test_model_runner_closes_monokernels_before_distributed_teardown():

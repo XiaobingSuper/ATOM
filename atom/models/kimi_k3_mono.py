@@ -320,6 +320,7 @@ class KimiMonoDecode:
             samples=samples,
             tp_size=self._atom_config.tensor_parallel_size,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
         )
         if (
             backend is None
@@ -388,6 +389,7 @@ class KimiMonoDecode:
                 samples=samples,
                 tp_size=8,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
+                dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
                 is_kda=layer.is_linear_attn,
                 has_moe=hasattr(layer, "block_sparse_moe"),
             )
@@ -500,6 +502,7 @@ class KimiMonoDecode:
             samples=samples,
             tp_size=8,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
             is_kda=layer.is_linear_attn,
             has_moe=hasattr(layer, "block_sparse_moe"),
         )

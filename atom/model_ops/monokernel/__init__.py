@@ -17,11 +17,12 @@ def _owned_model_monokernels(model):
     modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
     seen: set[int] = set()
     for module in modules:
-        owned = getattr(module, "_mono", None)
-        if owned is None or id(owned) in seen:
-            continue
-        seen.add(id(owned))
-        yield owned
+        for name in ("_mono", "_glm52_mono"):
+            owned = getattr(module, name, None)
+            if owned is None or id(owned) in seen:
+                continue
+            seen.add(id(owned))
+            yield owned
 
 
 def model_monokernel_memory_reserve(model) -> int:
