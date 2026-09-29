@@ -22,6 +22,7 @@ from atom.model_ops.monokernel.config import (
     KvCacheLayout,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
+    glm5_shard_config,
 )
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
@@ -201,6 +202,44 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     )
 
 
+def _staged_moe_weights(moe, rank: int, npes: int) -> LayerWeights:
+    cfg = glm5_shard_config(npes)
+    experts = moe.experts
+    physical_experts = _physical_expert_count(experts)
+    _need(npes == 4, "staged MoE requires TP4")
+    _need(not experts.use_ep, "expert parallelism")
+    _need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
+    _need(experts.intermediate_size_per_partition == cfg.inter, "expert width")
+
+    w_ug = _atom_byte_view(experts.w13_weight)
+    s_ug = experts.w13_weight_scale.view(torch.uint8)
+    w_dn = _atom_byte_view(experts.w2_weight)
+    s_dn = experts.w2_weight_scale.view(torch.uint8)
+    for tensor, name, rows, logical_k, scale in (
+        (w_ug, "w_ug", physical_experts * 2 * cfg.inter, cfg.hidden, False),
+        (s_ug, "s_ug", physical_experts * 2 * cfg.inter, cfg.hidden, True),
+        (w_dn, "w_dn", physical_experts * cfg.hidden, cfg.inter, False),
+        (s_dn, "s_dn", physical_experts * cfg.hidden, cfg.inter, True),
+    ):
+        atom_mxfp4_storage_view(
+            tensor,
+            name=name,
+            logical_rows=rows,
+            logical_k=logical_k,
+            scale=scale,
+        )
+    return LayerWeights(
+        cfg.local_heads,
+        {"w_ug": w_ug, "s_ug": s_ug, "w_dn": w_dn, "s_dn": s_dn},
+        cfg,
+        rank,
+        npes,
+        mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
+        mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
+        physical_experts=physical_experts,
+    )
+
+
 def _attention_impl(layer):
     wrapped = layer.self_attn.mla_attn
     return getattr(wrapped, "impl", wrapped)
@@ -249,6 +288,17 @@ class _GlmLayerOp:
         self.op.close()
 
 
+class _GlmMoeBinding:
+    def __init__(self, owner, layer, key: str, original) -> None:
+        self.owner = owner
+        self.layer = layer
+        self.key = key
+        self.original = original
+
+    def __call__(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return self.owner._staged_moe_forward(self, hidden_states)
+
+
 class Glm52MonoDecode:
     """Run eligible GLM-5.2 MoE layers while retaining ATOM's external indexer."""
 
@@ -258,12 +308,44 @@ class Glm52MonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int], _GlmLayerOp] = {}
         self._refused: set[int] = set()
+        self._staged_bindings: list[_GlmMoeBinding] = []
+        self._staged_workspaces: dict[int, object] = {}
+        self._staged_ops: dict[tuple[int, int], object] = {}
+        self._staged_refused: set[int] = set()
+        self._staged_enabled = False
         self._stats = MonoRouteStats("glm52")
         self._enabled = mode != "off"
         if not self._enabled:
             return
 
         config = atom_config.hf_config
+        staged_checks = (
+            (mode in ("auto", "staged"), "mode"),
+            (getattr(config, "model_type", None) == "glm_moe_dsa", "model type"),
+            (atom_config.tensor_parallel_size == 4, "not TP4"),
+            (atom_config.parallel_config.data_parallel_size == 1, "DP"),
+            (not atom_config.enable_dp_attention, "DPA"),
+            (atom_config.prefill_context_parallel_size == 1, "PCP"),
+            (atom_config.pipeline_parallel_size == 1, "PP"),
+            (not atom_config.enable_expert_parallel, "EP"),
+            (not atom_config.enable_tbo and not atom_config.enable_tbo_decode, "TBO"),
+            (atom_config.kv_cache_dtype == "fp8", "KV dtype"),
+            (not is_plugin_mode(), "plugin mode"),
+        )
+        if all(ok for ok, _ in staged_checks):
+            try:
+                self._install_staged_moe()
+            except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
+                logger.warning("GLM-5.2 staged MoE off: %s", error)
+            else:
+                self._staged_enabled = True
+                self._enabled = False
+                logger.info(
+                    "GLM-5.2 staged MoE installed: TP4 layers=%d",
+                    len(self._staged_bindings),
+                )
+                return
+
         checks = (
             (getattr(config, "model_type", None) == "glm_moe_dsa", "model type"),
             (atom_config.tensor_parallel_size == 8, "not TP8"),
@@ -327,6 +409,125 @@ class Glm52MonoDecode:
                 logger.info("GLM-5.2 MonoKernel off: shared IndexShare layer precedes a full layer")
                 self._enabled = False
                 return
+
+    def _install_staged_moe(self) -> None:
+        from atom.model_ops.monokernel.glm.staged_moe import (
+            install_staged_moe_forward,
+        )
+
+        context = self._atom_config.compilation_config.static_forward_context
+        layers = self._mono_layers()
+        _need(bool(layers), "no MoE layers")
+        for layer in layers:
+            _physical_expert_count(layer.mlp.experts)
+        try:
+            for layer in layers:
+                key = f"glm52_staged_moe.layer_{layer.layer_idx}"
+                _need(key not in context, f"duplicate staged key {key}")
+                original = install_staged_moe_forward(layer.mlp, key)
+                binding = _GlmMoeBinding(self, layer, key, original)
+                context[key] = binding
+                self._staged_bindings.append(binding)
+        except Exception:
+            for binding in self._staged_bindings:
+                binding.layer.mlp.forward = binding.original
+                if context.get(binding.key) is binding:
+                    context.pop(binding.key)
+            self._staged_bindings.clear()
+            raise
+
+    def _prepare_staged_moe(self, rows: int) -> bool:
+        if all((binding.layer.layer_idx, rows) in self._staged_ops for binding in self._staged_bindings):
+            return True
+        if rows in self._staged_refused or torch.cuda.is_current_stream_capturing():
+            return False
+
+        rank = get_tensor_model_parallel_rank()
+        npes = get_tensor_model_parallel_world_size()
+        mapped = []
+        error = None
+        try:
+            mapped = [
+                (binding, _staged_moe_weights(binding.layer.mlp, rank, npes))
+                for binding in self._staged_bindings
+            ]
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as caught:
+            error = caught
+        try:
+            tp_uniform_local_validation(
+                error,
+                group=get_tp_group().cpu_group,
+                world_size=npes,
+                context="GLM-5.2 staged MoE weight mapping failed",
+            )
+            from atom.model_ops.monokernel.glm.staged_moe import (
+                Glm52MoeWorkspace,
+                Glm52Tp4MoeStage,
+            )
+
+            workspace = Glm52MoeWorkspace(
+                rows,
+                torch.device("cuda", torch.cuda.current_device()),
+            )
+            stages = {
+                (binding.layer.layer_idx, rows): Glm52Tp4MoeStage(
+                    weights,
+                    binding.layer.mlp.gate,
+                    binding.layer.mlp.gate.e_score_correction_bias,
+                    workspace,
+                    reduce_results=binding.layer.mlp.reduce_results,
+                )
+                for binding, weights in mapped
+            }
+        except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as caught:
+            self._staged_refused.add(rows)
+            logger.warning("GLM-5.2 staged MoE fallback before launch: %s", caught)
+            return False
+
+        self._staged_workspaces[rows] = workspace
+        self._staged_ops.update(stages)
+        logger.info(
+            "GLM-5.2 MonoKernel ready: backend=staged_moe rows=%d layers=%d",
+            rows,
+            len(stages),
+        )
+        return True
+
+    def _staged_moe_forward(
+        self,
+        binding: _GlmMoeBinding,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor:
+        rows = hidden_states.shape[0]
+        fwd = get_forward_context()
+        context = fwd.context
+        backend = select_backend(
+            "glm52",
+            self._mode,
+            samples=rows,
+            tp_size=self._atom_config.tensor_parallel_size,
+            kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            mtp=self._atom_config.speculative_config is not None,
+            dpa=self._atom_config.enable_dp_attention,
+            dcp=self._atom_config.decode_context_parallel_size > 1,
+            plugin=is_plugin_mode(),
+            segment="moe",
+        )
+        if (
+            backend != "staged_moe"
+            or context is None
+            or context.is_prefill
+            or fwd.ubatch_slices is not None
+            or hidden_states.ndim != 2
+            or hidden_states.shape[1] != GLM5_CONFIG.hidden
+            or hidden_states.dtype is not torch.bfloat16
+            or not hidden_states.is_contiguous()
+            or not self._prepare_staged_moe(rows)
+        ):
+            self._route_stats().record_fallback("staged_moe", rows)
+            return binding.original(hidden_states)
+        self._route_stats().record_hit(backend, rows)
+        return self._staged_ops[binding.layer.layer_idx, rows](hidden_states)
 
     def _route_stats(self) -> MonoRouteStats:
         stats = getattr(self, "_stats", None)
@@ -414,6 +615,8 @@ class Glm52MonoDecode:
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
         samples = input_ids.numel()
+        if getattr(self, "_staged_enabled", False):
+            return False
         self._route_stats().record_attempt(samples)
         if not self._enabled:
             return self._fallback("disabled", samples)
@@ -548,6 +751,15 @@ class Glm52MonoDecode:
         )
 
     def close(self) -> None:
+        context = self._atom_config.compilation_config.static_forward_context
+        for binding in self._staged_bindings:
+            binding.layer.mlp.forward = binding.original
+            if context.get(binding.key) is binding:
+                context.pop(binding.key)
+        self._staged_bindings.clear()
+        self._staged_ops.clear()
+        self._staged_workspaces.clear()
+        self._staged_refused.clear()
         for owned in self._ops.values():
             owned.close()
         self._ops.clear()

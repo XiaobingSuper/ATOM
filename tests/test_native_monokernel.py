@@ -519,6 +519,42 @@ def test_glm_agentic_selects_moe_stage_for_flattened_rows(rows, mtp, dcp):
     assert select_backend("glm52", "auto", **common, plugin=True) is None
 
 
+def test_glm_tp4_staged_moe_workspace_tracks_flattened_rows():
+    from atom.model_ops.monokernel.glm.staged_moe import workspace_shapes
+
+    shapes = workspace_shapes(48)
+
+    assert shapes["routes"] == (48, 9)
+    assert shapes["sorted"] == (48 * 9 * 16,)
+    assert shapes["intermediate"] == (48 * 9 * 16, 512)
+    assert shapes["output"] == (48, 6144)
+
+
+def test_glm_staged_moe_wrapper_preserves_parameter_names():
+    import torch
+
+    from atom.model_ops.monokernel.glm.staged_moe import (
+        install_staged_moe_forward,
+    )
+
+    class FakeMoe(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+
+        def forward(self, hidden_states):
+            return hidden_states
+
+    moe = FakeMoe()
+    names_before = tuple(name for name, _ in moe.named_parameters())
+
+    original = install_staged_moe_forward(moe, "glm52.stage.3")
+
+    assert tuple(name for name, _ in moe.named_parameters()) == names_before
+    assert original.__self__ is moe
+    assert moe._glm52_staged_key == "glm52.stage.3"
+
+
 def test_glm_shard_geometry_derives_from_tensor_parallel_size():
     from atom.model_ops.monokernel.config import (
         glm5_decode_shape,
