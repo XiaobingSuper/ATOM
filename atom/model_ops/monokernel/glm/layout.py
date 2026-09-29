@@ -38,10 +38,10 @@ INDEX_KEYS_PER_TASK = 64
 DCP_SUMMARY_PAIRS = KV_LORA // 2 + 2
 
 
-def split_acc_head(head_group, lane_group: int, element: int):
-    """Map one split-PV accumulator row to its local attention head."""
+def split_acc_head(lane_group: int, element: int):
+    """Map one split-PV MFMA row to its local attention head."""
 
-    return head_group * WAVES + lane_group * 4 + element
+    return lane_group * 4 + element
 
 
 def sparse_cache_rows(

@@ -700,9 +700,8 @@ def test_glm_chunk12_covers_routing_expert_tiles_and_down_lds():
     assert routed == list(range(12))
     assert expert_tiles == list(range(512))
     assert [
-        glm_layout.split_acc_head(group, lane_group, element)
-        for group in range(2)
-        for lane_group in range(2)
+        glm_layout.split_acc_head(lane_group, element)
+        for lane_group in range(4)
         for element in range(4)
     ] == list(range(16))
     assert glm_layout.down_x_words(12, 512, True) == 27_648

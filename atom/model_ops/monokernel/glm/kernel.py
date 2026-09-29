@@ -1826,9 +1826,9 @@ def build_glm5_monokernel(
                     b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
                     c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
                     c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                if lane < 32:
+                if lane // 32 == head_group:
                     for e in range_constexpr(4):
-                        hh = split_acc_head(head_group, lane // 16, e)
+                        hh = split_acc_head(lane // 16, e)
                         put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
             if lane == 0:  # written last: the merge's readiness hint
                 put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
