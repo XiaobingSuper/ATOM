@@ -16,11 +16,11 @@ from atom.model_ops.monokernel.config import (
     ConvStateLayout,
     KvCacheLayout,
 )
-from atom.model_ops.monokernel.formats import quantize_mxfp8
 from atom.model_ops.monokernel.k3.attn_res import KimiK3AttnRes
 from atom.model_ops.monokernel.k3.kda import KimiK3KdaAttention
 from atom.model_ops.monokernel.k3.mla import KimiK3MlaAttention
 from atom.model_ops.monokernel.k3.moe import kimi_k3_mxfp4_gemm1, kimi_k3_mxfp4_gemm2
+from atom.model_ops.monokernel.k3.prepared import KimiK3PreparedWeights
 from atom.model_ops.monokernel.k3.router import SigmoidTopkRouter
 from atom.model_ops.monokernel.k3.router_projection import FusedRouterProjection
 from atom.model_ops.monokernel.k3.tail import FusedKimiK3Tail
@@ -34,11 +34,6 @@ from atom.model_ops.monokernel.k3.torch_fusions import (
     situ,
 )
 from atom.model_ops.monokernel.mxfp8_linear import Mxfp8Linear
-from atom.model_ops.monokernel.packing import (
-    pack_bf16,
-    pack_mxfp8_scale,
-    pack_mxfp8_weight,
-)
 from atom.model_ops.monokernel.symmetric_allreduce import SymmetricBf16Allreduce
 from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
 
@@ -73,6 +68,7 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        prepared_weights: KimiK3PreparedWeights | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -107,6 +103,9 @@ class _KimiK3MlaPath:
         self.routed_hidden = config.routed_hidden
         self.shared_inter = config.shared_inter
         self.hidden_shard = config.hidden // npes
+        if prepared_weights is not None:
+            prepared_weights.validate_source(weights)
+        self.prepared_weights = prepared_weights
 
         expected = {
             "w_r",
@@ -145,6 +144,7 @@ class _KimiK3MlaPath:
             kv_cache_layout=kv_cache_layout,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            prepared_weights=prepared_weights,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -168,22 +168,38 @@ class _KimiK3MlaPath:
             source_override_idx=0 if self.inline_pre_attn else -1,
         )
 
-        self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
-        self.w_router = pack_bf16(self.t["w_r"])
-        latent_weight, self.s_latent_down = quantize_mxfp8(self.t["w_latent_down"])
-        shared_weight, self.s_shared_ug = quantize_mxfp8(self.t["w_shared_ug"])
-        shared_down_weight, self.s_shared_dn = quantize_mxfp8(self.t["w_shared_dn"])
-        latent_up_weight, self.s_latent_up = quantize_mxfp8(self.t["w_latent_up"])
-        self.latent_projection = Mxfp8Linear(latent_weight, self.s_latent_down, samples)
-        self.shared_projection = Mxfp8Linear(shared_weight, self.s_shared_ug, samples)
+        if prepared_weights is None:
+            from atom.model_ops.monokernel.formats import quantize_mxfp8
+            from atom.model_ops.monokernel.packing import pack_bf16, pack_mxfp8_scale, pack_mxfp8_weight
+
+            self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
+            self.w_router = pack_bf16(self.t["w_r"])
+            latent_weight, self.s_latent_down = quantize_mxfp8(self.t["w_latent_down"])
+            shared_weight, self.s_shared_ug = quantize_mxfp8(self.t["w_shared_ug"])
+            shared_down_weight, self.s_shared_dn = quantize_mxfp8(self.t["w_shared_dn"])
+            latent_up_weight, self.s_latent_up = quantize_mxfp8(self.t["w_latent_up"])
+            self.latent_projection = Mxfp8Linear(latent_weight, self.s_latent_down, samples)
+            self.shared_projection = Mxfp8Linear(shared_weight, self.s_shared_ug, samples)
+            self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
+            self.s_shared_dn = pack_mxfp8_scale(self.s_shared_dn)
+            self.w_latent_up = pack_mxfp8_weight(latent_up_weight)
+            self.s_latent_up = pack_mxfp8_scale(self.s_latent_up)
+        else:
+            self.w_ug = prepared_weights.w_ug
+            self.s_ug = prepared_weights.s_ug
+            self.w_dn = prepared_weights.w_dn
+            self.s_dn = prepared_weights.s_dn
+            self.w_router = prepared_weights.w_router
+            self.latent_projection = Mxfp8Linear.from_prepared(prepared_weights.latent_down, samples)
+            self.shared_projection = Mxfp8Linear.from_prepared(prepared_weights.shared_up, samples)
+            self.w_shared_dn = prepared_weights.shared_down.weight
+            self.s_shared_dn = prepared_weights.shared_down.scale
+            self.w_latent_up = prepared_weights.latent_up.weight
+            self.s_latent_up = prepared_weights.latent_up.scale
         self.w_latent_down = self.latent_projection.weight
         self.s_latent_down = self.latent_projection.scale
         self.w_shared_ug = self.shared_projection.weight
         self.s_shared_ug = self.shared_projection.scale
-        self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
-        self.s_shared_dn = pack_mxfp8_scale(self.s_shared_dn)
-        self.w_latent_up = pack_mxfp8_weight(latent_up_weight)
-        self.s_latent_up = pack_mxfp8_scale(self.s_latent_up)
 
         # At most one padded BM tile is needed per selected route: there can be
         # no more active experts than routes.  The old ``routes + E*(BM-1)``
@@ -280,8 +296,9 @@ class _KimiK3MlaPath:
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        prepared_weights: KimiK3PreparedWeights | None,
     ):
-        del reduce_group, reduce_backend, mtp, conv_state_layout
+        del reduce_group, reduce_backend, mtp, conv_state_layout, prepared_weights
         return KimiK3MlaAttention(
             weights,
             samples,
@@ -724,6 +741,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         kv_cache_layout: KvCacheLayout | str,
         mtp: bool,
         conv_state_layout: ConvStateLayout,
+        prepared_weights: KimiK3PreparedWeights | None,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -739,6 +757,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             single_launch_attention=samples <= 4 or mtp,
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            prepared_weights=prepared_weights,
         )
 
     def forward(

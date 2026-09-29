@@ -439,6 +439,7 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
     module._KimiLayerOp(
         SimpleNamespace(layer_idx=1),
         weights=object(),
+        prepared_weights=object(),
         samples=8,
         mode=mode,
     )
@@ -459,6 +460,11 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
         lambda: SimpleNamespace(cpu_group=object(), device_group=object()),
     )
     monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(
+        module,
+        "prepare_kimi_k3_weights",
+        lambda *_args: SimpleNamespace(validate_source=lambda *_: None),
+    )
     monkeypatch.setattr(module, "_KimiLayerOp", lambda *_args: object())
     monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(module.logger, "info", lambda *args: messages.append(args))
@@ -469,6 +475,7 @@ def test_kimi_announces_backend_once_on_rank_zero(monkeypatch):
         value._atom_config = SimpleNamespace(kv_cache_dtype="bf16")
         value._ops = {}
         value._weights = {}
+        value._prepared = {}
         value._refused = set()
         value._announced = set()
         return value
@@ -834,12 +841,88 @@ def test_kimi_runner_close_is_idempotent():
     owned = Owned()
     runner._ops = {(1, 4, "staged"): owned}
     runner._weights = {}
+    runner._prepared = {1: object()}
     runner._refused = set()
     runner._announced = {("staged", 4)}
     runner.close()
     runner.close()
     assert owned.calls == 1
+    assert runner._prepared == {}
     assert runner._announced == set()
+
+
+def test_kimi_prepared_weights_are_shared_across_sample_runners(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    static_names = (
+        "w_kda_in_padded", "w_kda_in_packed", "w_kda_o_packed", "w_router",
+        "w_ug", "s_ug", "w_dn", "s_dn",
+    )
+    prepared = SimpleNamespace(
+        **{name: torch.zeros(1, dtype=torch.uint8) for name in static_names},
+        **{
+            name: SimpleNamespace(
+                weight=torch.zeros(1, dtype=torch.uint8),
+                scale=torch.zeros(1, dtype=torch.uint8),
+            )
+            for name in ("latent_down", "shared_up", "shared_down", "latent_up")
+        },
+    )
+    validations = []
+    prepared.validate_source = lambda weights: validations.append(weights)
+    weights = module.LayerWeights(1, {"source": torch.zeros(1)})
+    preparations = []
+
+    class Owned:
+        def __init__(self, _layer, layer_weights, prepared_weights, samples, _backend):
+            self.weights = layer_weights
+            self.prepared = prepared_weights
+            self.static = [getattr(prepared_weights, name) for name in static_names]
+            self.static += [
+                tensor
+                for name in ("latent_down", "shared_up", "shared_down", "latent_up")
+                for tensor in (
+                    getattr(prepared_weights, name).weight,
+                    getattr(prepared_weights, name).scale,
+                )
+            ]
+            self.activation = torch.empty(samples, 2)
+            self.scratch = torch.empty(samples, 3)
+
+        def close(self):
+            pass
+
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(kv_cache_dtype="bf16")
+    runner._ops = {}
+    runner._weights = {}
+    runner._prepared = {}
+    runner._refused = set()
+    runner._announced = set()
+    layer = SimpleNamespace(layer_idx=3, is_linear_attn=True, block_sparse_moe=object())
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: weights)
+    monkeypatch.setattr(module, "prepare_kimi_k3_weights", lambda w: (preparations.append(w) or prepared))
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 8)
+    monkeypatch.setattr(module, "get_tp_group", lambda: SimpleNamespace(cpu_group=object(), device_group=object()))
+    monkeypatch.setattr(module, "tp_uniform_local_validation", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module.torch.cuda, "is_current_stream_capturing", lambda: False)
+
+    op4 = runner._op(layer, 4)
+    op8 = runner._op(layer, 8)
+
+    assert preparations == [weights]
+    assert validations == [weights]
+    assert op4.weights is op8.weights is weights
+    assert op4.prepared is op8.prepared is prepared
+    assert [x.data_ptr() for x in op4.static] == [x.data_ptr() for x in op8.static]
+    assert op4.activation.data_ptr() != op8.activation.data_ptr()
+    assert op4.scratch.data_ptr() != op8.scratch.data_ptr()
+    runner.close()
+    assert runner._prepared == {}
 
 
 def test_kimi_default_off_does_not_inspect_runtime_config():
@@ -847,6 +930,7 @@ def test_kimi_default_off_does_not_inspect_runtime_config():
     runner = KimiMonoDecode(None, object(), "off")
     assert runner._enabled is False
     assert runner._ops == {}
+    assert runner._prepared == {}
 
 
 @pytest.mark.parametrize("samples", (4, 8))

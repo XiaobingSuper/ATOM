@@ -20,6 +20,10 @@ from atom.model_ops.monokernel.k3.kernel import (
     build_kimi_k3_monokernel,
     monokernel_scratch_nbytes,
 )
+from atom.model_ops.monokernel.k3.prepared import (
+    KimiK3PreparedWeights,
+    MONOKERNEL_INPUT_ROWS,
+)
 from atom.model_ops.monokernel.packing import (
     pack_bf16,
     pack_mxfp4,
@@ -33,7 +37,6 @@ _TP_SIZE = 8
 _HEAD_DIM = 128
 _CONV_WIDTH = 4
 _INPUT_GEMM_ALIGNMENT = 32
-_MONOKERNEL_INPUT_ROWS = 6400
 _INPUT_GEMM_CONFIG = {
     "block_m": 16,
     "block_n": 32,
@@ -89,6 +92,7 @@ class KimiK3KdaAttention:
         single_launch_attention: bool = True,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        prepared_weights: KimiK3PreparedWeights | None = None,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -120,6 +124,9 @@ class KimiK3KdaAttention:
         self.mtp = mtp
         self.conv_state_layout = conv_state_layout
         self.local_projection = config.local_heads * _HEAD_DIM
+        if prepared_weights is not None:
+            prepared_weights.validate_source(weights)
+        self.prepared_weights = prepared_weights
 
         expected = {
             "w_kda_in",
@@ -165,13 +172,18 @@ class KimiK3KdaAttention:
             device=device,
         )
         self.fused_input = self.fused_input_storage[:, :fused_width]
-        self.w_kda_in_padded = torch.zeros(
-            padded_fused_width,
-            config.hidden,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
+        if prepared_weights is None:
+            self.w_kda_in_padded = torch.zeros(
+                padded_fused_width,
+                config.hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
+        else:
+            if prepared_weights.w_kda_in_padded.shape != (padded_fused_width, config.hidden):
+                raise ValueError("prepared KDA input weight has the wrong shape")
+            self.w_kda_in_padded = prepared_weights.w_kda_in_padded
         self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
@@ -195,11 +207,11 @@ class KimiK3KdaAttention:
         self.block_write_idx = -1
         self.fuse_moe = False
         self.moe_packed: dict[str, torch.Tensor] = {}
-        self.w_kda_in_packed = None
-        self.w_kda_o_packed = None
+        self.w_kda_in_packed = None if prepared_weights is None else prepared_weights.w_kda_in_packed
+        self.w_kda_o_packed = None if prepared_weights is None else prepared_weights.w_kda_o_packed
         if self.symmetric_allreduce is not None and single_launch_attention:
             monokernel_input = torch.zeros(
-                _MONOKERNEL_INPUT_ROWS,
+                MONOKERNEL_INPUT_ROWS,
                 config.hidden,
                 dtype=torch.bfloat16,
                 device=device,
@@ -239,7 +251,7 @@ class KimiK3KdaAttention:
         if self.w_kda_in_packed is None:
             fused_width = 4 * self.local_projection + self.config.local_heads + _HEAD_DIM
             monokernel_input = torch.zeros(
-                _MONOKERNEL_INPUT_ROWS,
+                MONOKERNEL_INPUT_ROWS,
                 self.config.hidden,
                 dtype=torch.bfloat16,
                 device=device,
@@ -248,23 +260,39 @@ class KimiK3KdaAttention:
             self.w_kda_in_packed = pack_bf16(monokernel_input)
             self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
         if fuse_moe:
-            latent_down, latent_down_scale = quantize_mxfp8(self.t["w_latent_down"])
-            shared_up, shared_up_scale = quantize_mxfp8(self.t["w_shared_ug"])
-            shared_down, shared_down_scale = quantize_mxfp8(self.t["w_shared_dn"])
-            latent_up, latent_up_scale = quantize_mxfp8(self.t["w_latent_up"])
-            self.moe_packed = {
-                "w_r": pack_bf16(self.t["w_r"]),
-                "w_latent_down": pack_mxfp8_weight(latent_down),
-                "s_latent_down": pack_mxfp8_scale(latent_down_scale),
-                "w_shared_ug": pack_mxfp8_weight(shared_up),
-                "s_shared_ug": pack_mxfp8_scale(shared_up_scale),
-                "w_ug": pack_mxfp4(self.t["w_ug"]),
-                "w_dn": pack_mxfp4(self.t["w_dn"]),
-                "w_shared_dn": pack_mxfp8_weight(shared_down),
-                "s_shared_dn": pack_mxfp8_scale(shared_down_scale),
-                "w_latent_up": pack_mxfp8_weight(latent_up),
-                "s_latent_up": pack_mxfp8_scale(latent_up_scale),
-            }
+            if self.prepared_weights is None:
+                latent_down, latent_down_scale = quantize_mxfp8(self.t["w_latent_down"])
+                shared_up, shared_up_scale = quantize_mxfp8(self.t["w_shared_ug"])
+                shared_down, shared_down_scale = quantize_mxfp8(self.t["w_shared_dn"])
+                latent_up, latent_up_scale = quantize_mxfp8(self.t["w_latent_up"])
+                self.moe_packed = {
+                    "w_r": pack_bf16(self.t["w_r"]),
+                    "w_latent_down": pack_mxfp8_weight(latent_down),
+                    "s_latent_down": pack_mxfp8_scale(latent_down_scale),
+                    "w_shared_ug": pack_mxfp8_weight(shared_up),
+                    "s_shared_ug": pack_mxfp8_scale(shared_up_scale),
+                    "w_ug": pack_mxfp4(self.t["w_ug"]),
+                    "w_dn": pack_mxfp4(self.t["w_dn"]),
+                    "w_shared_dn": pack_mxfp8_weight(shared_down),
+                    "s_shared_dn": pack_mxfp8_scale(shared_down_scale),
+                    "w_latent_up": pack_mxfp8_weight(latent_up),
+                    "s_latent_up": pack_mxfp8_scale(latent_up_scale),
+                }
+            else:
+                prepared = self.prepared_weights
+                self.moe_packed = {
+                    "w_r": prepared.w_router,
+                    "w_latent_down": prepared.latent_down.weight,
+                    "s_latent_down": prepared.latent_down.scale,
+                    "w_shared_ug": prepared.shared_up.weight,
+                    "s_shared_ug": prepared.shared_up.scale,
+                    "w_ug": prepared.w_ug,
+                    "w_dn": prepared.w_dn,
+                    "w_shared_dn": prepared.shared_down.weight,
+                    "s_shared_dn": prepared.shared_down.scale,
+                    "w_latent_up": prepared.latent_up.weight,
+                    "s_latent_up": prepared.latent_up.scale,
+                }
         self.monokernel_scratch = torch.zeros(
             monokernel_scratch_nbytes(
                 self.S,

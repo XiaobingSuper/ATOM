@@ -4,6 +4,7 @@
 """Reusable small-batch MXFP8 quantization and linear projection kernels."""
 
 import functools
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -15,6 +16,9 @@ from flydsl.expr.typing import Int64, ReductionOp, Stream, T
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from atom.model_ops.monokernel.ops import rsrc
 from atom.model_ops.monokernel.packing import pack_mxfp8_scale, pack_mxfp8_weight
+
+if TYPE_CHECKING:
+    from atom.model_ops.monokernel.k3.prepared import PreparedMxfp8Weight
 
 _GROUP = 32
 _QUANT_THREADS = 64
@@ -321,13 +325,40 @@ class Mxfp8Linear:
         self.rows = rows
         self.weight = pack_mxfp8_weight(weight)
         self.scale = pack_mxfp8_scale(scale)
+        self._allocate_runtime(rows, weight.device)
+
+    @classmethod
+    def from_prepared(cls, prepared: "PreparedMxfp8Weight", rows: int) -> "Mxfp8Linear":
+        expected_scale = ((prepared.rows + 255) // 256 * 256) * (prepared.cols // _GROUP)
+        if (
+            prepared.weight.dtype != torch.uint8
+            or prepared.weight.numel() != prepared.rows * prepared.cols
+            or not prepared.weight.is_contiguous()
+        ):
+            raise ValueError("prepared MXFP8 weight has the wrong storage")
+        if (
+            prepared.scale.dtype != torch.uint8
+            or prepared.scale.numel() != expected_scale
+            or not prepared.scale.is_contiguous()
+        ):
+            raise ValueError("prepared MXFP8 scale has the wrong storage")
+        result = cls.__new__(cls)
+        result.n = prepared.rows
+        result.k = prepared.cols
+        result.rows = rows
+        result.weight = prepared.weight
+        result.scale = prepared.scale
+        result._allocate_runtime(rows, prepared.weight.device)
+        return result
+
+    def _allocate_runtime(self, rows: int, device: torch.device) -> None:
         padded_rows = (rows + 31) // 32 * 32
         self.padded_rows = padded_rows
-        self.activation = torch.zeros((padded_rows, self.k), dtype=torch.uint8, device=weight.device)
+        self.activation = torch.zeros((padded_rows, self.k), dtype=torch.uint8, device=device)
         self.activation_scale = torch.zeros(
             padded_rows * (self.k // _GROUP),
             dtype=torch.uint8,
-            device=weight.device,
+            device=device,
         )
         self.quantize = build_mxfp8_quantize(rows, self.k)
         self.project = build_mxfp8_project(rows, self.n, self.k)

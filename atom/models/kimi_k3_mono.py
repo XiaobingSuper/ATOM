@@ -25,6 +25,10 @@ from atom.model_ops.monokernel.dispatch import (
     select_backend,
     tp_uniform_local_validation,
 )
+from atom.model_ops.monokernel.k3.prepared import (
+    KimiK3PreparedWeights,
+    prepare_kimi_k3_weights,
+)
 from atom.model_ops.monokernel.weights import (
     LayerWeights,
     atom_mxfp4_storage_view,
@@ -175,7 +179,14 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
 
 
 class _KimiLayerOp:
-    def __init__(self, layer, weights: LayerWeights, samples: int, mode: str) -> None:
+    def __init__(
+        self,
+        layer,
+        weights: LayerWeights,
+        prepared_weights: KimiK3PreparedWeights,
+        samples: int,
+        mode: str,
+    ) -> None:
         from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
         from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
 
@@ -193,6 +204,7 @@ class _KimiLayerOp:
             reduce_group=tp.device_group,
             mtp=False,
             conv_state_layout=ConvStateLayout.TIME_MAJOR,
+            prepared_weights=prepared_weights,
         )
 
     def close(self) -> None:
@@ -208,6 +220,7 @@ class KimiMonoDecode:
         self._mode = mode
         self._ops: dict[tuple[int, int, str], _KimiLayerOp] = {}
         self._weights: dict[int, LayerWeights] = {}
+        self._prepared: dict[int, KimiK3PreparedWeights] = {}
         self._refused: set[tuple[int, int, str]] = set()
         self._announced: set[tuple[str, int]] = set()
         self._enabled = mode != "off"
@@ -299,7 +312,24 @@ class KimiMonoDecode:
                 )
                 assert weights is not None
                 self._weights[layer.layer_idx] = weights
-                self._ops[key] = _KimiLayerOp(layer, weights, samples, backend)
+                prepared = self._prepared.get(layer.layer_idx)
+                preparation_error = None
+                if prepared is None:
+                    try:
+                        prepared = prepare_kimi_k3_weights(weights)
+                    except (MonoUnsupported, ValueError) as error:
+                        preparation_error = error
+                    tp_uniform_local_validation(
+                        preparation_error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=f"layer {layer.layer_idx} weight preparation failed",
+                    )
+                    assert prepared is not None
+                    self._prepared[layer.layer_idx] = prepared
+                else:
+                    prepared.validate_source(weights)
+                self._ops[key] = _KimiLayerOp(layer, weights, prepared, samples, backend)
                 announcement = (backend, samples)
                 if rank == 0 and announcement not in self._announced:
                     logger.info("Kimi-K3 MonoKernel on: backend=%s S=%d", backend, samples)
@@ -366,6 +396,7 @@ class KimiMonoDecode:
         for owned in self._ops.values():
             owned.close()
         self._ops.clear()
+        self._prepared.clear()
         self._weights.clear()
         self._refused.clear()
         self._announced.clear()

@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 
 from atom.model_ops.monokernel.config import ConvStateLayout
+from atom.model_ops.monokernel.k3.prepared import KimiK3PreparedWeights
 from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
 from atom.model_ops.monokernel.weights import LayerWeights
 
@@ -27,6 +28,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         reduce_group=None,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        prepared_weights: KimiK3PreparedWeights | None = None,
     ) -> None:
         super().__init__(
             weights,
@@ -42,6 +44,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             reduce_backend="symmetric",
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            prepared_weights=prepared_weights,
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)
 
