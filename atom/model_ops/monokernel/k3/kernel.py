@@ -207,6 +207,7 @@ def build_kimi_k3_monokernel(
     fuse_moe: bool = False,
     mtp: bool = False,
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+    atom_expert_layout: bool = False,
 ):
     """Build the fixed-shape single-launch Kimi-K3 decode MonoKernel."""
 
@@ -241,6 +242,18 @@ def build_kimi_k3_monokernel(
     input_split_waves = _WAVES // input_row_groups
     input_row_tile = input_row_groups * 16
     input_row_tasks = _FUSED_PAD // input_row_tile
+    up_scale_groups = (
+        (_ROUTED_HIDDEN // 32 + 7) // 8 * 8
+        if atom_expert_layout
+        else _ROUTED_HIDDEN // 32
+    )
+    down_scale_groups = (
+        (_INTER // 32 + 7) // 8 * 8
+        if atom_expert_layout
+        else _INTER // 32
+    )
+    up_expert_scale_bytes = 2 * _INTER * up_scale_groups
+    down_expert_scale_bytes = _ROUTED_HIDDEN * down_scale_groups
 
     pre_mailbox_offset = 0
     pre_ready_offset = samples * _HIDDEN * 2 if fuse_attn_res else 0
@@ -1400,6 +1413,56 @@ def build_kimi_k3_monokernel(
                     lds_store(x, pair, packed.bitcast(fx.Float32))
 
         def mxfp4_fragment(weight_rsrc, scale_rsrc, row_group, k_chunk, k_size):
+            if const_expr(atom_expert_layout):
+                # Read ATOM/AITER's preshuffled 16-row weights and
+                # 32-row-by-8-group E8M0 scales without repacking checkpoints.
+                row_in_group = lane % 16
+                lane_word = lane // 16
+                row = row_group * 16 + row_in_group
+                raw_values = []
+                scale_values = []
+                padded_groups = ((k_size // 32 + 7) // 8) * 8
+                for step in range_constexpr(4):
+                    group = k_chunk * 4 + step
+                    k64 = group // 2
+                    half = group % 2
+                    weight_offset = (
+                        (((row_group * (k_size // 64) + k64) * 2 + half) * 16 + row_in_group) * 4
+                        + lane_word
+                    )
+                    raw_values.append(
+                        fx.Int32(
+                            bo.buffer_load(
+                                weight_rsrc,
+                                weight_offset,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                    )
+                    scale_offset = (
+                        ((row // 32) * (padded_groups // 8) + group // 8) * 256
+                        + (group % 4) * 64
+                        + (row % 16) * 4
+                        + ((group % 8) // 4) * 2
+                        + (row % 32) // 16
+                    )
+                    scale_values.append(
+                        fx.Int32(
+                            bo.buffer_load(
+                                scale_rsrc,
+                                scale_offset,
+                                vec_width=1,
+                                dtype=T.i8,
+                            )
+                        )
+                    )
+                raw = fx.Vector.from_elements(raw_values, fx.Int32)
+                scales = [
+                    ((value & fx.Int32(0xFF)) << fx.Int32(23)).bitcast(fx.Float32)
+                    for value in scale_values
+                ]
+                return raw, scales
             raw = fx.Vector(
                 bo.buffer_load(
                     weight_rsrc,
@@ -3032,9 +3095,14 @@ def build_kimi_k3_monokernel(
                 route = sample * _TOP_K + route_in_sample
                 expert = uniform(load_i32(selection_id_rsrc, route))
                 expert_weight_bytes = 2 * _INTER * (_ROUTED_HIDDEN // 2)
-                expert_scale_bytes = 2 * _INTER * (_ROUTED_HIDDEN // 32)
-                up_weight_rsrc = rsrc(packed_expert_up + fx.Int64(expert) * fx.Int64(expert_weight_bytes))
-                up_scale_rsrc = rsrc(expert_up_scale + fx.Int64(expert) * fx.Int64(expert_scale_bytes))
+                up_weight_rsrc = rsrc(
+                    packed_expert_up
+                    + fx.Int64(expert) * fx.Int64(expert_weight_bytes)
+                )
+                up_scale_rsrc = rsrc(
+                    expert_up_scale
+                    + fx.Int64(expert) * fx.Int64(up_expert_scale_bytes)
+                )
                 stage_raw_vector(
                     latent_mailbox_rsrc,
                     latent_ready_rsrc,
@@ -3140,9 +3208,14 @@ def build_kimi_k3_monokernel(
                     expert = uniform(load_i32(selection_id_rsrc, route))
                     route_weight = uniform_f32(load_f32(selection_weight_rsrc, route))
                     expert_weight_bytes = _ROUTED_HIDDEN * (_INTER // 2)
-                    expert_scale_bytes = _ROUTED_HIDDEN * (_INTER // 32)
-                    down_weight_rsrc = rsrc(packed_expert_down + fx.Int64(expert) * fx.Int64(expert_weight_bytes))
-                    down_scale_rsrc = rsrc(expert_down_scale + fx.Int64(expert) * fx.Int64(expert_scale_bytes))
+                    down_weight_rsrc = rsrc(
+                        packed_expert_down
+                        + fx.Int64(expert) * fx.Int64(expert_weight_bytes)
+                    )
+                    down_scale_rsrc = rsrc(
+                        expert_down_scale
+                        + fx.Int64(expert) * fx.Int64(down_expert_scale_bytes)
+                    )
                     route_accumulator = [fx.Float32(0.0) for _ in range(4)]
                     for k_chunk in range_constexpr(_INTER // 128):
                         fragment = mxfp4_fragment(
@@ -3475,4 +3548,11 @@ def build_kimi_k3_monokernel(
             layer,
         ).launch(grid=(_BLOCKS,), block=(_THREADS,), stream=stream)
 
+    block_tag = f"m{-attn_res_blocks}" if attn_res_blocks < 0 else str(attn_res_blocks)
+    write_tag = f"m{-block_write_idx}" if block_write_idx < 0 else str(block_write_idx)
+    launch.func.__name__ = (
+        f"kimi_k3_monokernel_s{samples}_p{npes}_l{launches_per_step}"
+        f"_b{block_tag}_w{write_tag}_f{int(fuse_moe)}_m{int(mtp)}"
+        f"_c{conv_state_layout.value}_a{int(atom_expert_layout)}"
+    )
     return launch

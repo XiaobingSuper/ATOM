@@ -265,6 +265,71 @@ def test_bundled_aiter_compatibility_imports():
     import atom.model_ops.monokernel.k3.staged  # noqa: F401
 
 
+def test_kimi_attn_res_compile_cache_preserves_delta_specialization():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available():
+        pytest.skip("Kimi-K3 AttnRes requires a visible ROCm device")
+
+    from atom.model_ops.monokernel.k3.attn_res import KimiK3AttnRes
+
+    samples, hidden = 1, 7168
+    prefix = torch.randn(samples, hidden, dtype=torch.bfloat16, device="cuda")
+    delta = torch.randn_like(prefix)
+    blocks = torch.randn(samples, 1, hidden, dtype=torch.bfloat16, device="cuda")
+    weight = torch.ones(hidden, dtype=torch.bfloat16, device="cuda")
+    updated = torch.empty_like(prefix)
+    output = torch.empty_like(prefix)
+
+    KimiK3AttnRes(samples, hidden, 1, False, -1)(
+        prefix,
+        delta,
+        blocks,
+        weight,
+        weight,
+        weight,
+        updated,
+        output,
+    )
+    KimiK3AttnRes(samples, hidden, 1, True, -1)(
+        prefix,
+        delta,
+        blocks,
+        weight,
+        weight,
+        weight,
+        updated,
+        output,
+    )
+    torch.cuda.synchronize()
+
+    expected = (prefix.float() + delta.float()).to(torch.bfloat16)
+    assert torch.equal(updated, expected)
+
+
+def test_kimi_monokernel_compile_cache_keys_layer_geometry():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available():
+        pytest.skip("Kimi-K3 MonoKernel requires a visible ROCm device")
+
+    from atom.model_ops.monokernel.k3.kernel import build_kimi_k3_monokernel
+
+    launches = (
+        build_kimi_k3_monokernel(4, attn_res_blocks=1, fuse_moe=True),
+        build_kimi_k3_monokernel(4, attn_res_blocks=2, fuse_moe=True),
+        build_kimi_k3_monokernel(8, attn_res_blocks=1, fuse_moe=True),
+        build_kimi_k3_monokernel(
+            4,
+            attn_res_blocks=1,
+            fuse_moe=True,
+            atom_expert_layout=True,
+        ),
+    )
+
+    assert len({launch.func.__name__ for launch in launches}) == len(launches)
+
+
 def test_scaled_mfma_uses_flydsl_v0341_operand_abi():
     root = Path(__file__).parents[1] / "atom" / "model_ops" / "monokernel"
     paths = (

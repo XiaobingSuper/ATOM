@@ -11,6 +11,8 @@ from atom.model_ops.monokernel.config import (
     KIMI_K3_CONFIG,
     MAX_LAYERS_PER_STEP,
     ConvStateLayout,
+    Mxfp4ScaleLayout,
+    Mxfp4WeightLayout,
     conv_state_shape,
 )
 from atom.model_ops.monokernel.formats import quantize_mxfp8
@@ -126,6 +128,13 @@ class KimiK3KdaAttention:
         self.mtp = mtp
         self.conv_state_layout = conv_state_layout
         self.state_dtype = state_dtype
+        atom_weight_layout = weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+        atom_scale_layout = weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+        if atom_weight_layout != atom_scale_layout:
+            raise ValueError(
+                "the Kimi-K3 MonoKernel requires matching MXFP4 weight and scale layouts"
+            )
+        self.atom_expert_layout = atom_weight_layout
         self.local_projection = config.local_heads * _HEAD_DIM
 
         expected = {
@@ -235,6 +244,7 @@ class KimiK3KdaAttention:
                 launches_per_step,
                 mtp=mtp,
                 conv_state_layout=conv_state_layout,
+                atom_expert_layout=self.atom_expert_layout,
             )
         elif mtp:
             raise ValueError("Kimi-K3 MTP currently requires FP32 state")
@@ -305,6 +315,7 @@ class KimiK3KdaAttention:
             fuse_moe,
             self.mtp,
             conv_state_layout=self.conv_state_layout,
+            atom_expert_layout=self.atom_expert_layout,
         )
 
     def forward(
