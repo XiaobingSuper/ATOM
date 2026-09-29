@@ -386,6 +386,42 @@ def test_kimi_adapter_constructs_time_major_ops(monkeypatch, mode):
     assert captured[0]["moe_symmetric_allreduce"] is moe_reduce
 
 
+def test_kimi_mono_accepts_shared_reduction_dependencies():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "k3"
+        / "op.py"
+    ).read_text()
+    tree = ast.parse(source)
+    kernel = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "KimiK3MonoKernel"
+    )
+    init = next(
+        node
+        for node in kernel.body
+        if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+    )
+    dependencies = {
+        "attention_symmetric_allreduce",
+        "moe_symmetric_allreduce",
+    }
+    parameters = {argument.arg for argument in init.args.args + init.args.kwonlyargs}
+    forwarded = {
+        keyword.arg
+        for node in ast.walk(init)
+        if isinstance(node, ast.Call)
+        for keyword in node.keywords
+    }
+
+    assert dependencies <= parameters
+    assert dependencies <= forwarded
+
+
 def test_model_specific_backend_selection():
     common = dict(samples=8, tp_size=8, kv_cache_dtype="fp8")
     assert select_backend("glm52", "auto", **common) is None
@@ -769,7 +805,7 @@ def test_shared_linear_scale_unshuffle_round_trip():
     assert torch.equal(pack_a16w4_scale(restored), shuffled.reshape(-1))
 
 
-def test_kimi_runner_close_is_idempotent():
+def test_kimi_runner_closes_shared_reductions_once():
     KimiMonoDecode = _kimi_mono_module().KimiMonoDecode
 
     class Owned:
@@ -780,12 +816,45 @@ def test_kimi_runner_close_is_idempotent():
             self.calls += 1
 
     runner = object.__new__(KimiMonoDecode)
-    owned = Owned()
-    runner._ops = {(1, 4, "staged"): owned}
+    attention_reduce = Owned()
+    moe_reduce = Owned()
+    runner._ops = {(1, 4, "staged"): object()}
+    runner._weights = {}
+    runner._reductions = {
+        (4, "staged"): (attention_reduce, moe_reduce),
+    }
     runner._refused = set()
+
     runner.close()
     runner.close()
-    assert owned.calls == 1
+
+    assert attention_reduce.calls == 1
+    assert moe_reduce.calls == 1
+
+
+def test_kimi_failed_prepare_preserves_existing_shared_reductions():
+    KimiMonoDecode = _kimi_mono_module().KimiMonoDecode
+
+    class Owned:
+        def __init__(self):
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+
+    runner = object.__new__(KimiMonoDecode)
+    existing = (Owned(), Owned())
+    created = (Owned(), Owned())
+    runner._reductions = {
+        (4, "staged"): existing,
+        (8, "staged"): created,
+    }
+
+    runner._close_reductions([(8, "staged")])
+
+    assert [owned.calls for owned in existing] == [0, 0]
+    assert [owned.calls for owned in created] == [1, 1]
+    assert runner._reductions == {(4, "staged"): existing}
 
 
 def test_kimi_memory_reserve_tracks_persistent_packed_artifacts():
@@ -1183,6 +1252,28 @@ def test_close_model_monokernels_is_deduplicated_and_idempotent():
     owned.memory_reserve_bytes = lambda: 123
     glm_owned.memory_reserve_bytes = lambda: 456
     assert model_monokernel_memory_reserve(model) == 579
+
+
+def test_close_model_monokernels_retries_failed_close():
+    from atom.model_ops.monokernel import close_model_monokernels
+
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        def close(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("close failed")
+
+    owned = Flaky()
+    model = SimpleNamespace(modules=lambda: [SimpleNamespace(_mono=owned)])
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        close_model_monokernels(model)
+    close_model_monokernels(model)
+
+    assert owned.calls == 2
 
 
 def test_model_runner_closes_monokernels_before_distributed_teardown():

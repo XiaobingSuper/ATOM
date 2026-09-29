@@ -13,6 +13,20 @@ from weakref import WeakSet
 _closed_model_monokernels: WeakSet = WeakSet()
 
 
+def _model_monokernel_closed(owned: object) -> bool:
+    try:
+        return owned in _closed_model_monokernels
+    except TypeError:
+        return bool(getattr(owned, "_atom_monokernel_closed", False))
+
+
+def _mark_model_monokernel_closed(owned: object) -> None:
+    try:
+        _closed_model_monokernels.add(owned)
+    except TypeError:
+        setattr(owned, "_atom_monokernel_closed", True)
+
+
 def _owned_model_monokernels(model):
     modules = model.modules() if callable(getattr(model, "modules", None)) else (model,)
     seen: set[int] = set()
@@ -40,17 +54,12 @@ def close_model_monokernels(model) -> None:
     """Close each model-owned native runner once before distributed teardown."""
 
     for owned in _owned_model_monokernels(model):
-        try:
-            if owned in _closed_model_monokernels:
-                continue
-            _closed_model_monokernels.add(owned)
-        except TypeError:
-            if getattr(owned, "_atom_monokernel_closed", False):
-                continue
-            setattr(owned, "_atom_monokernel_closed", True)
+        if _model_monokernel_closed(owned):
+            continue
         close = getattr(owned, "close", None)
         if callable(close):
             close()
+        _mark_model_monokernel_closed(owned)
 
 
 __all__ = ["close_model_monokernels", "model_monokernel_memory_reserve"]

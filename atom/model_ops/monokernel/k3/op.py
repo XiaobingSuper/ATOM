@@ -9,6 +9,7 @@ import torch
 
 from atom.model_ops.monokernel.config import ConvStateLayout
 from atom.model_ops.monokernel.k3.staged import _KimiK3KdaStagedPath
+from atom.model_ops.monokernel.symmetric_allreduce import SymmetricBf16Allreduce
 from atom.model_ops.monokernel.weights import LayerWeights
 
 
@@ -27,6 +28,8 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         reduce_group=None,
         mtp: bool = False,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
+        attention_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
+        moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
     ) -> None:
         if state_dtype is not torch.float32:
@@ -45,6 +48,8 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             reduce_backend="symmetric",
             mtp=mtp,
             conv_state_layout=conv_state_layout,
+            attention_symmetric_allreduce=attention_symmetric_allreduce,
+            moe_symmetric_allreduce=moe_symmetric_allreduce,
             state_dtype=state_dtype,
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)

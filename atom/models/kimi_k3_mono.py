@@ -245,9 +245,6 @@ class _KimiLayerOp:
             state_dtype=state_dtype,
         )
 
-    def close(self) -> None:
-        self.op.close()
-
 
 class KimiMonoDecode:
     """Run eligible KDA+MoE layers natively and preserve every fallback layer."""
@@ -291,6 +288,22 @@ class KimiMonoDecode:
     def _fallback(self, reason: str, samples: int) -> bool:
         self._route_stats().record_fallback(reason, samples)
         return False
+
+    def _close_reductions(self, keys=None) -> None:
+        """Close adapter-owned shared reductions in collective order."""
+
+        keys = tuple(self._reductions) if keys is None else tuple(keys)
+        closed: set[int] = set()
+        for key in keys:
+            reductions = self._reductions.get(key)
+            if reductions is None:
+                continue
+            for reduction in reversed(reductions):
+                if reduction is None or id(reduction) in closed:
+                    continue
+                reduction.close()
+                closed.add(id(reduction))
+            self._reductions.pop(key)
 
     def memory_reserve_bytes(self) -> int:
         """Reserve KV-budget headroom for lazy S4/S8 packed layer artifacts."""
@@ -420,6 +433,7 @@ class KimiMonoDecode:
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
         made = []
+        created_reduction_keys = []
         try:
             for layer, backend, key in specs:
                 if key in self._ops:
@@ -467,20 +481,22 @@ class KimiMonoDecode:
                 )
                 assert owned is not None
                 self._ops[key] = owned
+                made.append(key)
                 if reduction_key not in self._reductions:
                     op = owned.op
                     self._reductions[reduction_key] = (
                         op.attention.symmetric_allreduce,
                         op.symmetric_allreduce,
                     )
+                    created_reduction_keys.append(reduction_key)
                 owned.op.release_packed_sources()
                 self._weights.pop(layer.layer_idx, None)
-                made.append(key)
         except (AttributeError, MonoUnsupported, RuntimeError, ValueError) as error:
             for key in reversed(made):
-                self._ops.pop(key).close()
-            for _, backend, _ in specs:
-                self._reductions.pop((samples, backend), None)
+                self._ops.pop(key)
+            self._close_reductions(reversed(created_reduction_keys))
+            for layer, _, _ in specs:
+                self._weights.pop(layer.layer_idx, None)
             self._refused.update(key for _, _, key in specs)
             logger.warning("Kimi-K3 MonoKernel fallback before launch: %s", error)
             return False
@@ -574,9 +590,7 @@ class KimiMonoDecode:
         return hidden
 
     def close(self) -> None:
-        for owned in self._ops.values():
-            owned.close()
+        self._close_reductions()
         self._ops.clear()
-        getattr(self, "_weights", {}).clear()
-        getattr(self, "_reductions", {}).clear()
+        self._weights.clear()
         self._refused.clear()
