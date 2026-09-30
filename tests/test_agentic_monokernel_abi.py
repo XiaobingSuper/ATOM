@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: MIT
 
+from types import SimpleNamespace
+
 import pytest
 
 
@@ -20,6 +22,36 @@ def test_agentic_shape_separates_batch_query_and_flattened_rows():
     assert shape.row_to_request(14) == 2
     assert shape.row_to_query(14) == 4
     assert not shape.is_active_row(15)
+
+
+def test_agentic_shape_preserves_ragged_runtime_row_count():
+    from atom.model_ops.monokernel.abi import AgenticDecodeShape
+
+    shape = AgenticDecodeShape(
+        running_bs=3,
+        query_len=5,
+        running_rows=12,
+        batch_capacity=4,
+        row_capacity=20,
+        tile_rows=8,
+    )
+
+    assert shape.actual_rows == 12
+    assert not shape.is_active_row(12)
+    with pytest.raises(ValueError, match="cu_q"):
+        shape.row_to_request(11)
+
+
+def test_agentic_shape_consumes_forward_mode_without_rederiving_rows():
+    from atom.model_ops.monokernel.abi import AgenticDecodeShape
+
+    shape = AgenticDecodeShape.from_forward_mode(
+        SimpleNamespace(running_bs=3, running_tokens=12, max_seqlen_q=5),
+        batch_capacity=4,
+        row_capacity=20,
+    )
+
+    assert shape.actual_rows == 12
 
 
 def test_non_owner_query_is_active_but_cannot_write_or_contribute_locally():
@@ -56,6 +88,23 @@ def test_padding_row_is_inactive_even_with_safe_dummy_sparse_slot():
     assert not row.cache_writer
     assert not row.local_sparse_active
     assert row.safe_sparse_row == 120
+
+
+def test_active_new_request_can_write_cache_with_zero_prior_context():
+    from atom.model_ops.monokernel.abi import classify_decode_row
+
+    row = classify_decode_row(
+        batch_id=0,
+        context_len=0,
+        slot=42,
+        sparse_begin=0,
+        sparse_end=0,
+        owned_count=0,
+    )
+
+    assert row.query_active
+    assert row.cache_writer
+    assert not row.local_sparse_active
 
 
 @pytest.mark.parametrize(

@@ -16,6 +16,7 @@ class AgenticDecodeShape:
     query_len: int
     batch_capacity: int
     row_capacity: int
+    running_rows: int | None = None
     tile_rows: int = 8
 
     def __post_init__(self) -> None:
@@ -25,10 +26,16 @@ class AgenticDecodeShape:
             raise ValueError("batch capacity is smaller than the running batch")
         if self.row_capacity < self.batch_capacity * self.query_len:
             raise ValueError("row capacity is smaller than batch_capacity * query_len")
+        if not self.running_bs <= self.actual_rows <= self.running_bs * self.query_len:
+            raise ValueError("running rows must fit the per-request query capacity")
 
     @property
     def actual_rows(self) -> int:
-        return self.running_bs * self.query_len
+        return (
+            self.running_bs * self.query_len
+            if self.running_rows is None
+            else self.running_rows
+        )
 
     @property
     def tiles(self) -> int:
@@ -44,12 +51,34 @@ class AgenticDecodeShape:
     def row_to_request(self, row: int) -> int:
         if not self.is_active_row(row):
             raise ValueError(f"inactive row {row}")
+        if self.actual_rows != self.running_bs * self.query_len:
+            raise ValueError("ragged rows require the runtime cu_q mapping")
         return row // self.query_len
 
     def row_to_query(self, row: int) -> int:
         if not self.is_active_row(row):
             raise ValueError(f"inactive row {row}")
+        if self.actual_rows != self.running_bs * self.query_len:
+            raise ValueError("ragged rows require the runtime cu_q mapping")
         return row % self.query_len
+
+    @classmethod
+    def from_forward_mode(
+        cls,
+        mode,
+        *,
+        batch_capacity: int,
+        row_capacity: int,
+        tile_rows: int = 8,
+    ) -> "AgenticDecodeShape":
+        return cls(
+            running_bs=mode.running_bs,
+            query_len=mode.max_seqlen_q,
+            running_rows=mode.running_tokens,
+            batch_capacity=batch_capacity,
+            row_capacity=row_capacity,
+            tile_rows=tile_rows,
+        )
 
 
 @dataclass(frozen=True)
@@ -73,9 +102,14 @@ def classify_decode_row(
 ) -> DecodeRowContract:
     """Reference the device-side row predicates used by both model kernels."""
 
-    if sparse_begin < 0 or sparse_end < sparse_begin or owned_count < 0:
+    if (
+        context_len < 0
+        or sparse_begin < 0
+        or sparse_end < sparse_begin
+        or owned_count < 0
+    ):
         raise ValueError("invalid sparse row metadata")
-    query_active = batch_id >= 0 and context_len > 0
+    query_active = batch_id >= 0
     return DecodeRowContract(
         query_active=query_active,
         cache_writer=query_active and slot >= 0,

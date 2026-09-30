@@ -15,6 +15,7 @@ from aiter.dist.parallel_state import (
 )
 
 from atom.model_ops.layernorm import rmsnorm2d_fwd_
+from atom.model_ops.monokernel.abi import AgenticDecodeShape
 from atom.model_ops.monokernel.config import (
     EPS,
     GLM5_CONFIG,
@@ -513,6 +514,20 @@ class Glm52MonoDecode:
         rows = hidden_states.shape[0]
         fwd = get_forward_context()
         context = fwd.context
+        shape = None
+        has_agentic_shape = context is not None and hasattr(context, "running_bs")
+        if has_agentic_shape:
+            try:
+                shape = AgenticDecodeShape.from_forward_mode(
+                    context,
+                    batch_capacity=context.running_bs,
+                    row_capacity=max(
+                        rows,
+                        context.running_bs * context.max_seqlen_q,
+                    ),
+                )
+            except ValueError:
+                shape = None
         backend = select_backend(
             "glm52",
             self._mode,
@@ -528,6 +543,8 @@ class Glm52MonoDecode:
         if (
             backend != "staged_moe"
             or context is None
+            or (has_agentic_shape and shape is None)
+            or (shape is not None and shape.actual_rows != rows)
             or context.is_prefill
             or fwd.ubatch_slices is not None
             or hidden_states.ndim != 2

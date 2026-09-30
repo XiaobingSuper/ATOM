@@ -20,6 +20,7 @@ from atom.model_ops.monokernel.config import (
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
 )
+from atom.model_ops.monokernel.abi import AgenticDecodeShape
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
     select_backend,
@@ -358,6 +359,21 @@ class KimiMonoDecode:
         fwd = get_forward_context()
         if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
             return self._fallback("forward_mode", samples)
+        shape = None
+        if hasattr(fwd.context, "running_bs"):
+            try:
+                shape = AgenticDecodeShape.from_forward_mode(
+                    fwd.context,
+                    batch_capacity=fwd.context.running_bs,
+                    row_capacity=max(
+                        samples,
+                        fwd.context.running_bs * fwd.context.max_seqlen_q,
+                    ),
+                )
+            except ValueError:
+                return self._fallback("agentic_shape", samples)
+            if shape.query_len != 1 or shape.actual_rows > samples:
+                return self._fallback("agentic_shape", samples)
         md = getattr(fwd.attn_metadata, "kda_metadata", None)
         if md is None:
             md = getattr(fwd.attn_metadata, "gdn_metadata", None)
