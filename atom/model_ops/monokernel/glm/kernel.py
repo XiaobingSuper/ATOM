@@ -158,6 +158,7 @@ def build_glm5_monokernel(
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     uv_scale_block_m: int = 128,
+    agentic_row_contract: bool = False,
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
 ):
@@ -263,6 +264,8 @@ def build_glm5_monokernel(
         positions: Int64,
         slot_mapping: Int64,
         sparse_kv_indptr: Int64,
+        batch_ids: Int64,
+        owned_counts: Int64,
         kv_cache: Int64,
         pe_cache: Int64,
         indices: Int64,
@@ -341,6 +344,32 @@ def build_glm5_monokernel(
 
         def row_active(s):
             if const_expr(use_atom_kv_cache):
+                if const_expr(agentic_row_contract):
+                    batch_id = _uniform(
+                        bo.buffer_load(
+                            _rsrc(batch_ids),
+                            s,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    return batch_id >= 0
+                begin, end = row_index_bounds(s)
+                return end > begin
+            return True
+
+        def row_local_sparse_active(s):
+            if const_expr(use_atom_kv_cache):
+                if const_expr(agentic_row_contract):
+                    count = _uniform(
+                        bo.buffer_load(
+                            _rsrc(owned_counts),
+                            s,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    return row_active(s) & (count > 0)
                 begin, end = row_index_bounds(s)
                 return end > begin
             return True
@@ -1620,7 +1649,9 @@ def build_glm5_monokernel(
         def patch_new_kv():
             """Rows appended by this launch come from the cache task's kvnew / penew pairs."""
             if const_expr(use_atom_kv_cache):
-                new_active = [row_active(new_s) for new_s in range(S)]
+                new_active = [
+                    row_local_sparse_active(new_s) for new_s in range(S)
+                ]
                 new_slots = [row_slot(new_s) for new_s in range(S)]
             for jj in range_constexpr(KPW):
                 j = wave * KPW + jj
@@ -2562,6 +2593,8 @@ def build_glm5_monokernel(
         positions: Int64,
         slot_mapping: Int64,
         sparse_kv_indptr: Int64,
+        batch_ids: Int64,
+        owned_counts: Int64,
         kv_cache: Int64,
         pe_cache: Int64,
         indices: Int64,
@@ -2603,6 +2636,8 @@ def build_glm5_monokernel(
             positions,
             slot_mapping,
             sparse_kv_indptr,
+            batch_ids,
+            owned_counts,
             kv_cache,
             pe_cache,
             indices,

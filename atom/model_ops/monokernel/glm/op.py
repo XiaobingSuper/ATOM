@@ -70,6 +70,7 @@ class Glm5MonoKernel:
         attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         uv_scale_block_m: int = 128,
+        agentic_row_contract: bool = False,
         timeline=False,
     ):
         if W.config != GLM5_CONFIG:
@@ -83,6 +84,7 @@ class Glm5MonoKernel:
         self.index_max_seq = index_max_seq
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
+        self.agentic_row_contract = agentic_row_contract
         t = W.t
         self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
         moe_mode = MoeMode.A16W4 if self.expert_mxfp4 else MoeMode.W8A8
@@ -168,6 +170,7 @@ class Glm5MonoKernel:
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
             uv_scale_block_m=uv_scale_block_m,
+            agentic_row_contract=agentic_row_contract,
             timeline=timeline,
         )
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
@@ -203,6 +206,8 @@ class Glm5MonoKernel:
         positions=None,
         slot_mapping=None,
         sparse_kv_indptr=None,
+        batch_ids=None,
+        owned_counts=None,
     ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -234,6 +239,22 @@ class Glm5MonoKernel:
                 if value is None or value.dtype is not dtype or value.numel() < size or not value.is_contiguous():
                     got = None if value is None else (tuple(value.shape), value.dtype)
                     raise ValueError(f"{name} must be contiguous {dtype} with at least {size} values, got {got}")
+            if self.agentic_row_contract:
+                for name, value in (
+                    ("batch_ids", batch_ids),
+                    ("owned_counts", owned_counts),
+                ):
+                    if (
+                        value is None
+                        or value.dtype is not torch.int32
+                        or value.numel() < self.S
+                        or not value.is_contiguous()
+                    ):
+                        got = None if value is None else (tuple(value.shape), value.dtype)
+                        raise ValueError(
+                            f"{name} must be contiguous int32 with at least "
+                            f"{self.S} values, got {got}"
+                        )
         t = dict(self.W.t, **self.packed)
         if x_out is None:
             x_out = torch.empty(self.S, HIDDEN, dtype=torch.bfloat16, device=h.device)
@@ -245,6 +266,8 @@ class Glm5MonoKernel:
             p(cur_pos if positions is None else positions),
             p(cur_pos if slot_mapping is None else slot_mapping),
             p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr),
+            p(cur_pos if batch_ids is None else batch_ids),
+            p(cur_pos if owned_counts is None else owned_counts),
             p(kv_cache),
             p(pe_cache),
             p(index_cache) if self.with_indexer else p(indices),
