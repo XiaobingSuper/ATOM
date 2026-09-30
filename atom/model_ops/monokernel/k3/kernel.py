@@ -118,6 +118,7 @@ def monokernel_layout(
         "norm": 0,
         "norm_packed": 0,
         "attention": 0,
+        "mtp_state_handoff": 0,
     }
     offset = 0
     if fuse_attn_res:
@@ -178,6 +179,8 @@ def monokernel_layout(
         offset += samples * _HEADS * 8
         offsets["mtp_state_ready"] = offset
         offset += samples * _HEADS * mtp_splits * 8
+        offsets["mtp_state_handoff"] = offset
+        offset += (samples // 8) * _HEADS * _HEAD_DIM * _HEAD_DIM * 4
         offsets["mtp_norm_ready"] = offset
         offset += samples * _HEADS * 8
     offsets["_bytes"] = offset
@@ -318,6 +321,7 @@ def build_kimi_k3_monokernel(
     mtp_qkvg_offset = layout.get("mtp_qkvg", 0)
     mtp_conv_ready_offset = layout.get("mtp_conv_ready", 0)
     mtp_state_ready_offset = layout.get("mtp_state_ready", 0)
+    mtp_state_handoff_offset = layout.get("mtp_state_handoff", 0)
     mtp_norm_ready_offset = layout.get("mtp_norm_ready", 0)
     max_pairs = samples * _HIDDEN // 2
     slot_bytes = npes * max_pairs * 8
@@ -451,6 +455,9 @@ def build_kimi_k3_monokernel(
         mtp_qkvg_rsrc = rsrc(scratch + fx.Int64(mtp_qkvg_offset))
         mtp_conv_ready_rsrc = rsrc(scratch + fx.Int64(mtp_conv_ready_offset))
         mtp_state_ready_rsrc = rsrc(scratch + fx.Int64(mtp_state_ready_offset))
+        mtp_state_handoff_rsrc = rsrc(
+            scratch + fx.Int64(mtp_state_handoff_offset)
+        )
         mtp_norm_ready_rsrc = rsrc(scratch + fx.Int64(mtp_norm_ready_offset))
         quantized_moe_rsrc = rsrc(quantized_moe_input)
         quantized_moe_scale_rsrc = rsrc(quantized_moe_scale)
@@ -2536,8 +2543,10 @@ def build_kimi_k3_monokernel(
             def run_mtp_pair(pair, head, value_split, local_sample):
                 sample_base = pair * 2
                 token_base = sample_base
+                request = fx.Int32(0)
                 if const_expr(agentic_batch_size > 0):
                     token_base = sample_base % 8
+                    request = sample_base // 8
                 if tid == 0:
                     if token_base > 0:
                         load_f32(
@@ -2553,33 +2562,37 @@ def build_kimi_k3_monokernel(
 
                 k_lane = lane % mtp_k_lanes
                 value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
-                input_slot, _, acceptance_valid = state_slots(sample_base)
+                request_sample = sample_base
+                if const_expr(agentic_batch_size > 0):
+                    request_sample = request * 8
+                input_slot, _, acceptance_valid = state_slots(request_sample)
                 state_vectors = [
                     fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32) for _ in range_constexpr(mtp_k_iters)
                 ]
                 if (input_slot >= 0) & acceptance_valid:
-                    state_rsrc = rsrc(
-                        recurrent_state
-                        + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
-                    )
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
                         state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
-                        if const_expr(state_fp16):
+                        if token_base == 0:
+                            state_rsrc = rsrc(
+                                recurrent_state
+                                + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+                            )
                             state_vectors[k_iter] = fx.Vector(
                                 bo.buffer_load(
                                     state_rsrc,
                                     state_offset,
                                     vec_width=_VALUES_PER_THREAD,
-                                    dtype=T.f16,
+                                    dtype=T.f16 if state_fp16 else T.f32,
                                     cache_modifier=CM_DEV,
                                 )
                             ).to(fx.Float32)
                         else:
                             state_vectors[k_iter] = fx.Vector(
                                 bo.buffer_load(
-                                    state_rsrc,
-                                    state_offset,
+                                    mtp_state_handoff_rsrc,
+                                    request * (_HEADS * _HEAD_DIM * _HEAD_DIM)
+                                    + state_offset,
                                     vec_width=_VALUES_PER_THREAD,
                                     dtype=T.f32,
                                     cache_modifier=CM_DEV,
@@ -2772,6 +2785,14 @@ def build_kimi_k3_monokernel(
                                 next_state_vectors[k_iter],
                             )
                             state_value = next_state_vectors[k_iter]
+                            if token_offset == 1:
+                                bo.buffer_store(
+                                    state_value,
+                                    mtp_state_handoff_rsrc,
+                                    request * (_HEADS * _HEAD_DIM * _HEAD_DIM)
+                                    + state_offset,
+                                    cache_modifier=CM_DEV,
+                                )
                             if const_expr(state_fp16):
                                 state_value = state_value.to(fx.Float16)
                             bo.buffer_store(

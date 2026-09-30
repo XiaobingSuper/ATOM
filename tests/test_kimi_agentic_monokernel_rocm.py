@@ -16,7 +16,7 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _zero_weights(device, rank):
+def _deterministic_weights(device, rank):
     import torch
 
     from atom.model_ops.monokernel.config import (
@@ -54,7 +54,11 @@ def _zero_weights(device, rank):
             dtype=torch.float32,
             device=device,
         ),
-        "kda_dt_bias": bf16(config.local_heads, config.v_dim),
+        "kda_dt_bias": bf16(
+            config.local_heads,
+            config.v_dim,
+            value=-10.375,
+        ),
         "g_kda_out": bf16(config.v_dim, value=1),
         "w_kda_o": bf16(hidden, projection),
     }
@@ -67,6 +71,26 @@ def _zero_weights(device, rank):
         "g_post",
     ):
         tensors[name] = bf16(hidden, value=1)
+
+    rows = torch.arange(3 * projection, fused, device=device)
+    tensors["w_kda_in"][rows, rows.remainder(16)] = (
+        0.015625 + rows.remainder(7).to(torch.float32) / 1024
+    ).to(torch.bfloat16)
+    tensors["w_kda_conv"][:, 3] = 0.5
+    gate_rows = torch.arange(projection, device=device)
+    tensors["w_kda_fb"][gate_rows, gate_rows.remainder(config.v_dim)] = 0.03125
+    output_rows = torch.arange(hidden, device=device)
+    tensors["w_kda_o"][output_rows, output_rows.remainder(projection)] = 0.0625
+    tensors["w_r"][0, :16] = torch.linspace(
+        -0.125, 0.125, 16, dtype=torch.bfloat16, device=device
+    )
+    latent_rows = torch.arange(routed, device=device)
+    tensors["w_latent_down"][latent_rows, latent_rows.remainder(16)] = 0.03125
+    shared_rows = torch.arange(2 * shared, device=device)
+    tensors["w_shared_ug"][shared_rows, shared_rows.remainder(16)] = 0.03125
+    tensors["w_shared_dn"][
+        output_rows, output_rows.remainder(shared)
+    ] = 0.03125
 
     experts = config.n_experts
     ug_rows = experts * 2 * config.inter
@@ -94,6 +118,10 @@ def _zero_weights(device, rank):
 
     tensors["s_ug"] = scale(ug_rows, routed)
     tensors["s_dn"] = scale(dn_rows, config.inter)
+    tensors["w_ug"].fill_(0x11)
+    tensors["w_dn"].fill_(0x11)
+    tensors["s_ug"].fill_(120)
+    tensors["s_dn"].fill_(120)
     return LayerWeights(
         heads=config.local_heads,
         t=tensors,
@@ -105,58 +133,226 @@ def _zero_weights(device, rank):
     )
 
 
-def _apply_reference(conv, recurrent, snapshots, accepted):
+def _projected_input(prefix, weights):
     import torch
 
+    fused = weights["w_kda_in"].shape[0]
+    rows = torch.arange(fused, device=prefix.device)
+    columns = rows.remainder(16)
+    return (
+        prefix[:, columns].float()
+        * weights["w_kda_in"][rows, columns].float().unsqueeze(0)
+    ).to(torch.bfloat16)
+
+
+def _apply_reference(
+    conv,
+    recurrent,
+    snapshots,
+    accepted,
+    projected,
+    weights,
+):
+    import torch
+    import torch.nn.functional as functional
+
+    from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
+    from atom.model_ops.fla_ops.fused_sigmoid_gating import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+
+    config = KIMI_K3_CONFIG
+    projection = config.local_heads * config.v_dim
     next_conv = conv.clone()
-    next_recurrent = recurrent.clone()
-    decay = math.exp(-2.5)
+    next_recurrent = recurrent.float()
+    query = torch.empty(
+        snapshots.shape[0],
+        8,
+        config.local_heads,
+        config.v_dim,
+        dtype=torch.bfloat16,
+        device=conv.device,
+    )
+    key = torch.empty_like(query)
+    value = torch.empty_like(query)
+    gate = torch.empty_like(query)
+    beta = torch.empty(
+        snapshots.shape[0],
+        8,
+        config.local_heads,
+        dtype=torch.bfloat16,
+        device=conv.device,
+    )
     for request, count in enumerate(accepted.tolist()):
         conv_slot = snapshots[request, 0].item()
-        next_conv[conv_slot, :2] = conv[conv_slot, count : count + 2]
-        next_conv[conv_slot, 2:].zero_()
+        old_window = conv[conv_slot].clone()
+        draft = projected[request * 8 : (request + 1) * 8, : 3 * projection]
+        next_conv[conv_slot, :2] = old_window[count : count + 2]
+        next_conv[conv_slot, 2:] = draft
         for token in range(8):
-            source = (
-                snapshots[request, count - 1]
-                if token == 0
-                else snapshots[request, token - 1]
-            ).item()
-            target = snapshots[request, token].item()
-            next_recurrent[target] = (
-                next_recurrent[source].float() * decay
-            ).to(torch.float16)
-    return next_conv, next_recurrent
+            history = torch.cat((old_window[count - 1 : count + 2], draft[:token]))
+            conv_input = torch.cat((history[-3:], draft[token : token + 1]))
+            qkv = functional.silu(
+                (
+                    conv_input.float()
+                    * weights["w_kda_conv"].float().transpose(0, 1)
+                ).sum(dim=0)
+            ).to(torch.bfloat16)
+            row = projected[request * 8 + token]
+            f_a = row[
+                4 * projection
+                + config.local_heads : 4 * projection
+                + config.local_heads
+                + config.v_dim
+            ].float()
+            for head in range(config.local_heads):
+                start = head * config.v_dim
+                query[request, token, head] = qkv[
+                    start : start + config.v_dim
+                ]
+                key[request, token, head] = qkv[
+                    projection + start : projection + start + config.v_dim
+                ]
+                value[request, token, head] = qkv[
+                    2 * projection
+                    + start : 2 * projection
+                    + start
+                    + config.v_dim
+                ]
+                gate[request, token, head] = (
+                    weights["w_kda_fb"][
+                        start : start + config.v_dim
+                    ].float()
+                    @ f_a
+                ).to(torch.bfloat16)
+                beta[request, token, head] = row[4 * projection + head]
+    _, next_recurrent = fused_sigmoid_gating_delta_rule_update(
+        weights["kda_a_log"],
+        gate,
+        beta,
+        weights["kda_dt_bias"],
+        query,
+        key,
+        value,
+        initial_state=next_recurrent,
+        inplace_final_state=True,
+        ssm_state_indices=snapshots,
+        num_accepted_tokens=accepted,
+        use_qk_l2norm_in_kernel=True,
+        is_kda=True,
+        lower_bound=-2.5,
+    )
+    final_fp32 = next_recurrent[snapshots[:, -1].to(torch.int64)].clone()
+    pairwise_final = torch.empty_like(final_fp32)
+    for request, count in enumerate(accepted.tolist()):
+        state = recurrent[
+            snapshots[request, count - 1].item()
+        ].float().unsqueeze(0)
+        for pair in range(4):
+            begin = pair * 2
+            _, pair_states = fused_sigmoid_gating_delta_rule_update(
+                weights["kda_a_log"],
+                gate[request : request + 1, begin : begin + 2],
+                beta[request : request + 1, begin : begin + 2],
+                weights["kda_dt_bias"],
+                query[request : request + 1, begin : begin + 2],
+                key[request : request + 1, begin : begin + 2],
+                value[request : request + 1, begin : begin + 2],
+                initial_state=state,
+                inplace_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+                is_kda=True,
+                lower_bound=-2.5,
+            )
+            state = pair_states[-1:].to(torch.float16).float()
+        pairwise_final[request] = pair_states[-1]
+    return (
+        next_conv,
+        next_recurrent.to(torch.float16),
+        final_fp32,
+        pairwise_final,
+    )
 
 
 def _check_state(actual_conv, actual_recurrent, expected_conv, expected_recurrent):
     import torch
 
-    assert torch.equal(actual_conv, expected_conv)
-    torch.testing.assert_close(
-        actual_recurrent,
-        expected_recurrent,
-        atol=2e-3,
-        rtol=2e-3,
+    if not torch.equal(actual_conv, expected_conv):
+        mismatch = (actual_conv != expected_conv).nonzero()[0].tolist()
+        index = tuple(mismatch)
+        raise AssertionError(
+            "conv mismatch at "
+            f"{index}: actual={actual_conv[index].item()} "
+            f"expected={expected_conv[index].item()}"
+        )
+    try:
+        torch.testing.assert_close(
+            actual_recurrent,
+            expected_recurrent,
+            atol=1e-3,
+            rtol=1e-3,
+        )
+    except AssertionError as error:
+        delta = (actual_recurrent.float() - expected_recurrent.float()).abs()
+        slot_max = delta.flatten(1).amax(1)
+        raise AssertionError(
+            f"{error}\nper-slot max={slot_max.tolist()}"
+        ) from error
+
+
+def _check_fp32_handoff(op, batch, expected, pairwise):
+    import torch
+
+    from atom.model_ops.monokernel.k3.kernel import monokernel_layout
+
+    layout = monokernel_layout(
+        batch * 8,
+        fuse_attn_res=True,
+        fuse_moe=True,
+        mtp=True,
     )
+    elements = batch * 12 * 128 * 128
+    actual = (
+        op.attention.monokernel_scratch[
+            layout["mtp_state_handoff"] : layout["mtp_state_handoff"]
+            + elements * 4
+        ]
+        .view(torch.float32)
+        .view(batch, 12, 128, 128)
+    )
+    continuous_error = (actual - expected).abs().amax()
+    pairwise_error = (actual - pairwise).abs().amax()
+    assert continuous_error < pairwise_error, (
+        f"continuous error {continuous_error.item()} is not below "
+        f"pairwise-FP16 error {pairwise_error.item()}"
+    )
+    torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
 
 
-def _exercise_batch(op, batch, device):
+def _slot_table(batch, slots, shift, device):
+    import torch
+
+    rows = batch * 8
+    return (
+        torch.arange(rows, dtype=torch.int32, device=device) * 7 + shift
+    ).remainder(slots).view(batch, 8)
+
+
+def _exercise_batch(op, batch, device, weights):
     import torch
 
     from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
 
     rows = batch * 8
-    slots = rows
-    snapshots = torch.arange(
-        slots,
-        dtype=torch.int32,
-        device=device,
-    ).view(batch, 8)
-    conv_initial = torch.arange(
+    slots = 13 if batch == 1 else 37
+    snapshots = _slot_table(batch, slots, 1, device)
+    conv_initial = torch.linspace(
+        -0.125,
+        0.125,
         slots * 10 * 3 * KIMI_K3_CONFIG.local_heads * KIMI_K3_CONFIG.v_dim,
-        dtype=torch.int64,
+        dtype=torch.float32,
         device=device,
-    ).remainder_(251).to(torch.bfloat16).view(
+    ).to(torch.bfloat16).view(
         slots,
         10,
         3 * KIMI_K3_CONFIG.local_heads * KIMI_K3_CONFIG.v_dim,
@@ -170,7 +366,15 @@ def _exercise_batch(op, batch, device):
         device=device,
     )
     for slot in range(slots):
-        recurrent_initial[slot].fill_((slot + 1) / 64)
+        recurrent_initial[slot].copy_(
+            torch.linspace(
+                0.75 + slot / 1024,
+                1.25 + slot / 1024,
+                recurrent_initial[slot].numel(),
+                dtype=torch.float32,
+                device=device,
+            ).view_as(recurrent_initial[slot])
+        )
 
     conv = conv_initial.clone()
     recurrent = recurrent_initial.clone()
@@ -180,6 +384,13 @@ def _exercise_batch(op, batch, device):
         dtype=torch.bfloat16,
         device=device,
     )
+    prefix[:, :16] = torch.linspace(
+        -0.75,
+        0.75,
+        rows * 16,
+        dtype=torch.float32,
+        device=device,
+    ).view(rows, 16).to(torch.bfloat16)
     blocks = torch.zeros(
         rows,
         1,
@@ -189,7 +400,12 @@ def _exercise_batch(op, batch, device):
     )
     output = torch.full_like(prefix, float("nan"))
     accepted = torch.empty(batch, dtype=torch.int32, device=device)
-    pointers = (conv.data_ptr(), recurrent.data_ptr(), accepted.data_ptr())
+    pointers = (
+        conv.data_ptr(),
+        recurrent.data_ptr(),
+        snapshots.data_ptr(),
+        accepted.data_ptr(),
+    )
 
     eager_counts = (
         (4,) if batch == 1 else (1, 3, 6, 8),
@@ -210,14 +426,25 @@ def _exercise_batch(op, batch, device):
             num_accepted_tokens=accepted,
         )
         torch.cuda.synchronize(device)
-        expected_conv, expected_recurrent = _apply_reference(
+        projected = _projected_input(op.pre_attn, weights.t)
+        (
+            expected_conv,
+            expected_recurrent,
+            expected_fp32,
+            pairwise_fp32,
+        ) = _apply_reference(
             expected_conv,
             expected_recurrent,
             snapshots,
             accepted,
+            projected,
+            weights.t,
         )
         _check_state(conv, recurrent, expected_conv, expected_recurrent)
+        _check_fp32_handoff(op, batch, expected_fp32, pairwise_fp32)
         assert torch.isfinite(output).all()
+        assert output.abs().max() > 0
+        assert not torch.equal(output, prefix)
 
     conv.copy_(conv_initial)
     recurrent.copy_(recurrent_initial)
@@ -253,33 +480,48 @@ def _exercise_batch(op, batch, device):
             x_out=output,
             num_accepted_tokens=accepted,
         )
-    graph.replay()
-    torch.cuda.synchronize(device)
-    expected_conv, expected_recurrent = _apply_reference(
-        expected_conv,
-        expected_recurrent,
-        snapshots,
-        accepted,
-    )
-    _check_state(conv, recurrent, expected_conv, expected_recurrent)
-    assert torch.isfinite(output).all()
-
-    for counts in graph_counts[1:]:
+    for replay, counts in enumerate(graph_counts):
+        snapshots.copy_(
+            _slot_table(batch, slots, 3 + replay * 5, device)
+        )
         accepted.copy_(torch.tensor(counts, dtype=torch.int32, device=device))
+        eager_conv = conv.clone()
+        eager_recurrent = recurrent.clone()
+        eager_output = torch.full_like(output, float("nan"))
+        op.forward(
+            prefix,
+            blocks,
+            snapshots,
+            eager_conv,
+            eager_recurrent,
+            x_out=eager_output,
+            num_accepted_tokens=accepted,
+        )
         output.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize(device)
-        expected_conv, expected_recurrent = _apply_reference(
+        projected = _projected_input(op.pre_attn, weights.t)
+        (
+            expected_conv,
+            expected_recurrent,
+            expected_fp32,
+            pairwise_fp32,
+        ) = _apply_reference(
             expected_conv,
             expected_recurrent,
             snapshots,
             accepted,
+            projected,
+            weights.t,
         )
         _check_state(conv, recurrent, expected_conv, expected_recurrent)
-        assert torch.isfinite(output).all()
+        _check_fp32_handoff(op, batch, expected_fp32, pairwise_fp32)
+        torch.testing.assert_close(output, eager_output, atol=2e-2, rtol=2e-2)
+        assert torch.isfinite(output).all() and output.abs().max() > 0
         assert pointers == (
             conv.data_ptr(),
             recurrent.data_ptr(),
+            snapshots.data_ptr(),
             accepted.data_ptr(),
         )
 
@@ -300,7 +542,7 @@ def _tp8_worker(rank: int, port: int) -> None:
         world_size=8,
     )
     try:
-        weights = _zero_weights(device, rank)
+        weights = _deterministic_weights(device, rank)
         packed = None
         for batch in (1, 4):
             op = KimiK3MonoKernel(
@@ -318,7 +560,7 @@ def _tp8_worker(rank: int, port: int) -> None:
                 packed_artifacts=packed,
             )
             packed = op.packed_artifacts()
-            _exercise_batch(op, batch, device)
+            _exercise_batch(op, batch, device, weights)
             op.close()
             dist.barrier()
     finally:

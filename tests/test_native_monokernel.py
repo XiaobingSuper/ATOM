@@ -394,6 +394,11 @@ def test_kimi_agentic_host_builder_layout(batch_capacity, rows):
     layout = monokernel_layout(rows, fuse_attn_res=True, fuse_moe=True, mtp=True)
 
     assert layout["_bytes"] > layout["mtp_norm_ready"]
+    assert layout["mtp_state_handoff"] > layout["mtp_state_ready"]
+    assert (
+        layout["mtp_norm_ready"] - layout["mtp_state_handoff"]
+        == batch_capacity * 12 * 128 * 128 * 4
+    )
     assert "agentic_batch_size" in __import__("inspect").signature(
         build_kimi_k3_monokernel
     ).parameters
@@ -402,6 +407,21 @@ def test_kimi_agentic_host_builder_layout(batch_capacity, rows):
     ).parameters
     assert batch_capacity == rows // 8
     assert torch.float16.itemsize == 2
+
+
+def test_kimi_agentic_pair_schedule_uses_fp32_state_handoff():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "k3"
+        / "kernel.py"
+    ).read_text()
+
+    assert 'offsets["mtp_state_handoff"]' in source
+    assert "mtp_state_handoff_rsrc" in source
+    assert "token_base == 0" in source
 
 
 def test_kimi_full_monokernel_accepts_fp16_agentic_construction(monkeypatch):
