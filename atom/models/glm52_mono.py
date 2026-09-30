@@ -41,8 +41,7 @@ from atom.model_ops.monokernel.weights import (
     LayerWeights,
     atom_mxfp4_storage_view,
     linear_bf16,
-    linear_fp8_block128,
-    quantize_fp8_blocks,
+    linear_fp8_per_row,
     quantize_fp8_block128,
 )
 from atom.plugin.prepare import is_plugin_mode
@@ -244,7 +243,7 @@ def _agentic_layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         ),
         ("o", attn.o_proj, cfg.hidden, cfg.local_heads * cfg.v_dim),
     ):
-        weight, scale = linear_fp8_block128(
+        weight, scale = linear_fp8_per_row(
             linear,
             name=f"{name}_proj",
             logical_rows=rows,
@@ -253,25 +252,52 @@ def _agentic_layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         tensors[f"w_{name}"] = weight
         tensors[f"s_{name}"] = scale
 
-    kv_b = linear_bf16(
-        attn.kv_b_proj,
-        name="kv_b_proj",
-        logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.v_dim),
-        logical_cols=cfg.kv_lora,
+    mla = attn.mla_attn.impl
+    wk = mla.W_K
+    wv = mla.W_V
+    wk_scale = mla.W_K_scale
+    wv_scale = mla.W_V_scale
+    _need(
+        wk.dtype is torch.float8_e4m3fn
+        and wk.shape == (cfg.local_heads, cfg.kv_lora, cfg.nope_dim)
+        and wk.is_contiguous(),
+        "absorbed W_K must be contiguous E4M3FN [heads, kv_lora, nope]",
     )
-    uk, uv = _split_kv_b(
-        kv_b,
-        heads=cfg.local_heads,
-        nope_dim=cfg.nope_dim,
-        value_dim=cfg.v_dim,
-        kv_lora=cfg.kv_lora,
+    _need(
+        wv.dtype is torch.float8_e4m3fn
+        and wv.shape == (cfg.local_heads, cfg.v_dim, cfg.kv_lora)
+        and wv.is_contiguous(),
+        "absorbed W_V must be contiguous E4M3FN [heads, value, kv_lora]",
     )
-    tensors["w_uk"], tensors["s_uk"] = quantize_fp8_blocks(uk, block_k=64)
-    tensors["w_uv"], tensors["s_uv"] = quantize_fp8_block128(uv)
+    for name, scale in (("W_K", wk_scale), ("W_V", wv_scale)):
+        _need(
+            scale.dtype is torch.float32
+            and scale.numel() == 1
+            and scale.is_contiguous(),
+            f"absorbed {name} scale must be one contiguous FP32 scalar",
+        )
+    tensors["w_uk"] = wk.view(-1, cfg.nope_dim)
+    tensors["s_uk"] = (
+        wk_scale.view(1, 1)
+        .expand(
+            cfg.local_heads * cfg.kv_lora // 128,
+            cfg.nope_dim // 64,
+        )
+        .contiguous()
+    )
+    tensors["w_uv"] = wv.view(-1, cfg.kv_lora)
+    tensors["s_uv"] = (
+        wv_scale.view(1, 1)
+        .expand(
+            cfg.local_heads * cfg.v_dim // 128,
+            cfg.kv_lora // 128,
+        )
+        .contiguous()
+    )
 
     indexer = attn.indexer
     if indexer is not None and not attn.skip_topk:
-        tensors["w_index_q"], tensors["s_index_q"] = linear_fp8_block128(
+        tensors["w_index_q"], tensors["s_index_q"] = linear_fp8_per_row(
             indexer.wq_b,
             name="indexer.wq_b",
             logical_rows=32 * 128,
@@ -901,7 +927,7 @@ class Glm52MonoDecode:
                     inputs,
                     with_indexer=full,
                     index_max_seq=index_max_seq,
-                    attention_weight=AttentionWeight.FP8_BLOCK128,
+                    attention_weight=AttentionWeight.FP8_PER_ROW,
                     kv_cache_layout=KvCacheLayout.ATOM_FP8,
                     index_share_mode=mode,
                 )
@@ -933,7 +959,7 @@ class Glm52MonoDecode:
                         Glm5PackedArtifacts.pack(
                             weights,
                             npes=npes,
-                            attention_weight=AttentionWeight.FP8_BLOCK128,
+                            attention_weight=AttentionWeight.FP8_PER_ROW,
                             with_indexer=full,
                         )
                     )

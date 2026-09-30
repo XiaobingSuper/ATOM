@@ -72,6 +72,7 @@ class Glm5PackedArtifacts:
     attention_weight: AttentionWeight
     with_indexer: bool
     expert_mxfp4: bool
+    atom_expert_layout: bool = False
 
     @classmethod
     def pack(
@@ -143,6 +144,7 @@ class Glm5PackedArtifacts:
             attention_weight=attention_weight,
             with_indexer=with_indexer,
             expert_mxfp4=expert_mxfp4,
+            atom_expert_layout=atom_experts,
         )
 
     def validate(
@@ -217,7 +219,11 @@ class Glm5MonoKernel:
                 raise ValueError("shared Agentic workspace requires row ownership")
             if workspace.shape.config != config:
                 raise ValueError("shared workspace geometry does not match weights")
-            if samples not in {tile.capacity for tile in workspace.shape.row_tiles}:
+            if (
+                samples != workspace.shape.common.tile_rows
+                and samples
+                not in {tile.capacity for tile in workspace.shape.row_tiles}
+            ):
                 raise ValueError(f"row tile size {samples} is outside the graph bucket")
             if timeline:
                 raise ValueError("shared Agentic workspace does not support per-op timelines")
@@ -250,6 +256,7 @@ class Glm5MonoKernel:
         self._packed_artifacts = packed_artifacts
         self.packed = packed_artifacts.tensors
         self.expert_mxfp4 = packed_artifacts.expert_mxfp4
+        self.atom_expert_layout = packed_artifacts.atom_expert_layout
         self.scr_layout, self.sym_layout = layout(
             samples,
             W.heads,
@@ -335,6 +342,7 @@ class Glm5MonoKernel:
             index_max_seq=index_max_seq,
             cache_slots=self.cache_slots,
             expert_mxfp4=self.expert_mxfp4,
+            atom_expert_layout=self.atom_expert_layout,
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
             uv_scale_block_m=uv_scale_block_m,
@@ -445,6 +453,16 @@ class Glm5MonoKernel:
             raise ValueError(
                 f"hidden states must be contiguous BF16 {list(hidden_shape)}"
             )
+        for name, table in (("rope_cos", cos), ("rope_sin", sin)):
+            if (
+                table.dtype is not torch.bfloat16
+                or not table.is_contiguous()
+                or table.shape[-1] != self.W.config.pe_dim // 2
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous BF16 with "
+                    f"{self.W.config.pe_dim // 2} columns"
+                )
         if (
             self.with_indexer
             and self.kv_cache_layout is not KvCacheLayout.ATOM_FP8

@@ -278,6 +278,51 @@ def linear_fp8_block128(
     return quantize_fp8_block128(bf16)
 
 
+def linear_fp8_per_row(
+    linear,
+    *,
+    name: str,
+    logical_rows: int,
+    logical_cols: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return native PTPC E4M3FN values and one FP32 descale per output row."""
+
+    quant_name = getattr(getattr(linear, "quant_type", None), "name", None)
+    _need(quant_name == "per_Token", f"{name} requires PTPC FP8 storage")
+    weight = linear.weight
+    _need(
+        getattr(linear, "params_dtype", None) is torch.float8_e4m3fn
+        and weight.dtype is torch.float8_e4m3fn,
+        f"{name} must use E4M3FN",
+    )
+    padded = bool(getattr(linear, "is_output_padded", False))
+    storage_rows = weight.shape[0] if weight.ndim == 2 else 0
+    if padded:
+        _need(
+            getattr(linear, "_output_size_before_padding", None) == logical_rows
+            and storage_rows >= logical_rows,
+            f"{name} padded output rows do not match {logical_rows}",
+        )
+    else:
+        _need(storage_rows == logical_rows, f"{name} output rows {storage_rows}")
+    _need(
+        weight.shape == (storage_rows, logical_cols),
+        f"{name} weight shape {tuple(weight.shape)}",
+    )
+    scale = getattr(linear, "weight_scale", None)
+    _need(
+        scale is not None
+        and scale.dtype is torch.float32
+        and scale.shape == (storage_rows, 1)
+        and scale.is_contiguous(),
+        f"{name} row scale must be contiguous FP32 {(storage_rows, 1)}",
+    )
+    return (
+        _unshuffle_linear_weight(weight).narrow(0, 0, logical_rows).contiguous(),
+        scale.narrow(0, 0, logical_rows).contiguous(),
+    )
+
+
 @dataclass
 class LayerWeights:
     """One tensor-parallel rank's weights and model geometry."""
@@ -380,6 +425,7 @@ __all__ = [
     "atom_mxfp4_storage_view",
     "linear_bf16",
     "linear_fp8_block128",
+    "linear_fp8_per_row",
     "quantize_fp8_block128",
     "prepare_mxfp4_expert_storage",
 ]

@@ -15,6 +15,7 @@ from atom.model_ops.monokernel.config import (
     AttentionWeight,
     KvCacheLayout,
 )
+from atom.model_ops.monokernel.glm.abi import GLM_AGENTIC_TILE_ROWS
 from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
 from atom.model_ops.monokernel.glm.index_share import (
     GlmIndexShareMode,
@@ -46,6 +47,18 @@ class GlmAgenticLayerSpec:
     index_share_mode: GlmIndexShareMode | None = None
 
     def validate_cache_inputs(self) -> int | None:
+        for name, table in (
+            ("rope_cos", self.inputs.cos),
+            ("rope_sin", self.inputs.sin),
+        ):
+            if (
+                table.dtype is not torch.bfloat16
+                or not table.is_contiguous()
+                or table.shape[-1] != 32
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous BF16 with 32 columns"
+                )
         if self.index_share_mode is GlmIndexShareMode.FULL and not self.with_indexer:
             raise ValueError("full IndexShare layers require indexer weights")
         if self.index_share_mode is GlmIndexShareMode.SHARED and self.with_indexer:
@@ -94,7 +107,7 @@ class GlmAgenticGraphBucket:
         if any(not 0 <= slot < MAX_LAYERS_PER_STEP for slot in slots):
             raise ValueError("GLM graph-bucket layer slot is out of range")
         row_capacity = workspace.shape.common.row_capacity
-        kernel_rows = min(workspace.shape.common.tile_rows, row_capacity)
+        kernel_rows = GLM_AGENTIC_TILE_ROWS
         for layer in layers:
             if set(layer.kernels) != {kernel_rows}:
                 raise ValueError(
@@ -164,7 +177,7 @@ class GlmAgenticGraphBucket:
 
             artifact_factory = Glm5PackedArtifacts.pack
         row_capacity = workspace.shape.common.row_capacity
-        kernel_rows = min(workspace.shape.common.tile_rows, row_capacity)
+        kernel_rows = GLM_AGENTIC_TILE_ROWS
         layers = []
         try:
             for slot, spec in enumerate(specs):
@@ -290,7 +303,7 @@ class GlmAgenticGraphBucket:
         selected_slots = self.workspace.selected_slots
         selected_counts = self.workspace.selected_counts
         selected_indptr = self.workspace.selected_indptr
-        kernel_rows = min(shape.common.tile_rows, rows)
+        kernel_rows = GLM_AGENTIC_TILE_ROWS
         canonical_indices = False
         for layer_index, layer in enumerate(self.layers):
             output = buffers[layer_index % 2]

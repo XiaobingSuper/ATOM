@@ -699,7 +699,8 @@ def test_glm_layout_uses_tp4_heads_and_expert_width():
     assert one_row_stages["split"] == 2 * (2048 // 64)
 
 
-def test_glm_kernel_builder_accepts_tp4_agentic_capacity_100():
+@pytest.mark.parametrize("row_capacity", (5, 6, 100))
+def test_glm_kernel_builder_accepts_tp4_agentic_capacity(row_capacity):
     torch = pytest.importorskip("torch")
     pytest.importorskip("flydsl")
     if not torch.cuda.is_available():
@@ -721,7 +722,7 @@ def test_glm_kernel_builder_accepts_tp4_agentic_capacity_100():
         attention_weight=AttentionWeight.BF16,
         kv_cache_layout=KvCacheLayout.ATOM,
         agentic_row_contract=True,
-        row_capacity=100,
+        row_capacity=row_capacity,
         model_config=config,
     )
 
@@ -730,7 +731,11 @@ def test_glm_kernel_builder_accepts_tp4_agentic_capacity_100():
 
 def test_glm_kernel_builder_accepts_tp4_fp8_paged_index_cache():
     pytest.importorskip("flydsl")
-    from atom.model_ops.monokernel.config import KvCacheLayout, glm5_shard_config
+    from atom.model_ops.monokernel.config import (
+        AttentionWeight,
+        KvCacheLayout,
+        glm5_shard_config,
+    )
     from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
 
     config = glm5_shard_config(4)
@@ -742,6 +747,7 @@ def test_glm_kernel_builder_accepts_tp4_fp8_paged_index_cache():
         with_indexer=True,
         index_max_seq=1 << 20,
         cache_slots=48,
+        attention_weight=AttentionWeight.FP8_PER_ROW,
         kv_cache_layout=KvCacheLayout.ATOM_FP8,
         agentic_row_contract=True,
         model_config=config,
@@ -856,7 +862,7 @@ def test_glm_op_binds_shared_workspace_without_owning_peer_buffer(monkeypatch):
 
     config = glm5_shard_config(4)
     shape = GlmAgenticShape.for_graph(
-        batch_capacity=20,
+        batch_capacity=1,
         query_len=5,
         dcp_size=1,
         query_replication=False,
@@ -884,8 +890,8 @@ def test_glm_op_binds_shared_workspace_without_owning_peer_buffer(monkeypatch):
         peer_buffer=peer,
         step=torch.zeros(1, dtype=torch.int32),
         hidden_buffers=(
-            torch.empty(100, config.hidden, dtype=torch.bfloat16),
-            torch.empty(100, config.hidden, dtype=torch.bfloat16),
+            torch.empty(5, config.hidden, dtype=torch.bfloat16),
+            torch.empty(5, config.hidden, dtype=torch.bfloat16),
         ),
     )
     tensors = {
@@ -921,12 +927,13 @@ def test_glm_op_binds_shared_workspace_without_owning_peer_buffer(monkeypatch):
 
     kernel = Glm5MonoKernel(
         weights,
-        4,
+        8,
         rank=0,
         npes=4,
         topk=64,
         launches_per_step=128,
         agentic_row_contract=True,
+        row_capacity=5,
         workspace=workspace,
     )
 
@@ -1449,7 +1456,7 @@ def test_glm_recipe_per_token_fp8_attention_mapping():
     assert torch.equal(w_uv.view(2, 6, 64), by_head[:, 2:])
 
 
-def test_glm_agentic_mapping_requantizes_real_ptpc_wrappers(monkeypatch):
+def test_glm_agentic_mapping_preserves_real_ptpc_wrappers(monkeypatch):
     import torch
 
     layernorm = types.ModuleType("atom.model_ops.layernorm")
@@ -1474,26 +1481,56 @@ def test_glm_agentic_mapping_requantizes_real_ptpc_wrappers(monkeypatch):
         local_heads=2,
     )
 
-    def ptpc(rows, cols):
-        return _preshuffled_per_token_fp8_linear(
+    expected = {}
+
+    def ptpc(name, rows, cols):
+        linear, dequant = _preshuffled_per_token_fp8_linear(
             torch.linspace(-2, 2, rows * cols, dtype=torch.bfloat16).view(
                 rows, cols
             )
-        )[0]
+        )
+        expected[name] = dequant
+        return linear
 
+    padded_qkv = ptpc("qkv_a", config.qkv_a_rows + 16, config.hidden)
+    expected["qkv_a"] = expected["qkv_a"][: config.qkv_a_rows]
+    padded_qkv.is_output_padded = True
+    padded_qkv._output_size_before_padding = config.qkv_a_rows
+    wk = torch.arange(
+        config.local_heads * config.kv_lora * config.nope_dim,
+        dtype=torch.float32,
+    ).view(config.local_heads, config.kv_lora, config.nope_dim)
+    wv = torch.arange(
+        config.local_heads * config.v_dim * config.kv_lora,
+        dtype=torch.float32,
+    ).view(config.local_heads, config.v_dim, config.kv_lora)
+    wk_scale = torch.tensor(0.003, dtype=torch.float32)
+    wv_scale = torch.tensor(0.005, dtype=torch.float32)
+    wk = (wk.remainder(97) - 48).to(torch.float8_e4m3fn)
+    wv = (wv.remainder(89) - 44).to(torch.float8_e4m3fn)
     attention = SimpleNamespace(
-        fused_qkv_a_proj=ptpc(config.qkv_a_rows, config.hidden),
+        fused_qkv_a_proj=padded_qkv,
         q_b_proj=ptpc(
+            "q_b",
             config.local_heads * (config.nope_dim + config.pe_dim),
             config.q_lora,
         ),
-        o_proj=ptpc(config.hidden, config.local_heads * config.v_dim),
+        o_proj=ptpc("o", config.hidden, config.local_heads * config.v_dim),
         kv_b_proj=ptpc(
+            "kv_b",
             config.local_heads * (config.nope_dim + config.v_dim),
             config.kv_lora,
         ),
         indexer=None,
         skip_topk=True,
+        mla_attn=SimpleNamespace(
+            impl=SimpleNamespace(
+                W_K=wk,
+                W_K_scale=wk_scale,
+                W_V=wv,
+                W_V_scale=wv_scale,
+            )
+        ),
     )
     base = LayerWeights(
         config.local_heads,
@@ -1512,9 +1549,39 @@ def test_glm_agentic_mapping_requantizes_real_ptpc_wrappers(monkeypatch):
         npes=4,
     )
 
-    for name in ("qkv_a", "q_b", "o", "uk", "uv"):
+    for name in ("qkv_a", "q_b", "o"):
         assert mapped.t[f"w_{name}"].dtype is torch.float8_e4m3fn
         assert mapped.t[f"s_{name}"].dtype is torch.float32
+        assert mapped.t[f"s_{name}"].shape == (mapped.t[f"w_{name}"].shape[0], 1)
+        restored = (
+            mapped.t[f"w_{name}"].float() * mapped.t[f"s_{name}"].float()
+        ).to(torch.bfloat16)
+        assert torch.equal(restored, expected[name])
+    for name in ("uk", "uv"):
+        assert mapped.t[f"w_{name}"].dtype is torch.float8_e4m3fn
+        assert mapped.t[f"s_{name}"].dtype is torch.float32
+    assert torch.equal(
+        mapped.t["w_uk"].view(torch.uint8),
+        wk.view(-1, config.nope_dim).view(torch.uint8),
+    )
+    assert torch.equal(
+        mapped.t["w_uv"].view(torch.uint8),
+        wv.view(-1, config.kv_lora).view(torch.uint8),
+    )
+    assert torch.equal(
+        mapped.t["s_uk"],
+        wk_scale.view(1, 1).expand(
+            config.local_heads * config.kv_lora // 128,
+            config.nope_dim // 64,
+        ),
+    )
+    assert torch.equal(
+        mapped.t["s_uv"],
+        wv_scale.view(1, 1).expand(
+            config.local_heads * config.v_dim // 128,
+            config.kv_lora // 128,
+        ),
+    )
     assert mapped.t["s_uk"].shape[1] == 3
     assert mapped.physical_experts == 257
 
@@ -1566,8 +1633,8 @@ def test_glm_agentic_specs_decouple_logical_cap_from_physical_slots():
             mla_attn=SimpleNamespace(impl=impl),
             indexer=indexer,
             rotary_emb=SimpleNamespace(
-                cos_cache=torch.empty(0),
-                sin_cache=torch.empty(0),
+                cos_cache=torch.empty(1, 32, dtype=torch.bfloat16),
+                sin_cache=torch.empty(1, 32, dtype=torch.bfloat16),
             ),
         )
 
@@ -2806,6 +2873,65 @@ def test_atom_expert_storage_is_zero_copy(monkeypatch):
     defaults = LayerWeights(heads=1, t={}, config=config)
     assert defaults.mxfp4_weight_layout is Mxfp4WeightLayout.NATIVE
     assert defaults.mxfp4_scale_layout is Mxfp4ScaleLayout.NATIVE
+
+
+def test_glm_packed_artifacts_preserve_atom_expert_layout(monkeypatch):
+    import torch
+
+    from atom.model_ops.monokernel.config import (
+        AttentionWeight,
+        Mxfp4ScaleLayout,
+        Mxfp4WeightLayout,
+        glm5_shard_config,
+    )
+    from atom.model_ops.monokernel.glm.op import Glm5PackedArtifacts
+    from atom.model_ops.monokernel.glm import op as glm_op
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    tensors = {
+        "w_ug": torch.empty(8, dtype=torch.uint8),
+        "s_ug": torch.empty(8, dtype=torch.uint8),
+        "w_dn": torch.empty(8, dtype=torch.uint8),
+        "s_dn": torch.empty(8, dtype=torch.uint8),
+        "w_r": torch.empty(1, dtype=torch.bfloat16),
+    }
+    config = glm5_shard_config(4)
+    weights = LayerWeights(
+        heads=16,
+        t=tensors,
+        config=config,
+        npes=4,
+        physical_experts=257,
+        mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
+        mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
+    )
+    packed = {name: tensor for name, tensor in tensors.items()}
+    monkeypatch.setattr(
+        glm_op, "pack_layer_weights", lambda *_args, **_kwargs: packed.copy()
+    )
+    monkeypatch.setattr(
+        glm_op,
+        "pack_bf16",
+        lambda tensor: tensor,
+    )
+    monkeypatch.setattr(
+        glm_op,
+        "prepare_mxfp4_expert_storage",
+        lambda _weights: tuple(
+            tensors[name] for name in ("w_ug", "s_ug", "w_dn", "s_dn")
+        ),
+    )
+
+    artifacts = Glm5PackedArtifacts.pack(
+        weights,
+        npes=4,
+        attention_weight=AttentionWeight.FP8_BLOCK128,
+        with_indexer=False,
+    )
+
+    assert artifacts.atom_expert_layout
+    assert artifacts.tensors["w_ug"] is tensors["w_ug"]
+    assert artifacts.tensors["s_dn"] is tensors["s_dn"]
 
 
 def test_glm_fused_shared_expert_storage_is_zero_copy():

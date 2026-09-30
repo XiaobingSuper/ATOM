@@ -769,8 +769,8 @@ def test_glm_graph_bucket_launches_each_layer_once_and_advances_one_step():
         kv_cache=torch.empty(1),
         pe_cache=torch.empty(1),
         indices=torch.empty(1, dtype=torch.int32),
-        cos=torch.empty(1),
-        sin=torch.empty(1),
+        cos=torch.empty(1, 32, dtype=torch.bfloat16),
+        sin=torch.empty(1, 32, dtype=torch.bfloat16),
         kv_cache_scale=cache_scale,
     )
     layers = []
@@ -830,7 +830,15 @@ def test_glm_graph_bucket_launches_each_layer_once_and_advances_one_step():
     assert all(layer.workspace is workspace for layer in layers)
 
 
-def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
+@pytest.mark.parametrize(
+    ("batch_capacity", "query_len", "row_capacity"),
+    ((20, 5, 100), (1, 5, 5), (1, 6, 6)),
+)
+def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer(
+    batch_capacity,
+    query_len,
+    row_capacity,
+):
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.config import KvCacheLayout
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
@@ -843,8 +851,8 @@ def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
     from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
 
     shape = GlmAgenticShape.for_graph(
-        batch_capacity=20,
-        query_len=5,
+        batch_capacity=batch_capacity,
+        query_len=query_len,
         dcp_size=1,
         query_replication=False,
     )
@@ -864,8 +872,8 @@ def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
         ),
         step=torch.zeros(1, dtype=torch.int32),
         hidden_buffers=(
-            torch.empty(100, shape.config.hidden, dtype=torch.bfloat16),
-            torch.empty(100, shape.config.hidden, dtype=torch.bfloat16),
+            torch.empty(row_capacity, shape.config.hidden, dtype=torch.bfloat16),
+            torch.empty(row_capacity, shape.config.hidden, dtype=torch.bfloat16),
         ),
     )
     made = []
@@ -887,7 +895,13 @@ def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
         packed.append((owner, kwargs))
         return owner
 
-    args = GlmAgenticLayerInputs(*(torch.empty(1) for _ in range(5)))
+    args = GlmAgenticLayerInputs(
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1),
+        torch.empty(1, 32, dtype=torch.bfloat16),
+        torch.empty(1, 32, dtype=torch.bfloat16),
+    )
     specs = (
         GlmAgenticLayerSpec(
             object(), args, kv_cache_layout=KvCacheLayout.ATOM
@@ -909,7 +923,9 @@ def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
 
     assert [samples for _, samples, _ in made] == [8, 8]
     assert all(kwargs["workspace"] is workspace for _, _, kwargs in made)
-    assert all(kwargs["row_capacity"] == 100 for _, _, kwargs in made)
+    assert all(
+        kwargs["row_capacity"] == row_capacity for _, _, kwargs in made
+    )
     assert len(packed) == 2
     assert made[0][2]["packed_artifacts"] is not made[1][2]["packed_artifacts"]
     assert [layer.packed_artifacts for layer in bucket.layers] == [
@@ -932,8 +948,8 @@ def test_glm_graph_layer_spec_validates_fp8_physical_cache():
         kv_cache=torch.empty(16, 1, 576, dtype=torch.float8_e4m3fn),
         pe_cache=None,
         indices=torch.empty(1, dtype=torch.int32),
-        cos=torch.empty(1),
-        sin=torch.empty(1),
+        cos=torch.empty(1, 32, dtype=torch.bfloat16),
+        sin=torch.empty(1, 32, dtype=torch.bfloat16),
         index_cache=torch.empty(1, 16, 144, dtype=torch.float8_e4m3fn),
         kv_cache_scale=torch.empty(1, dtype=torch.float32),
     )
@@ -976,6 +992,24 @@ def test_glm_graph_layer_spec_validates_fp8_physical_cache():
     )
     with pytest.raises(ValueError, match="descale"):
         missing_scale.validate_cache_inputs()
+
+
+def test_glm_graph_layer_spec_rejects_non_bf16_rope():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.graph import (
+        GlmAgenticLayerInputs,
+        GlmAgenticLayerSpec,
+    )
+
+    inputs = GlmAgenticLayerInputs(
+        kv_cache=torch.empty(1),
+        pe_cache=torch.empty(1),
+        indices=torch.empty(1, dtype=torch.int32),
+        cos=torch.empty(2, 32),
+        sin=torch.empty(2, 32, dtype=torch.bfloat16),
+    )
+    with pytest.raises(ValueError, match="rope_cos.*BF16"):
+        GlmAgenticLayerSpec(object(), inputs).validate_cache_inputs()
 
 
 def test_glm_indexshare_stable_topk_publishes_physical_slots():
@@ -1299,7 +1333,7 @@ def test_glm_indexshare_external_prefix_switches_to_canonical_at_first_full():
 
     class FakeKernel:
         def __init__(self, mode):
-            self.S = 4
+            self.S = 8
             self.row_capacity = 4
             self.workspace = workspace
             self.scratch = workspace.scratch
@@ -1345,7 +1379,7 @@ def test_glm_indexshare_external_prefix_switches_to_canonical_at_first_full():
     layers = tuple(
         GlmAgenticLayer(
             slot,
-            {4: FakeKernel(mode)},
+            {8: FakeKernel(mode)},
             args,
             mode,
             index_share_mode=mode,

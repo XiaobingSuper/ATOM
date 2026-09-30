@@ -37,6 +37,7 @@ class AttentionWeight(str, Enum):
     """Packed attention-weight representation."""
 
     FP8_BLOCK128 = "fp8_block128"
+    FP8_PER_ROW = "fp8_per_row"
     BF16 = "bf16"
 
 
