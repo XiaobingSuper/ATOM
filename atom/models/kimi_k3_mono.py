@@ -21,6 +21,10 @@ from atom.model_ops.monokernel.config import (
     Mxfp4WeightLayout,
 )
 from atom.model_ops.monokernel.abi import AgenticDecodeShape
+from atom.model_ops.monokernel.k3.abi import (
+    KimiAgenticRuntime,
+    KimiAgenticShape,
+)
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
     select_backend,
@@ -37,7 +41,7 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-_NATIVE_BUCKETS = 2  # S4 and S8
+_NATIVE_BUCKETS = 6  # ordinary S4/S8 plus Agentic B1/B2/B4/B8 q=8
 # Immutable projections/MoE weights are shared by S4/S8. Each bucket retains
 # only graph-stable activation/scratch workspaces.
 _PACKED_RESERVE_PER_LAYER = 256 << 20
@@ -224,6 +228,7 @@ class _KimiLayerOp:
         attention_symmetric_allreduce=None,
         moe_symmetric_allreduce=None,
         state_dtype: torch.dtype = torch.float32,
+        agentic_batch_size: int = 0,
         defer_collectives: bool = False,
         packed_artifacts: dict[str, object] | None = None,
     ) -> None:
@@ -234,15 +239,13 @@ class _KimiLayerOp:
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
         op_type = KimiK3MonoKernel if mode == "mono" else _KimiK3KdaStagedPath
-        self.op = op_type(
-            weights,
-            samples,
+        op_kwargs = dict(
             layer_idx=layer.layer_idx,
             rank=rank,
             npes=npes,
             group=tp.cpu_group,
             reduce_group=tp.device_group,
-            mtp=False,
+            mtp=agentic_batch_size > 0,
             conv_state_layout=ConvStateLayout.TIME_MAJOR,
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             moe_symmetric_allreduce=moe_symmetric_allreduce,
@@ -250,6 +253,11 @@ class _KimiLayerOp:
             defer_collectives=defer_collectives,
             packed_artifacts=packed_artifacts,
         )
+        if agentic_batch_size:
+            if mode != "mono":
+                raise ValueError("Kimi Agentic q=8 requires the full MonoKernel")
+            op_kwargs["agentic_batch_size"] = agentic_batch_size
+        self.op = op_type(weights, samples, **op_kwargs)
 
     def initialize_collectives(self, attention=None, moe=None):
         return self.op.initialize_collectives(attention, moe)
@@ -262,11 +270,14 @@ class KimiMonoDecode:
         self._lm = causal_lm
         self._atom_config = atom_config
         self._mode = mode
-        self._ops: dict[tuple[int, int, str, torch.dtype], _KimiLayerOp] = {}
+        self._ops: dict[
+            tuple[int, int, str, torch.dtype, int],
+            _KimiLayerOp,
+        ] = {}
         self._weights: dict[int, LayerWeights] = {}
         self._packed_artifacts: dict[int, dict[str, object]] = {}
         self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
-        self._refused: set[tuple[int, int, str, torch.dtype]] = set()
+        self._refused: set[tuple[int, int, str, torch.dtype, int]] = set()
         self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
         if not self._enabled:
@@ -316,7 +327,7 @@ class KimiMonoDecode:
             self._reductions.pop(key)
 
     def memory_reserve_bytes(self) -> int:
-        """Reserve KV-budget headroom for lazy S4/S8 packed layer artifacts."""
+        """Reserve KV-budget headroom for every lazy native graph bucket."""
 
         if not self._enabled:
             return 0
@@ -341,13 +352,30 @@ class KimiMonoDecode:
             or not inputs_embeds.is_contiguous()
         ):
             return self._fallback("inputs_embeds", samples)
+        fwd = get_forward_context()
+        if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
+            return self._fallback("forward_mode", samples)
+        md = getattr(fwd.attn_metadata, "kda_metadata", None)
+        if md is None:
+            md = getattr(fwd.attn_metadata, "gdn_metadata", None)
+        if md is None:
+            return self._fallback("metadata", samples)
+        agentic = md.num_spec_decodes > 0
+        query_len = getattr(fwd.context, "max_seqlen_q", 1)
+        replay_ssm = getattr(md, "replayssm", False)
+        speculative = getattr(self._atom_config, "speculative_config", None)
+        if agentic and getattr(speculative, "method", None) != "dspark":
+            return self._fallback("spec_method", samples)
         backend = select_backend(
             "kimi_k3",
             self._mode,
             samples=samples,
             tp_size=self._atom_config.tensor_parallel_size,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            mtp=agentic,
             dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
+            query_len=query_len,
+            replay_ssm=replay_ssm,
         )
         if (
             backend is None
@@ -356,44 +384,71 @@ class KimiMonoDecode:
             or not positions.is_contiguous()
         ):
             return self._fallback("dispatch", samples)
-        fwd = get_forward_context()
-        if fwd.context is None or fwd.context.is_prefill or fwd.ubatch_slices is not None:
-            return self._fallback("forward_mode", samples)
-        shape = None
-        if hasattr(fwd.context, "running_bs"):
+        agentic_batch_size = 0
+        if agentic:
             try:
-                shape = AgenticDecodeShape.from_forward_mode(
+                common = AgenticDecodeShape.from_forward_mode(
                     fwd.context,
                     batch_capacity=fwd.context.running_bs,
-                    row_capacity=max(
-                        samples,
-                        fwd.context.running_bs * fwd.context.max_seqlen_q,
-                    ),
+                    row_capacity=samples,
                 )
-            except ValueError:
+                shape = KimiAgenticShape(
+                    common=common,
+                    dcp_size=getattr(
+                        self._atom_config,
+                        "decode_context_parallel_size",
+                        1,
+                    ),
+                    replay_ssm=replay_ssm,
+                )
+                KimiAgenticRuntime.bind(
+                    shape,
+                    md.spec_state_indices_tensor,
+                    md.num_accepted_tokens,
+                )
+            except (AttributeError, TypeError, ValueError):
                 return self._fallback("agentic_shape", samples)
-            if shape.query_len != 1 or shape.actual_rows > samples:
+            agentic_batch_size = shape.common.batch_capacity
+            supported = (
+                md.num_prefills == 0
+                and md.num_decodes == 0
+                and 0 < md.num_spec_decodes <= agentic_batch_size
+                and 0 < md.num_actual_tokens <= samples
+                and md.num_spec_decode_tokens == md.num_actual_tokens
+            )
+        else:
+            shape = None
+            if hasattr(fwd.context, "running_bs"):
+                try:
+                    shape = AgenticDecodeShape.from_forward_mode(
+                        fwd.context,
+                        batch_capacity=fwd.context.running_bs,
+                        row_capacity=max(
+                            samples,
+                            fwd.context.running_bs * fwd.context.max_seqlen_q,
+                        ),
+                    )
+                except ValueError:
+                    return self._fallback("agentic_shape", samples)
+            if shape is not None and (
+                shape.query_len != 1 or shape.actual_rows > samples
+            ):
                 return self._fallback("agentic_shape", samples)
-        md = getattr(fwd.attn_metadata, "kda_metadata", None)
-        if md is None:
-            md = getattr(fwd.attn_metadata, "gdn_metadata", None)
-        if md is None:
-            return self._fallback("metadata", samples)
-        state_indices = getattr(md, "non_spec_state_indices_tensor", None)
-        if (
-            not isinstance(state_indices, torch.Tensor)
-            or state_indices.shape != (samples,)
-            or state_indices.dtype is not torch.int32
-            or not state_indices.is_contiguous()
-        ):
-            return self._fallback("state_indices", samples)
-        supported = (
-            md.num_prefills == 0
-            and md.num_decodes == md.num_actual_tokens
-            and md.num_spec_decodes == 0
-            and 0 < md.num_actual_tokens <= samples
-            and not getattr(md, "replayssm", False)
-        )
+            state_indices = getattr(md, "non_spec_state_indices_tensor", None)
+            if (
+                not isinstance(state_indices, torch.Tensor)
+                or state_indices.shape != (samples,)
+                or state_indices.dtype is not torch.int32
+                or not state_indices.is_contiguous()
+            ):
+                return self._fallback("state_indices", samples)
+            supported = (
+                md.num_prefills == 0
+                and md.num_decodes == md.num_actual_tokens
+                and md.num_spec_decodes == 0
+                and 0 < md.num_actual_tokens <= samples
+                and not replay_ssm
+            )
         if not supported:
             return self._fallback("decode_shape", samples)
         model = getattr(getattr(self, "_lm", None), "model", None)
@@ -413,7 +468,16 @@ class KimiMonoDecode:
                 state_dtype = cache.v_cache.dtype
             elif cache.v_cache.dtype is not state_dtype:
                 return self._fallback("mixed_state_dtype", samples)
-        if state_dtype is None or not self._prepare(samples, state_dtype):
+        if agentic and state_dtype is not torch.float16:
+            return self._fallback("state_dtype", samples)
+        prepared = False
+        if state_dtype is not None:
+            prepared = (
+                self._prepare(samples, state_dtype, agentic_batch_size)
+                if agentic
+                else self._prepare(samples, state_dtype)
+            )
+        if not prepared:
             return self._fallback("prepare", samples)
         return True
 
@@ -421,6 +485,7 @@ class KimiMonoDecode:
         self,
         samples: int,
         state_dtype: torch.dtype = torch.float32,
+        agentic_batch_size: int = 0,
     ):
         model = self._lm.model
         specs = []
@@ -431,7 +496,9 @@ class KimiMonoDecode:
                 samples=samples,
                 tp_size=8,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
+                mtp=agentic_batch_size > 0,
                 dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
+                query_len=8 if agentic_batch_size else 1,
                 is_kda=layer.is_linear_attn,
                 has_moe=hasattr(layer, "block_sparse_moe"),
             )
@@ -440,13 +507,24 @@ class KimiMonoDecode:
                     (
                         layer,
                         backend,
-                        (layer.layer_idx, samples, backend, state_dtype),
+                        (
+                            layer.layer_idx,
+                            samples,
+                            backend,
+                            state_dtype,
+                            agentic_batch_size,
+                        ),
                     )
                 )
         return specs
 
-    def _prepare(self, samples: int, state_dtype: torch.dtype) -> bool:
-        specs = self._layer_specs(samples, state_dtype)
+    def _prepare(
+        self,
+        samples: int,
+        state_dtype: torch.dtype,
+        agentic_batch_size: int = 0,
+    ) -> bool:
+        specs = self._layer_specs(samples, state_dtype, agentic_batch_size)
         if not specs:
             return False
         if all(key in self._ops for _, _, key in specs):
@@ -490,6 +568,7 @@ class KimiMonoDecode:
                         samples,
                         backend,
                         state_dtype=state_dtype,
+                        agentic_batch_size=agentic_batch_size,
                         defer_collectives=True,
                         packed_artifacts=packed_artifacts,
                     )
@@ -567,6 +646,7 @@ class KimiMonoDecode:
         layer,
         samples: int,
         state_dtype: torch.dtype,
+        agentic_batch_size: int = 0,
     ) -> _KimiLayerOp:
         backend = select_backend(
             "kimi_k3",
@@ -574,13 +654,21 @@ class KimiMonoDecode:
             samples=samples,
             tp_size=8,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            mtp=agentic_batch_size > 0,
             dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
+            query_len=8 if agentic_batch_size else 1,
             is_kda=layer.is_linear_attn,
             has_moe=hasattr(layer, "block_sparse_moe"),
         )
         if backend is None:
             raise MonoUnsupported("layer fallback")
-        key = (layer.layer_idx, samples, backend, state_dtype)
+        key = (
+            layer.layer_idx,
+            samples,
+            backend,
+            state_dtype,
+            agentic_batch_size,
+        )
         try:
             return self._ops[key]
         except KeyError as error:
@@ -599,12 +687,26 @@ class KimiMonoDecode:
             md = fwd.attn_metadata.gdn_metadata
         samples = input_ids.numel()
         state_dtype = _kda_state_dtype(model, fwd) or torch.float32
+        agentic_batch_size = (
+            md.spec_state_indices_tensor.shape[0]
+            if md.num_spec_decodes > 0
+            else 0
+        )
         backend = select_backend(
             "kimi_k3",
             self._mode,
             samples=samples,
             tp_size=8,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
+            mtp=agentic_batch_size > 0,
+            dcp=getattr(
+                self._atom_config,
+                "decode_context_parallel_size",
+                1,
+            )
+            > 1,
+            query_len=8 if agentic_batch_size else 1,
+            replay_ssm=getattr(md, "replayssm", False),
         )
         self._route_stats().record_hit(backend or "baseline", samples)
         hidden = model.get_input_embeddings(input_ids) if inputs_embeds is None else inputs_embeds
@@ -612,7 +714,12 @@ class KimiMonoDecode:
         pending = pending2 = None
         for layer in model.layers[model.start_layer : model.end_layer]:
             try:
-                owned = self._op(layer, samples, state_dtype)
+                owned = self._op(
+                    layer,
+                    samples,
+                    state_dtype,
+                    agentic_batch_size,
+                )
             except MonoUnsupported:
                 hidden, pending, pending2, blocks = layer(
                     positions,
@@ -631,14 +738,23 @@ class KimiMonoDecode:
                 extra = hidden.new_zeros(samples, block_idx + 1 - blocks.shape[1], hidden.shape[-1])
                 blocks = torch.cat((blocks, extra), dim=1)
             cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
-            state_indices = md.non_spec_state_indices_tensor[:samples]
+            state_indices = (
+                md.spec_state_indices_tensor
+                if agentic_batch_size
+                else md.non_spec_state_indices_tensor[:samples]
+            )
+            forward_kwargs = {"epoch_layer": layer.layer_idx}
+            if agentic_batch_size:
+                forward_kwargs["num_accepted_tokens"] = (
+                    md.num_accepted_tokens
+                )
             hidden = owned.op.forward(
                 hidden,
                 blocks,
                 state_indices,
                 cache.k_cache,
                 cache.v_cache,
-                epoch_layer=layer.layer_idx,
+                **forward_kwargs,
             )
         hidden, _ = model.output_attn_res(hidden, blocks, pending, pending2)
         return hidden

@@ -1526,3 +1526,154 @@ def test_kimi_full_monokernel_rejects_dcp_and_replayssm():
             dcp_size=8,
             replay_ssm=True,
         )
+
+
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
+def test_kimi_agentic_q8_uses_fp16_batch_snapshot_abi(batch_capacity):
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import KimiAgenticShape
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=batch_capacity,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+        state_dtype=torch.float16,
+    )
+
+    assert shape.common.row_capacity == batch_capacity * 8
+    assert shape.snapshot_shape == (batch_capacity, 8)
+    assert shape.accepted_shape == (batch_capacity,)
+
+
+def test_kimi_agentic_runtime_selects_mixed_rollback_snapshots():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticRuntime,
+        KimiAgenticShape,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=3,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    snapshots = torch.tensor(
+        (
+            (10, 11, 12, 13, 14, 15, 16, 17),
+            (20, 21, 22, 23, 24, 25, 26, 27),
+            (30, 31, 32, 33, 34, 35, 36, 37),
+        ),
+        dtype=torch.int32,
+    )
+    accepted = torch.tensor((1, 4, 8), dtype=torch.int32)
+
+    inputs, outputs = KimiAgenticRuntime.bind(
+        shape,
+        snapshots,
+        accepted,
+    ).transition_slots()
+
+    assert inputs.tolist() == [
+        [10, 10, 11, 12, 13, 14, 15, 16],
+        [23, 20, 21, 22, 23, 24, 25, 26],
+        [37, 30, 31, 32, 33, 34, 35, 36],
+    ]
+    assert outputs.data_ptr() == snapshots.data_ptr()
+
+
+def test_kimi_agentic_transition_slots_roll_back_conv_per_request():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticRuntime,
+        KimiAgenticShape,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=3,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    snapshots = torch.arange(24, dtype=torch.int32).view(3, 8)
+    accepted = torch.tensor((1, 4, 8), dtype=torch.int32)
+    inputs, outputs = KimiAgenticRuntime.bind(
+        shape,
+        snapshots,
+        accepted,
+    ).transition_slots()
+    conv = torch.arange(24, dtype=torch.int64) * 100
+
+    for request in range(3):
+        for token in range(8):
+            conv[outputs[request, token]] = (
+                conv[inputs[request, token]] + token + 1
+            )
+
+    assert conv[snapshots[0]].tolist() == [1, 3, 6, 10, 15, 21, 28, 36]
+    assert conv[snapshots[1]].tolist() == [
+        1101,
+        1103,
+        1106,
+        1110,
+        1115,
+        1121,
+        1128,
+        1136,
+    ]
+    assert conv[snapshots[2]].tolist() == [
+        2301,
+        2303,
+        2306,
+        2310,
+        2315,
+        2321,
+        2328,
+        2336,
+    ]
+
+
+def test_kimi_agentic_runtime_rejects_non_batch_snapshot_metadata():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticRuntime,
+        KimiAgenticShape,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=2,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    snapshots = torch.arange(16, dtype=torch.int32).view(2, 8)
+    accepted = torch.ones(2, dtype=torch.int32)
+
+    with pytest.raises(ValueError, match=r"\[2, 8\]"):
+        KimiAgenticRuntime.bind(shape, snapshots[:, :-1], accepted)
+    with pytest.raises(ValueError, match=r"\[2\]"):
+        KimiAgenticRuntime.bind(shape, snapshots, accepted[:1])
+    with pytest.raises(ValueError, match="int32"):
+        KimiAgenticRuntime.bind(shape, snapshots.long(), accepted)
+
+
+def test_kimi_agentic_shape_rejects_non_q8_or_non_fp16_state():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import KimiAgenticShape
+
+    with pytest.raises(ValueError, match="q=8"):
+        KimiAgenticShape.for_graph(
+            batch_capacity=2,
+            query_len=4,
+            dcp_size=1,
+            replay_ssm=False,
+        )
+    with pytest.raises(ValueError, match="FP16"):
+        KimiAgenticShape.for_graph(
+            batch_capacity=2,
+            query_len=8,
+            dcp_size=1,
+            replay_ssm=False,
+            state_dtype=torch.float32,
+        )

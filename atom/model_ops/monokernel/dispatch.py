@@ -8,6 +8,7 @@ from __future__ import annotations
 MODES = ("off", "auto", "mono", "staged")
 SAMPLES = (4, 8)
 GLM52_AGENTIC_ROWS = (5, 6, 10, 12, 20, 24, 40, 48, 60, 72, 80, 96, 100)
+KIMI_AGENTIC_ROWS = (8, 16, 32, 64)
 
 
 class MonoUnsupported(Exception):
@@ -63,6 +64,8 @@ def select_backend(
     dpa: bool = False,
     dcp: bool = False,
     plugin: bool = False,
+    query_len: int = 1,
+    replay_ssm: bool = False,
     is_kda: bool = True,
     has_moe: bool = True,
     external_indexer: bool = True,
@@ -105,6 +108,24 @@ def select_backend(
             and cache_layout == "atom_fp8"
         ):
             return "agentic_full"
+        return None
+    if model == "kimi_k3" and mtp:
+        if (
+            mode == "mono"
+            and native
+            and decode
+            and samples in KIMI_AGENTIC_ROWS
+            and query_len == 8
+            and tp_size == 8
+            and kv_cache_dtype in ("bf16", "fp8")
+            and not dpa
+            and not dcp
+            and not plugin
+            and not replay_ssm
+            and is_kda
+            and has_moe
+        ):
+            return "mono"
         return None
     if (
         mode == "off"

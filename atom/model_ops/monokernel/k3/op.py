@@ -27,6 +27,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         group=None,
         reduce_group=None,
         mtp: bool = False,
+        agentic_batch_size: int = 0,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         attention_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         moe_symmetric_allreduce: SymmetricBf16Allreduce | None = None,
@@ -34,7 +35,17 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         defer_collectives: bool = False,
         packed_artifacts: dict[str, object] | None = None,
     ) -> None:
-        if state_dtype is not torch.float32:
+        if agentic_batch_size:
+            if (
+                not mtp
+                or samples != agentic_batch_size * 8
+                or state_dtype is not torch.float16
+            ):
+                raise ValueError(
+                    "Kimi Agentic MonoKernel requires q=8 MTP rows "
+                    "and FP16 recurrent state"
+                )
+        elif state_dtype is not torch.float32:
             raise ValueError("Kimi-K3 single-launch MonoKernel requires FP32 state")
         super().__init__(
             weights,
@@ -49,6 +60,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             fuse_shared_experts=True,
             reduce_backend="symmetric",
             mtp=mtp,
+            agentic_batch_size=agentic_batch_size,
             conv_state_layout=conv_state_layout,
             attention_symmetric_allreduce=attention_symmetric_allreduce,
             moe_symmetric_allreduce=moe_symmetric_allreduce,
@@ -67,6 +79,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         recurrent_state: torch.Tensor,
         *,
         x_out: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
         epoch_layer: int = 0,
         advance: bool = True,
     ) -> torch.Tensor:
@@ -93,6 +106,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             conv_state,
             recurrent_state,
             x_out=self.attention_delta,
+            num_accepted_tokens=num_accepted_tokens,
             block_residual=block_residual,
             pre_updated=self.pre_updated,
             pre_output=self.pre_attn,

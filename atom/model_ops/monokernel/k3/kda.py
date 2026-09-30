@@ -92,6 +92,7 @@ class KimiK3KdaAttention:
         launches_per_step: int = MAX_LAYERS_PER_STEP,
         single_launch_attention: bool = True,
         mtp: bool = False,
+        agentic_batch_size: int = 0,
         conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
         symmetric_allreduce: SymmetricBf16Allreduce | None = None,
         state_dtype: torch.dtype = torch.float32,
@@ -115,6 +116,16 @@ class KimiK3KdaAttention:
             raise TypeError(f"conv_state_layout must be ConvStateLayout, got {conv_state_layout!r}")
         if state_dtype not in (torch.float16, torch.float32):
             raise ValueError(f"state_dtype must be float16 or float32, got {state_dtype}")
+        if agentic_batch_size and (
+            not mtp
+            or agentic_batch_size not in (1, 2, 4, 8)
+            or samples != agentic_batch_size * 8
+            or state_dtype is not torch.float16
+        ):
+            raise ValueError(
+                "Kimi Agentic KDA requires B in {1,2,4,8}, q=8, "
+                "MTP, and FP16 recurrent state"
+            )
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
             raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], " f"got {launches_per_step}")
 
@@ -129,6 +140,7 @@ class KimiK3KdaAttention:
         self.reduce_backend = reduce_backend
         self.launches_per_step = launches_per_step
         self.mtp = mtp
+        self.agentic_batch_size = agentic_batch_size
         self.conv_state_layout = conv_state_layout
         self.state_dtype = state_dtype
         atom_weight_layout = weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
@@ -198,7 +210,11 @@ class KimiK3KdaAttention:
         self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
         self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
-        self.core = KimiK3KdaRecurrence(samples, conv_state_layout, state_dtype)
+        self.core = (
+            None
+            if agentic_batch_size
+            else KimiK3KdaRecurrence(samples, conv_state_layout, state_dtype)
+        )
         if reduce_backend == "symmetric":
             self.symmetric_allreduce = symmetric_allreduce
             if self.symmetric_allreduce is None and not defer_collectives:
@@ -228,7 +244,7 @@ class KimiK3KdaAttention:
         if (
             reduce_backend == "symmetric"
             and single_launch_attention
-            and state_dtype is torch.float32
+            and (state_dtype is torch.float32 or agentic_batch_size)
             and (self.symmetric_allreduce is not None or defer_collectives)
         ):
             self._pack_monokernel_projections()
@@ -243,10 +259,12 @@ class KimiK3KdaAttention:
                 npes,
                 launches_per_step,
                 mtp=mtp,
+                agentic_batch_size=agentic_batch_size,
+                state_dtype=state_dtype,
                 conv_state_layout=conv_state_layout,
                 atom_expert_layout=self.atom_expert_layout,
             )
-        elif mtp:
+        elif mtp and not agentic_batch_size:
             raise ValueError("Kimi-K3 MTP currently requires FP32 state")
         if reduce_group is None:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
@@ -351,6 +369,8 @@ class KimiK3KdaAttention:
             self.block_write_idx,
             fuse_moe,
             self.mtp,
+            agentic_batch_size=self.agentic_batch_size,
+            state_dtype=self.state_dtype,
             conv_state_layout=self.conv_state_layout,
             atom_expert_layout=self.atom_expert_layout,
         )
@@ -363,6 +383,7 @@ class KimiK3KdaAttention:
         recurrent_state: torch.Tensor,
         *,
         x_out: torch.Tensor | None = None,
+        num_accepted_tokens: torch.Tensor | None = None,
         block_residual: torch.Tensor | None = None,
         pre_updated: torch.Tensor | None = None,
         pre_output: torch.Tensor | None = None,
@@ -380,14 +401,37 @@ class KimiK3KdaAttention:
 
         if not 0 <= layer < self.launches_per_step:
             raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
-        expected_indices = (self.S + 1,) if self.mtp else (self.S,)
+        expected_indices = (
+            (self.agentic_batch_size, 8)
+            if self.agentic_batch_size
+            else ((self.S + 1,) if self.mtp else (self.S,))
+        )
         if (
             state_indices.shape != expected_indices
             or state_indices.dtype != torch.int32
             or not state_indices.is_contiguous()
         ):
-            mode = "MTP snapshot chain" if self.mtp else "decode slots"
+            mode = "Agentic snapshot matrix" if self.agentic_batch_size else (
+                "MTP snapshot chain" if self.mtp else "decode slots"
+            )
             raise ValueError(f"state_indices must be contiguous int32 {list(expected_indices)} for {mode}")
+        if self.agentic_batch_size:
+            expected_accepted = (self.agentic_batch_size,)
+            if (
+                num_accepted_tokens is None
+                or num_accepted_tokens.shape != expected_accepted
+                or num_accepted_tokens.dtype != torch.int32
+                or not num_accepted_tokens.is_contiguous()
+                or num_accepted_tokens.device != state_indices.device
+            ):
+                raise ValueError(
+                    "num_accepted_tokens must be contiguous int32 "
+                    f"{list(expected_accepted)} on the snapshot device"
+                )
+        elif num_accepted_tokens is not None:
+            raise ValueError(
+                "num_accepted_tokens is valid only for Agentic q=8"
+            )
         expected_hidden = (self.S, self.config.hidden)
         if (
             hidden_states.shape != expected_hidden
@@ -506,6 +550,11 @@ class KimiK3KdaAttention:
                 self.t["g_kda_out"].data_ptr(),
                 self.w_kda_o_packed.data_ptr(),
                 state_indices.data_ptr(),
+                (
+                    num_accepted_tokens.data_ptr()
+                    if num_accepted_tokens is not None
+                    else state_indices.data_ptr()
+                ),
                 conv_state.data_ptr(),
                 recurrent_state.data_ptr(),
                 self.monokernel_scratch.data_ptr(),
@@ -534,6 +583,7 @@ class KimiK3KdaAttention:
         output_gate = self.fused_input[:, 3 * projection : 4 * projection]
         beta = self.fused_input[:, 4 * projection : 4 * projection + heads].view(self.S, 1, heads)
         f_a = self.fused_input[:, 4 * projection + heads :]
+        assert self.core is not None
         self.core(
             mixed_qkv,
             beta,

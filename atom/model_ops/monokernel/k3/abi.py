@@ -23,14 +23,22 @@ class KimiAgenticShape:
     def __post_init__(self) -> None:
         if self.dcp_size != 1:
             raise ValueError("Kimi full MonoKernel supports TP-only DCP1")
-        if self.common.query_len not in (1, 8):
+        if self.common.query_len != 8:
             raise ValueError(
-                f"Kimi TP-only query length must be 1 or 8, got {self.common.query_len}"
+                f"Kimi full Agentic MonoKernel requires q=8, got {self.common.query_len}"
             )
-        if self.state_dtype not in (torch.float16, torch.float32):
-            raise ValueError("Kimi recurrent state must use FP16 or FP32")
+        if self.state_dtype is not torch.float16:
+            raise ValueError("Kimi full Agentic recurrent state must use FP16")
         if self.replay_ssm:
             raise ValueError("ReplaySSM is used only by unsupported DCP bands")
+
+    @property
+    def snapshot_shape(self) -> tuple[int, int]:
+        return (self.common.batch_capacity, self.common.query_len)
+
+    @property
+    def accepted_shape(self) -> tuple[int]:
+        return (self.common.batch_capacity,)
 
     @classmethod
     def for_graph(
@@ -55,4 +63,55 @@ class KimiAgenticShape:
         )
 
 
-__all__ = ["KimiAgenticShape"]
+@dataclass(frozen=True)
+class KimiAgenticRuntime:
+    """Graph-stable q=8 snapshot metadata for one full-layer launch."""
+
+    shape: KimiAgenticShape
+    snapshot_slots: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+
+    @classmethod
+    def bind(
+        cls,
+        shape: KimiAgenticShape,
+        snapshot_slots: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+    ) -> "KimiAgenticRuntime":
+        if (
+            snapshot_slots.shape != shape.snapshot_shape
+            or snapshot_slots.dtype is not torch.int32
+            or not snapshot_slots.is_contiguous()
+        ):
+            raise ValueError(
+                "snapshot_slots must be contiguous int32 "
+                f"{list(shape.snapshot_shape)}"
+            )
+        if (
+            num_accepted_tokens.shape != shape.accepted_shape
+            or num_accepted_tokens.dtype is not torch.int32
+            or not num_accepted_tokens.is_contiguous()
+        ):
+            raise ValueError(
+                "num_accepted_tokens must be contiguous int32 "
+                f"{list(shape.accepted_shape)}"
+            )
+        if snapshot_slots.device != num_accepted_tokens.device:
+            raise ValueError("Kimi Agentic metadata must use one device")
+        return cls(shape, snapshot_slots, num_accepted_tokens)
+
+    def transition_slots(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Materialize the circular snapshot transitions for reference checks."""
+
+        query_len = self.shape.common.query_len
+        columns = torch.arange(
+            query_len,
+            dtype=torch.int64,
+            device=self.snapshot_slots.device,
+        ).expand(self.snapshot_slots.shape[0], query_len).clone()
+        columns[:, 0] = self.num_accepted_tokens.to(torch.int64) - 1
+        columns[:, 1:] -= 1
+        return self.snapshot_slots.gather(1, columns), self.snapshot_slots
+
+
+__all__ = ["KimiAgenticRuntime", "KimiAgenticShape"]

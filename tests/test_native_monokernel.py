@@ -129,6 +129,46 @@ def _kimi_decode_context(samples, actual_tokens=None, state_indices=None):
     )
 
 
+def _kimi_agentic_context(batch_capacity, accepted=None, *, replay_ssm=False):
+    import torch
+
+    query_len = 8
+    rows = batch_capacity * query_len
+    snapshots = torch.arange(rows, dtype=torch.int32).view(
+        batch_capacity,
+        query_len,
+    )
+    if accepted is None:
+        accepted = torch.ones(batch_capacity, dtype=torch.int32)
+    metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=batch_capacity,
+        num_spec_decode_tokens=rows,
+        num_actual_tokens=rows,
+        replayssm=replay_ssm,
+        spec_state_indices_tensor=snapshots,
+        spec_query_start_loc=torch.arange(
+            0,
+            rows + 1,
+            query_len,
+            dtype=torch.int32,
+        ),
+        num_accepted_tokens=accepted,
+    )
+    return SimpleNamespace(
+        context=SimpleNamespace(
+            is_prefill=False,
+            running_bs=batch_capacity,
+            running_tokens=rows,
+            max_seqlen_q=query_len,
+        ),
+        ubatch_slices=None,
+        attn_metadata=SimpleNamespace(kda_metadata=metadata),
+        kv_cache_data={},
+    )
+
+
 def test_public_package_import_is_lazy():
     code = """
 import sys
@@ -320,6 +360,14 @@ def test_kimi_monokernel_compile_cache_keys_layer_geometry():
         build_kimi_k3_monokernel(4, attn_res_blocks=2, fuse_moe=True),
         build_kimi_k3_monokernel(8, attn_res_blocks=1, fuse_moe=True),
         build_kimi_k3_monokernel(
+            16,
+            attn_res_blocks=1,
+            fuse_moe=True,
+            mtp=True,
+            agentic_batch_size=2,
+            state_dtype=torch.float16,
+        ),
+        build_kimi_k3_monokernel(
             4,
             attn_res_blocks=1,
             fuse_moe=True,
@@ -328,6 +376,64 @@ def test_kimi_monokernel_compile_cache_keys_layer_geometry():
     )
 
     assert len({launch.func.__name__ for launch in launches}) == len(launches)
+
+
+@pytest.mark.parametrize(
+    ("batch_capacity", "rows"),
+    ((1, 8), (2, 16), (4, 32), (8, 64)),
+)
+def test_kimi_agentic_host_builder_layout(batch_capacity, rows):
+    pytest.importorskip("flydsl")
+    import torch
+
+    from atom.model_ops.monokernel.k3.kernel import (
+        build_kimi_k3_monokernel,
+        monokernel_layout,
+    )
+
+    layout = monokernel_layout(rows, fuse_attn_res=True, fuse_moe=True, mtp=True)
+
+    assert layout["_bytes"] > layout["mtp_norm_ready"]
+    assert "agentic_batch_size" in __import__("inspect").signature(
+        build_kimi_k3_monokernel
+    ).parameters
+    assert "state_dtype" in __import__("inspect").signature(
+        build_kimi_k3_monokernel
+    ).parameters
+    assert batch_capacity == rows // 8
+    assert torch.float16.itemsize == 2
+
+
+def test_kimi_full_monokernel_accepts_fp16_agentic_construction(monkeypatch):
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.k3 import op as module
+
+    captured = {}
+
+    def fake_init(self, _weights, samples, **kwargs):
+        captured.update(samples=samples, **kwargs)
+        self.attention = SimpleNamespace(
+            configure_monokernel=lambda *_args, **inner: captured.update(inner)
+        )
+
+    monkeypatch.setattr(module._KimiK3KdaStagedPath, "__init__", fake_init)
+
+    module.KimiK3MonoKernel(
+        object(),
+        16,
+        layer_idx=7,
+        rank=0,
+        state_dtype=torch.float16,
+        mtp=True,
+        agentic_batch_size=2,
+    )
+
+    assert captured["samples"] == 16
+    assert captured["state_dtype"] is torch.float16
+    assert captured["mtp"] is True
+    assert captured["agentic_batch_size"] == 2
+    assert captured["fuse_moe"] is True
 
 
 def test_scaled_mfma_uses_flydsl_v0341_operand_abi():
@@ -513,6 +619,24 @@ def test_model_specific_backend_selection():
     assert select_backend("kimi_k3", "auto", **common, dcp=True) is None
     assert select_backend("kimi_k3", "auto", **common, is_kda=False) is None
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
+
+
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
+def test_kimi_full_agentic_dispatch_is_explicit_mono_only(batch_capacity):
+    common = dict(
+        samples=batch_capacity * 8,
+        query_len=8,
+        tp_size=8,
+        kv_cache_dtype="fp8",
+        mtp=True,
+    )
+
+    assert select_backend("kimi_k3", "mono", **common) == "mono"
+    assert select_backend("kimi_k3", "auto", **common) is None
+    assert select_backend("kimi_k3", "mono", **common, dcp=True) is None
+    assert (
+        select_backend("kimi_k3", "mono", **common, replay_ssm=True) is None
+    )
 
 
 @pytest.mark.parametrize(("rows", "mtp", "dcp"), ((48, True, False), (80, True, True)))
@@ -2185,14 +2309,14 @@ def test_kimi_failed_prepare_preserves_existing_shared_reductions():
     assert runner._reductions == {(4, "staged"): existing}
 
 
-def test_kimi_memory_reserve_tracks_persistent_packed_artifacts():
+def test_kimi_memory_reserve_tracks_all_native_graph_buckets():
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
     runner._layer_specs = lambda _samples: [object(), object(), object()]
 
     assert runner.memory_reserve_bytes() == 3 * (
-        (256 << 20) + 2 * (32 << 20)
+        (256 << 20) + 6 * (32 << 20)
     )
 
 
@@ -2307,6 +2431,163 @@ def test_kimi_supports_rejects_multi_token_decode(monkeypatch):
         None,
         torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
     )
+
+
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
+def test_kimi_supports_agentic_q8_fp16_snapshots(monkeypatch, batch_capacity):
+    import torch
+
+    module = _kimi_mono_module()
+    rows = batch_capacity * 8
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    layer = SimpleNamespace(
+        layer_idx=1,
+        is_linear_attn=True,
+        block_sparse_moe=object(),
+    )
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[layer], start_layer=0, end_layer=1)
+    )
+    context = _kimi_agentic_context(
+        batch_capacity,
+        torch.arange(1, batch_capacity + 1, dtype=torch.int32).clamp(max=8),
+    )
+    context.kv_cache_data = {
+        "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float16))
+    }
+    monkeypatch.setattr(module, "_kda_state_pool_supported", lambda _cache: True)
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    prepared = []
+    runner._prepare = (
+        lambda samples, dtype, agentic_batch_size=0: prepared.append(
+            (samples, dtype, agentic_batch_size)
+        )
+        or True
+    )
+
+    assert runner.supports(
+        torch.arange(rows),
+        torch.arange(rows, dtype=torch.int64),
+        None,
+        torch.zeros(rows, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
+    )
+    assert prepared == [(rows, torch.float16, batch_capacity)]
+
+
+@pytest.mark.parametrize(
+    ("mode", "dcp_size", "replay_ssm", "spec_method"),
+    (
+        ("auto", 1, False, "dspark"),
+        ("mono", 2, False, "dspark"),
+        ("mono", 1, True, "dspark"),
+        ("mono", 1, False, "mtp"),
+    ),
+)
+def test_kimi_agentic_keeps_unsupported_routes_on_baseline(
+    monkeypatch,
+    mode,
+    dcp_size,
+    replay_ssm,
+    spec_method,
+):
+    import torch
+
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = mode
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=dcp_size,
+        speculative_config=SimpleNamespace(method=spec_method),
+    )
+    context = _kimi_agentic_context(2, replay_ssm=replay_ssm)
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+
+    assert not runner.supports(
+        torch.arange(16),
+        torch.arange(16, dtype=torch.int64),
+        None,
+        torch.zeros(16, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
+    )
+
+
+def test_kimi_agentic_forward_passes_snapshot_matrix_and_acceptance(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    batch_capacity = 2
+    rows = batch_capacity * 8
+    accepted = torch.tensor((2, 7), dtype=torch.int32)
+    context = _kimi_agentic_context(batch_capacity, accepted)
+    conv_state = torch.empty(1)
+    recurrent_state = torch.empty(1, dtype=torch.float16)
+    context.kv_cache_data = {
+        "layer_1": SimpleNamespace(
+            k_cache=conv_state,
+            v_cache=recurrent_state,
+        )
+    }
+    seen = []
+
+    class FakeOp:
+        block_write_idx = 0
+
+        @staticmethod
+        def forward(
+            hidden,
+            _blocks,
+            snapshots,
+            conv,
+            recurrent,
+            *,
+            num_accepted_tokens,
+            **_kwargs,
+        ):
+            seen.append((snapshots, num_accepted_tokens, conv, recurrent))
+            return hidden
+
+    layer = SimpleNamespace(layer_idx=1, is_linear_attn=True)
+    model = SimpleNamespace(
+        get_input_embeddings=lambda _ids: pytest.fail("inputs_embeds must be used"),
+        layers=[layer],
+        start_layer=0,
+        end_layer=1,
+        output_attn_res=lambda hidden, *_args: (hidden, None),
+    )
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._lm = SimpleNamespace(model=model)
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+    )
+    runner._op = lambda *_args, **_kwargs: SimpleNamespace(op=FakeOp())
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    inputs = torch.zeros(
+        rows,
+        module.KIMI_K3_CONFIG.hidden,
+        dtype=torch.bfloat16,
+    )
+
+    output = runner.forward(torch.arange(rows), torch.arange(rows), inputs)
+
+    assert output is inputs
+    assert len(seen) == 1
+    snapshots, observed_accepted, conv, recurrent = seen[0]
+    assert snapshots.data_ptr() == context.attn_metadata.kda_metadata.spec_state_indices_tensor.data_ptr()
+    assert observed_accepted.data_ptr() == accepted.data_ptr()
+    assert conv.data_ptr() == conv_state.data_ptr()
+    assert recurrent.data_ptr() == recurrent_state.data_ptr()
 
 
 def test_kimi_state_pool_contract_accepts_agentic_fp16_recurrence():
@@ -2504,8 +2785,10 @@ def test_kimi_negative_slot_device_guards_cover_staged_and_mono_paths():
     mono = (root / "kernel.py").read_text()
 
     assert "if slot >= 0:\n            decode()\n        else:\n            zero_output()" in recurrence
-    assert "if (input_slot >= 0) & (output_slot >= 0):" in mono
-    assert mono.count("valid_state = (input_slot >= 0) & (output_slot >= 0)") >= 3
+    assert mono.count("(input_slot >= 0)") >= 4
+    assert mono.count("(output_slot >= 0)") >= 4
+    assert mono.count("& acceptance_valid") >= 3
+    assert "& token_acceptance_valid" in mono
 
 
 def test_per_layer_mailboxes_alternate_between_decode_steps():

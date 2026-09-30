@@ -18,6 +18,8 @@ Kimi-K3-specific extensions.
 
 import functools
 
+import torch
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
@@ -71,7 +73,6 @@ _OUTPUT_TASKS = _HIDDEN // _OUTPUT_ROW_TILE
 _CONV_CHANNELS = 3 * _PROJECTION
 _CONV_STATE_LENGTH = 3
 _CONV_KERNEL_WIDTH = 4
-_STATE_SLOT_BYTES = _HEADS * _HEAD_DIM * _HEAD_DIM * 4
 _K_LANES = 8
 _V_LANES = _WAVE_SIZE // _K_LANES
 _VALUES_PER_THREAD = 4
@@ -101,8 +102,11 @@ def monokernel_layout(
 ) -> dict[str, int]:
     """Return byte offsets for the MonoKernel's tagged mailboxes."""
 
-    if samples not in {1, 2, 4, 8}:
-        raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
+    supported = {1, 2, 4, 8, 16, 32, 64} if mtp else {1, 2, 4, 8}
+    if samples not in supported:
+        raise ValueError(
+            f"samples must be one of {sorted(supported)}, got {samples}"
+        )
     offsets = {
         "pre": 0,
         "pre_ready": 0,
@@ -206,13 +210,30 @@ def build_kimi_k3_monokernel(
     block_write_idx: int = -1,
     fuse_moe: bool = False,
     mtp: bool = False,
+    agentic_batch_size: int = 0,
+    state_dtype: torch.dtype = torch.float32,
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
     atom_expert_layout: bool = False,
 ):
     """Build the fixed-shape single-launch Kimi-K3 decode MonoKernel."""
 
-    if samples not in {1, 2, 4, 8}:
-        raise ValueError(f"samples must be one of {{1, 2, 4, 8}}, got {samples}")
+    if agentic_batch_size:
+        if (
+            agentic_batch_size not in (1, 2, 4, 8)
+            or not mtp
+            or samples != agentic_batch_size * 8
+            or state_dtype is not torch.float16
+        ):
+            raise ValueError(
+                "Kimi Agentic MonoKernel requires B in {1,2,4,8}, "
+                "q=8, MTP, and FP16 recurrent state"
+            )
+    elif samples not in {1, 2, 4, 8}:
+        raise ValueError(
+            f"samples must be one of {{1, 2, 4, 8}}, got {samples}"
+        )
+    elif state_dtype is not torch.float32:
+        raise ValueError("legacy Kimi MonoKernel state must use FP32")
     if npes != 8:
         raise ValueError(f"Kimi-K3 MonoKernel requires TP8, got TP{npes}")
     if not isinstance(conv_state_layout, ConvStateLayout):
@@ -226,6 +247,10 @@ def build_kimi_k3_monokernel(
         raise ValueError(f"attn_res_blocks must be >= -1, got {attn_res_blocks}")
     if block_write_idx >= 0 and block_write_idx != attn_res_blocks:
         raise ValueError("the pre-attention block write must append at attn_res_blocks")
+    state_fp16 = state_dtype is torch.float16
+    state_slot_bytes = (
+        _HEADS * _HEAD_DIM * _HEAD_DIM * (2 if state_fp16 else 4)
+    )
     latent_projection_waves = 3 if samples <= 4 else 4
     shared_projection_waves = 3 if samples <= 4 else 6
     mtp_splits = 4 if mtp else _MTP_SPLITS
@@ -363,6 +388,7 @@ def build_kimi_k3_monokernel(
         norm_weight: Int64,
         packed_output_weight: Int64,
         state_indices: Int64,
+        num_accepted_tokens: Int64,
         conv_state: Int64,
         recurrent_state: Int64,
         scratch: Int64,
@@ -413,6 +439,7 @@ def build_kimi_k3_monokernel(
         norm_weight_rsrc = rsrc(norm_weight)
         output_weight_rsrc = rsrc(packed_output_weight)
         indices_rsrc = rsrc(state_indices)
+        accepted_rsrc = rsrc(num_accepted_tokens)
         output_rsrc = rsrc(output)
         input_mailbox_rsrc = rsrc(scratch + fx.Int64(input_mailbox_offset))
         norm_mailbox_rsrc = rsrc(scratch + fx.Int64(norm_mailbox_offset))
@@ -450,6 +477,60 @@ def build_kimi_k3_monokernel(
         tag = step_value * launches_per_step + layer + 1
         slot = step_value & 1
         symmetric_base = fx.Int64(slot) * fx.Int64(slot_bytes)
+
+        def state_slots(sample):
+            if const_expr(agentic_batch_size > 0):
+                request = sample // 8
+                token = sample % 8
+                accepted = uniform(
+                    bo.buffer_load(
+                        accepted_rsrc,
+                        request,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                input_column = (token == 0).select(
+                    fx.max(fx.Int32(0), fx.min(accepted - 1, fx.Int32(7))),
+                    token - 1,
+                )
+                input_slot = uniform(
+                    bo.buffer_load(
+                        indices_rsrc,
+                        request * 8 + input_column,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                output_slot = uniform(
+                    bo.buffer_load(
+                        indices_rsrc,
+                        request * 8 + token,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                acceptance_valid = (accepted >= 1) & (accepted <= 8)
+                return input_slot, output_slot, acceptance_valid
+            input_slot = uniform(
+                bo.buffer_load(
+                    indices_rsrc,
+                    sample,
+                    vec_width=1,
+                    dtype=T.i32,
+                )
+            )
+            output_slot = input_slot
+            if const_expr(mtp):
+                output_slot = uniform(
+                    bo.buffer_load(
+                        indices_rsrc,
+                        sample + 1,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+            return input_slot, output_slot, input_slot == input_slot
 
         def stamp(index):
             if (bid == 0) & (tid == 0):
@@ -1856,16 +1937,22 @@ def build_kimi_k3_monokernel(
             stamp(1)
             sample = recurrence_task // _HEADS
             head = recurrence_task % _HEADS
-            input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
-            output_slot = input_slot
-            state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
+            input_slot, output_slot, acceptance_valid = state_slots(sample)
+            state_rsrc = rsrc(
+                recurrent_state
+                + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+            )
             state_out_rsrc = state_rsrc
             conv_state_rsrc = rsrc(
                 conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
             )
             conv_state_out_rsrc = conv_state_rsrc
 
-            if (input_slot >= 0) & (output_slot >= 0):
+            if (
+                (input_slot >= 0)
+                & (output_slot >= 0)
+                & acceptance_valid
+            ):
                 prepare_kda_gate(sample, head)
                 prepare_kda_conv(sample, head, conv_state_rsrc, conv_state_out_rsrc)
 
@@ -2055,16 +2142,21 @@ def build_kimi_k3_monokernel(
         if const_expr(mtp):
             conv_task = bid
             conv_tasks = samples * _HEADS
-            conv_active = conv_task < conv_tasks
-            if conv_active:
+            while conv_task < conv_tasks:
                 sample = conv_task // _HEADS
                 head = conv_task % _HEADS
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
-                output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
-                valid_state = (input_slot >= 0) & (output_slot >= 0)
+                input_slot, output_slot, acceptance_valid = state_slots(sample)
+                valid_state = (
+                    (input_slot >= 0)
+                    & (output_slot >= 0)
+                    & acceptance_valid
+                )
                 if valid_state:
                     prepare_kda_gate(sample, head)
-                if sample > 0:
+                token = sample
+                if const_expr(agentic_batch_size > 0):
+                    token = sample % 8
+                if token > 0:
                     if tid == 0:
                         load_i32(mtp_conv_ready_rsrc, (sample - 1) * _HEADS + head)
                     gpu.barrier()
@@ -2112,6 +2204,7 @@ def build_kimi_k3_monokernel(
                 gpu.barrier()
                 if tid == 0:
                     store_i32(mtp_conv_ready_rsrc, sample * _HEADS + head, 1)
+                conv_task = conv_task + _BLOCKS
 
             stamp(1)
 
@@ -2127,14 +2220,23 @@ def build_kimi_k3_monokernel(
                     lds_store(norm_sums, _WAVES + 1, get_input(sample, 4 * _PROJECTION + head))
                 gpu.barrier()
 
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample, vec_width=1, dtype=T.i32))
-                output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
-                valid_state = (input_slot >= 0) & (output_slot >= 0)
+                input_slot, output_slot, acceptance_valid = state_slots(sample)
+                valid_state = (
+                    (input_slot >= 0)
+                    & (output_slot >= 0)
+                    & acceptance_valid
+                )
                 result = fx.Float32(0.0)
                 value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
                 if valid_state:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
-                    state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                    state_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+                    )
+                    state_out_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(output_slot) * fx.Int64(state_slot_bytes)
+                    )
                     qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                     k_lane = lane % mtp_k_lanes
                     exp_a_log = exp(lds_load(norm_sums, _WAVES))
@@ -2326,8 +2428,11 @@ def build_kimi_k3_monokernel(
 
             def run_mtp_pair(pair, head, value_split, local_sample):
                 sample_base = pair * 2
+                token_base = sample_base
+                if const_expr(agentic_batch_size > 0):
+                    token_base = sample_base % 8
                 if tid == 0:
-                    if sample_base > 0:
+                    if token_base > 0:
                         load_f32(
                             mtp_state_ready_rsrc,
                             ((sample_base - 1) * _HEADS + head) * mtp_splits + value_split,
@@ -2341,24 +2446,38 @@ def build_kimi_k3_monokernel(
 
                 k_lane = lane % mtp_k_lanes
                 value_index = value_split * mtp_rows_per_split + wave * mtp_v_lanes + lane // mtp_k_lanes
-                input_slot = uniform(bo.buffer_load(indices_rsrc, sample_base, vec_width=1, dtype=T.i32))
+                input_slot, _, acceptance_valid = state_slots(sample_base)
                 state_vectors = [
                     fx.Vector.filled(_VALUES_PER_THREAD, 0.0, fx.Float32) for _ in range_constexpr(mtp_k_iters)
                 ]
-                if input_slot >= 0:
-                    state_rsrc = rsrc(recurrent_state + fx.Int64(input_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                if (input_slot >= 0) & acceptance_valid:
+                    state_rsrc = rsrc(
+                        recurrent_state
+                        + fx.Int64(input_slot) * fx.Int64(state_slot_bytes)
+                    )
                     for k_iter in range_constexpr(mtp_k_iters):
                         k_base = k_lane * _VALUES_PER_THREAD + k_iter * mtp_k_tile
                         state_offset = (head * _HEAD_DIM + value_index) * _HEAD_DIM + k_base
-                        state_vectors[k_iter] = fx.Vector(
-                            bo.buffer_load(
-                                state_rsrc,
-                                state_offset,
-                                vec_width=_VALUES_PER_THREAD,
-                                dtype=T.f32,
-                                cache_modifier=CM_DEV,
+                        if const_expr(state_fp16):
+                            state_vectors[k_iter] = fx.Vector(
+                                bo.buffer_load(
+                                    state_rsrc,
+                                    state_offset,
+                                    vec_width=_VALUES_PER_THREAD,
+                                    dtype=T.f16,
+                                    cache_modifier=CM_DEV,
+                                )
+                            ).to(fx.Float32)
+                        else:
+                            state_vectors[k_iter] = fx.Vector(
+                                bo.buffer_load(
+                                    state_rsrc,
+                                    state_offset,
+                                    vec_width=_VALUES_PER_THREAD,
+                                    dtype=T.f32,
+                                    cache_modifier=CM_DEV,
+                                )
                             )
-                        )
 
                 exp_a_log = exp(lds_load(norm_sums, _WAVES))
                 dt_vectors = [None] * mtp_k_iters
@@ -2387,12 +2506,20 @@ def build_kimi_k3_monokernel(
                         lds_store(norm_sums, _WAVES + 1, get_input(sample, 4 * _PROJECTION + head))
                     gpu.barrier()
 
-                    output_slot = uniform(bo.buffer_load(indices_rsrc, sample + 1, vec_width=1, dtype=T.i32))
-                    valid_state = (input_slot >= 0) & (output_slot >= 0)
+                    _, output_slot, token_acceptance_valid = state_slots(sample)
+                    valid_state = (
+                        (input_slot >= 0)
+                        & (output_slot >= 0)
+                        & token_acceptance_valid
+                    )
                     next_state_vectors = [loop_args[k_iter] for k_iter in range_constexpr(mtp_k_iters)]
                     result = fx.Float32(0.0)
                     if valid_state:
-                        state_out_rsrc = rsrc(recurrent_state + fx.Int64(output_slot) * fx.Int64(_STATE_SLOT_BYTES))
+                        state_out_rsrc = rsrc(
+                            recurrent_state
+                            + fx.Int64(output_slot)
+                            * fx.Int64(state_slot_bytes)
+                        )
                         qkvg_base = (sample * _HEADS + head) * 4 * _HEAD_DIM
                         beta_logit = lds_load(norm_sums, _WAVES + 1)
                         beta_value = sigmoid_batch([beta_logit])[0]
@@ -2537,8 +2664,11 @@ def build_kimi_k3_monokernel(
                                 value_new_vector,
                                 next_state_vectors[k_iter],
                             )
+                            state_value = next_state_vectors[k_iter]
+                            if const_expr(state_fp16):
+                                state_value = state_value.to(fx.Float16)
                             bo.buffer_store(
-                                next_state_vectors[k_iter],
+                                state_value,
                                 state_out_rsrc,
                                 state_offset,
                                 cache_modifier=CM_DEV,
@@ -2588,19 +2718,24 @@ def build_kimi_k3_monokernel(
                     run_mtp_recurrence(sample, head, value_split, local_qkvg)
             else:
                 mtp_pair_tasks = (samples // 2) * _HEADS
-                if bid < mtp_splits * mtp_pair_tasks:
-                    has_local_qkvg = bid < mtp_recurrence_tasks
-                    conv_sample = bid // _HEADS
+                mtp_task = bid
+                while mtp_task < mtp_splits * mtp_pair_tasks:
+                    has_local_qkvg = mtp_task < mtp_recurrence_tasks
+                    conv_sample = mtp_task // _HEADS
                     local_pair = conv_sample // 2
                     local_split = conv_sample % 2
-                    remote_task = bid - mtp_recurrence_tasks
+                    remote_task = mtp_task - mtp_recurrence_tasks
                     remote_split = 2 + remote_task // mtp_pair_tasks
                     remote_pair_task = remote_task % mtp_pair_tasks
                     pair = has_local_qkvg.select(local_pair, remote_pair_task // _HEADS)
-                    head = has_local_qkvg.select(bid % _HEADS, remote_pair_task % _HEADS)
+                    head = has_local_qkvg.select(
+                        mtp_task % _HEADS,
+                        remote_pair_task % _HEADS,
+                    )
                     value_split = has_local_qkvg.select(local_split, remote_split)
                     local_sample = has_local_qkvg.select(conv_sample, fx.Int32(-1))
                     run_mtp_pair(pair, head, value_split, local_sample)
+                    mtp_task = mtp_task + _BLOCKS
 
             mtp_norm_head_groups = _HEADS // 4
             mtp_norm_tasks = samples * mtp_norm_head_groups
@@ -2838,7 +2973,7 @@ def build_kimi_k3_monokernel(
             shared_tasks = sample_groups * shared_blocks
             projection_tasks = router_tasks + latent_tasks + shared_tasks
             projection_task = bid
-            if projection_task < projection_tasks:
+            while projection_task < projection_tasks:
                 if projection_task < router_tasks:
                     if const_expr(sample_groups == 1):
                         router_row_task = projection_task
@@ -2952,6 +3087,7 @@ def build_kimi_k3_monokernel(
                                 sample_base,
                                 staged_samples,
                             )
+                projection_task = projection_task + _BLOCKS
 
             # One selector CTA handles four samples, one sample per wave.
             selector_tasks = (samples + _WAVES - 1) // _WAVES
@@ -3483,6 +3619,7 @@ def build_kimi_k3_monokernel(
         norm_weight: Int64,
         packed_output_weight: Int64,
         state_indices: Int64,
+        num_accepted_tokens: Int64,
         conv_state: Int64,
         recurrent_state: Int64,
         scratch: Int64,
@@ -3537,6 +3674,7 @@ def build_kimi_k3_monokernel(
             norm_weight,
             packed_output_weight,
             state_indices,
+            num_accepted_tokens,
             conv_state,
             recurrent_state,
             scratch,
@@ -3553,6 +3691,7 @@ def build_kimi_k3_monokernel(
     launch.func.__name__ = (
         f"kimi_k3_monokernel_s{samples}_p{npes}_l{launches_per_step}"
         f"_b{block_tag}_w{write_tag}_f{int(fuse_moe)}_m{int(mtp)}"
+        f"_bq{agentic_batch_size}_h{2 if state_fp16 else 4}"
         f"_c{conv_state_layout.value}_a{int(atom_expert_layout)}"
     )
     return launch
