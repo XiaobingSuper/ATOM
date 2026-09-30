@@ -806,6 +806,327 @@ def test_glm_graph_layer_spec_validates_fp8_physical_cache():
         missing_scale.validate_cache_inputs()
 
 
+def test_glm_indexshare_stable_topk_publishes_physical_slots():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.index_share import stable_physical_topk
+
+    block_tables = torch.tensor([[7, 2]], dtype=torch.int32)
+    scores = torch.tensor([1.0, 4.0, 4.0, -2.0, 3.0], dtype=torch.float32)
+
+    slots, count = stable_physical_topk(
+        scores,
+        block_tables,
+        batch_id=0,
+        position=4,
+        request_context=5,
+        topk=8,
+    )
+
+    assert count == 5
+    assert slots.tolist() == [113, 114, 116, 112, 115, 0, 0, 0]
+
+
+def test_glm_indexshare_device_publication_uses_index_cache_pointer():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    start = source.index("# Index keys use LayerNorm")
+    publication = source[start : source.index('stamp("cache", t, 4)', start)]
+
+    assert "r_index_cache = _rsrc(index_cache)" in publication
+    assert "r_index_cache = _rsrc(indices)" not in publication
+
+
+def test_glm_indexshare_split_acquires_before_compact_metadata_load():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    split = source[source.index("def split_keys(t, s):"):]
+    split = split[: split.index("def gather_old_kv")]
+
+    ready = split.index('get(mb("indices_ready"), s)')
+    acquire = split.index("fx.memory_fence", ready)
+    bounds = split.index("row_index_bounds(s)")
+    assert ready < acquire < bounds
+
+
+def test_glm_indexshare_device_has_bounded_score_ordering_phase():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    selection = source[source.index("threshold = prefix"):]
+    selection = selection[: selection.index('stamp("index_select", s, 4)')]
+
+    assert "sort_keys" in selection
+    assert "sort_logical" in selection
+    assert 'INDEX_LDS["sort_keys"].start' in selection
+    assert "(score == 0.0).select" in source
+    assert "key_a > key_b" in selection
+    assert "logical_a < logical_b" in selection
+
+
+def test_glm_indexshare_histogram_preserves_all_index_head_weights():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.layout import index_selection_lds_regions
+
+    regions = index_selection_lds_regions(2048, histogram_offset=8192)
+    weights = regions["index_weights"]
+    histogram = regions["radix_histogram"]
+    assert weights.stop <= histogram.start or histogram.stop <= weights.start
+
+    arena = torch.full((histogram.stop + 1,), -1.0)
+    expected = torch.arange(32, dtype=torch.float32) + 0.25
+    arena[weights.start : weights.stop] = expected
+    # Four threshold digits plus greater/equal collection passes each clear
+    # and reuse the complete radix histogram.
+    for _ in range(6):
+        arena[histogram.start : histogram.stop] = 0
+        assert torch.equal(arena[weights.start : weights.stop], expected)
+
+
+def test_glm_indexshare_bounded_2048_order_matches_fp32_reference():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.index_share import stable_physical_topk
+
+    scores = torch.arange(2304, dtype=torch.float32).remainder(37)
+    blocks = torch.arange(144, dtype=torch.int32).flip(0).view(1, -1)
+    slots, count = stable_physical_topk(
+        scores,
+        blocks,
+        batch_id=0,
+        position=2303,
+        request_context=2304,
+        topk=2048,
+    )
+    expected_logical = sorted(
+        range(2304), key=lambda i: (-float(scores[i]), i)
+    )[:2048]
+    expected = [
+        int(blocks[0, logical // 16]) * 16 + logical % 16
+        for logical in expected_logical
+    ]
+
+    assert count == 2048
+    assert slots.tolist() == expected
+    signed_zero, _ = stable_physical_topk(
+        torch.tensor([-0.0, 0.0, 1.0], dtype=torch.float32),
+        torch.tensor([[4]], dtype=torch.int32),
+        batch_id=0,
+        position=2,
+        request_context=3,
+        topk=3,
+    )
+    assert signed_zero.tolist() == [66, 64, 65]
+    with pytest.raises(ValueError, match="2048"):
+        stable_physical_topk(
+            scores,
+            blocks,
+            batch_id=0,
+            position=2303,
+            request_context=2304,
+            topk=2049,
+        )
+
+
+def test_glm_indexshare_workspace_is_bounded_at_one_million_context():
+    from atom.model_ops.monokernel.config import glm5_shard_config
+    from atom.model_ops.monokernel.glm.layout import layout
+
+    config = glm5_shard_config(4)
+    small, _ = layout(
+        8,
+        config.local_heads,
+        4,
+        2048,
+        with_indexer=True,
+        index_max_seq=4096,
+        model_config=config,
+    )
+    million, _ = layout(
+        8,
+        config.local_heads,
+        4,
+        2048,
+        with_indexer=True,
+        index_max_seq=1_000_000,
+        model_config=config,
+    )
+
+    assert million["_bytes"] == small["_bytes"]
+    assert "index_scores" not in million
+
+
+def test_glm_indexshare_mtp_visibility_padding_and_zero_owned_rows():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.index_share import stable_physical_topk
+
+    blocks = torch.tensor([[9, 2], [5, 12]], dtype=torch.int32)
+    scores = torch.arange(32, dtype=torch.float32)
+    first, first_count = stable_physical_topk(
+        scores,
+        blocks,
+        batch_id=0,
+        position=2,
+        request_context=20,
+        topk=8,
+    )
+    later, later_count = stable_physical_topk(
+        scores,
+        blocks,
+        batch_id=1,
+        position=17,
+        request_context=18,
+        topk=8,
+    )
+    padded, padded_count = stable_physical_topk(
+        scores,
+        blocks,
+        batch_id=-1,
+        position=31,
+        request_context=32,
+        topk=8,
+    )
+    unowned, unowned_count = stable_physical_topk(
+        scores,
+        blocks,
+        batch_id=0,
+        position=31,
+        request_context=32,
+        topk=8,
+        owned_count=0,
+    )
+
+    assert (first_count, later_count) == (3, 8)
+    assert first[:3].tolist() == [146, 145, 144]
+    assert later.tolist() == [193, 192, 95, 94, 93, 92, 91, 90]
+    assert padded_count == unowned_count == 0
+    assert not padded.any() and not unowned.any()
+
+
+def test_glm_indexshare_plan_requires_full_before_three_shared():
+    from atom.model_ops.monokernel.glm.index_share import (
+        GlmIndexShareMode,
+        GlmIndexSharePlan,
+    )
+
+    plan = GlmIndexSharePlan.from_runtime_pattern(("F", "S", "S", "S", "F"))
+
+    assert plan.modes == (
+        GlmIndexShareMode.FULL,
+        GlmIndexShareMode.SHARED,
+        GlmIndexShareMode.SHARED,
+        GlmIndexShareMode.SHARED,
+        GlmIndexShareMode.FULL,
+    )
+    assert plan.source_layers == (0, 0, 0, 0, 4)
+    with pytest.raises(ValueError, match="precede"):
+        GlmIndexSharePlan.from_runtime_pattern(("S", "F"))
+
+
+def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.graph import (
+        GlmAgenticGraphBucket,
+        GlmAgenticLayer,
+        GlmAgenticLayerInputs,
+    )
+    from atom.model_ops.monokernel.glm.index_share import GlmIndexShareMode
+    from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
+    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
+
+    shape = GlmAgenticShape.for_graph(
+        batch_capacity=1,
+        query_len=4,
+        dcp_size=1,
+        query_replication=False,
+    )
+    plan = agentic_workspace_layout(shape, npes=4, sparse_attention_topk=4)
+    workspace = GlmAgenticWorkspace(
+        shape,
+        plan,
+        torch.empty(plan.scratch["_bytes"], dtype=torch.uint8),
+        SimpleNamespace(),
+        torch.zeros(1, dtype=torch.int32),
+        hidden_buffers=tuple(
+            torch.empty(4, shape.config.hidden, dtype=torch.bfloat16)
+            for _ in range(2)
+        ),
+    )
+    workspace.ensure_index_share(4)
+    observed = []
+
+    class FakeKernel:
+        def __init__(self, mode):
+            self.S = 4
+            self.workspace = workspace
+            self.scratch = workspace.scratch
+            self.peer_buffer = workspace.peer_buffer
+            self.step = workspace.step
+            self.packed_artifacts = mode
+            self.mode = mode
+
+        def forward(
+            self, h, _cur_pos, _kv, _pe, indices, _cos, _sin, *,
+            x_out, sparse_kv_indptr, selected_counts, **_kwargs
+        ):
+            if self.mode is GlmIndexShareMode.FULL:
+                indices[:5].copy_(torch.tensor([29, 3, 71, 0, 0]))
+                selected_counts[:2].copy_(torch.tensor([3, 2]))
+                sparse_kv_indptr[:3].copy_(torch.tensor([0, 3, 5]))
+            observed.append(
+                (
+                    self.mode,
+                    indices.data_ptr(),
+                    sparse_kv_indptr.data_ptr(),
+                    indices.clone(),
+                    sparse_kv_indptr.clone(),
+                )
+            )
+            x_out.copy_(h)
+            return x_out
+
+    args = GlmAgenticLayerInputs(*(torch.empty(1) for _ in range(5)))
+    modes = (GlmIndexShareMode.FULL,) + (GlmIndexShareMode.SHARED,) * 3
+    layers = tuple(
+        GlmAgenticLayer(
+            slot,
+            {4: FakeKernel(mode)},
+            args,
+            mode,
+            index_share_mode=mode,
+        )
+        for slot, mode in enumerate(modes)
+    )
+    bucket = GlmAgenticGraphBucket(workspace, layers)
+    rows = shape.common.row_capacity
+    bucket(
+        torch.zeros(rows, shape.config.hidden, dtype=torch.bfloat16),
+        positions=torch.arange(rows, dtype=torch.int64),
+        slot_mapping=torch.arange(rows, dtype=torch.int64),
+        sparse_kv_indptr=torch.zeros(rows + 1, dtype=torch.int32),
+        batch_ids=torch.tensor([0, 0, -1, -1], dtype=torch.int32),
+        owned_counts=torch.tensor([1, 1, 0, 0], dtype=torch.int32),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        context_lens=torch.tensor([2], dtype=torch.int32),
+    )
+
+    assert [item[0] for item in observed] == list(modes)
+    assert len({item[1] for item in observed}) == 1
+    assert len({item[2] for item in observed}) == 1
+    assert all(item[3][:5].tolist() == [29, 3, 71, 0, 0] for item in observed)
+    assert all(item[4][:3].tolist() == [0, 3, 5] for item in observed)
+
+
 @pytest.mark.parametrize(
     ("batch_capacity", "query_len", "dcp_size", "rows"),
     ((2, 8, 1, 16), (4, 8, 1, 32), (8, 8, 1, 64)),

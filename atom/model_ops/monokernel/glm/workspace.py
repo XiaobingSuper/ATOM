@@ -38,6 +38,9 @@ class GlmAgenticWorkspace:
     step: torch.Tensor
     hidden_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
     runtime: GlmAgenticRuntime | None = None
+    selected_slots: torch.Tensor | None = None
+    selected_counts: torch.Tensor | None = None
+    selected_indptr: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.layout.config != self.shape.config:
@@ -119,6 +122,40 @@ class GlmAgenticWorkspace:
             peers,
             step,
             hidden_buffers=hidden_buffers,
+        )
+
+    def ensure_index_share(self, topk: int) -> None:
+        """Allocate graph-stable full→shared selection storage once."""
+
+        if topk <= 0:
+            raise ValueError("IndexShare top-k must be positive")
+        rows = self.shape.common.row_capacity
+        expected = ((rows, topk), (rows,), (rows + 1,))
+        buffers = (self.selected_slots, self.selected_counts, self.selected_indptr)
+        if any(buffer is not None for buffer in buffers):
+            if (
+                any(buffer is None for buffer in buffers)
+                or tuple(
+                    tuple(buffer.shape) for buffer in buffers if buffer is not None
+                ) != expected
+                or any(
+                    buffer.dtype is not torch.int32
+                    or not buffer.is_contiguous()
+                    or buffer.device != self.scratch.device
+                    for buffer in buffers
+                    if buffer is not None
+                )
+            ):
+                raise ValueError("existing IndexShare storage has incompatible geometry")
+            return
+        self.selected_slots = torch.empty(
+            expected[0], dtype=torch.int32, device=self.scratch.device
+        )
+        self.selected_counts = torch.empty(
+            expected[1], dtype=torch.int32, device=self.scratch.device
+        )
+        self.selected_indptr = torch.empty(
+            expected[2], dtype=torch.int32, device=self.scratch.device
         )
 
     def bind_runtime(

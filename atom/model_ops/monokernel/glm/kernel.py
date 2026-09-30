@@ -82,6 +82,7 @@ from atom.model_ops.monokernel.glm.layout import (
     INDEX_HEADS,
     INDEX_KEYS_PER_TASK,
     INDEX_Q_ROWS,
+    INDEX_RADIX_WORDS,
     INDEX_TILE,
     N_QKV_A,
     N_ROUTER,
@@ -99,6 +100,7 @@ from atom.model_ops.monokernel.glm.layout import (
     XQ_WAVES,
     dn_tile,
     fp8_scale_offset,
+    index_selection_lds_regions,
     layout,
     sparse_keys_per_task,
     stage_tasks,
@@ -256,7 +258,11 @@ def build_glm5_monokernel(
     DN_TILE = dn_tile(S, expert_mxfp4, config)
     N_DN_TILES = HIDDEN // DN_TILE
     RED_WORDS = WAVES * 64 * 4
-    LDS_KEYS = max(264 if with_indexer else 0, SPLIT_KEYS, S * MOE_SLOTS)
+    LDS_KEYS = max(
+        INDEX_RADIX_WORDS if with_indexer else 0,
+        SPLIT_KEYS,
+        S * MOE_SLOTS,
+    )
 
     # TileRT lineage: use one phase-overlaid arena instead of summing every
     # stage's LDS requirement.  The Kimi kernel reuses this same fusion pattern.
@@ -264,10 +270,30 @@ def build_glm5_monokernel(
     # activations, and sparse attention.  Metadata, reductions, and outputs live
     # after that common X region because they are simultaneously live in GEMVs.
     SPLIT_X_WORDS = PT_OFF + SPLIT_KEYS * PS
-    X_WORDS = max(SAMPLE_TILE * HIDDEN // 2, S * HIDDEN // 4, SPLIT_X_WORDS, index_max_seq)
+    INDEX_LDS = index_selection_lds_regions(topk) if with_indexer else {}
+    INDEX_SORT_WORDS = (
+        INDEX_LDS["index_weights"].stop if with_indexer else 0
+    )
+    X_WORDS = max(
+        SAMPLE_TILE * HIDDEN // 2,
+        S * HIDDEN // 4,
+        SPLIT_X_WORDS,
+        INDEX_SORT_WORDS,
+    )
     MISC_OFF = X_WORDS
     MISC_WORDS = max(8 + S * XQ_BLOCKS, S * MOE_SLOTS * (INTER // 128), N_SPLIT)
     KEYS_OFF = MISC_OFF + MISC_WORDS
+    if with_indexer:
+        INDEX_LDS = index_selection_lds_regions(
+            topk,
+            histogram_offset=KEYS_OFF,
+        )
+        index_regions = tuple(INDEX_LDS.values())
+        for i, left in enumerate(index_regions):
+            for right in index_regions[i + 1 :]:
+                assert (
+                    left.stop <= right.start or right.stop <= left.start
+                ), "index selection LDS regions must not overlap"
     DNW_OFF = KEYS_OFF + LDS_KEYS
     RED_OFF = DNW_OFF + S * MOE_SLOTS
     OUT_OFF = RED_OFF + RED_WORDS
@@ -335,6 +361,8 @@ def build_glm5_monokernel(
         pe_cache: Int64,
         kv_cache_scale: Int64,
         indices: Int64,
+        index_cache: Int64,
+        selected_counts: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
         g_in: Int64,
@@ -1355,7 +1383,7 @@ def build_glm5_monokernel(
                 # on the first 64 dimensions. BF16 mailboxes feed this launch;
                 # persistent ATOM_FP8 rows use per-row embedded descales.
                 r_gik, r_bik = _rsrc(index_arg(5)), _rsrc(index_arg(6))
-                r_index_cache = _rsrc(indices)
+                r_index_cache = _rsrc(index_cache)
                 for s in range_constexpr(S):
                     ik = getf(mb("index_k"), s * INDEX_DIM + fx.min(tid, INDEX_DIM - 1))
                     live = tid < INDEX_DIM
@@ -1618,8 +1646,9 @@ def build_glm5_monokernel(
 
         # ====================== 4b. fused sparse index score + exact top-2048
         if const_expr(with_indexer):
-            r_index_cache = _rsrc(indices)
+            r_index_cache = _rsrc(index_cache)
             N_INDEX_SPLIT = index_max_seq // INDEX_KEYS_PER_TASK
+            index_weights = xs + INDEX_LDS["index_weights"].start
 
             def load_index_q8(head, k):
                 words = fx.Vector.from_elements(
@@ -1627,36 +1656,47 @@ def build_glm5_monokernel(
                 )
                 return words.bitcast(fx.BFloat16)
 
-            for tt in range(start("index_score"), S * N_INDEX_SPLIT, G):
-                tt = fx.Int32(tt)
-                s = tt // N_INDEX_SPLIT
-                tile = tt % N_INDEX_SPLIT
-                stamp("index_score", tt, 0)
-                bound = row_context_len(s)
-                if row_local_sparse_active(s) & (
-                    tile * INDEX_KEYS_PER_TASK < bound
-                ):
-                    get(mb("index_ready"), s)
-                    if tid < INDEX_HEADS:
-                        lds_st(keys, tid, get(mb("index_w"), s * INDEX_HEADS + tid))
-                    # Every key group reuses the same 32x128 query.  Stage and RoPE
-                    # it once per scoring CTA instead of polling and rotating it in
-                    # each of the four key-group wave pairs.
-                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
-                        q_pair = tid + b * THREADS
-                        q_elem = q_pair * 2
-                        kq = q_elem % INDEX_DIM
-                        q0, q1 = get_bf2_many([(mb("index_q"), s * INDEX_Q_ROWS + q_elem)])[0]
-                        if kq < PE_DIM:
-                            c = ld_f32(_rsrc(rope_cos), row_position(s) * (PE_DIM // 2) + kq // 2)
-                            sn = ld_f32(_rsrc(rope_sin), row_position(s) * (PE_DIM // 2) + kq // 2)
-                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                        lds_st(xs, q_pair, bf16_pair(q0, q1))
-                    gpu.barrier()
+            for s in range(start("index_select"), S, G):
+                s = fx.Int32(s)
+                stamp("index_select", s, 0)
+                bound = row_local_sparse_active(s).select(
+                    row_context_len(s),
+                    fx.Int32(0),
+                )
+                get(mb("index_ready"), s)
+                if tid < INDEX_HEADS:
+                    lds_st(
+                        index_weights,
+                        tid,
+                        get(mb("index_w"), s * INDEX_HEADS + tid),
+                    )
+                for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
+                    q_pair = tid + b * THREADS
+                    q_elem = q_pair * 2
+                    kq = q_elem % INDEX_DIM
+                    q0, q1 = get_bf2_many(
+                        [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
+                    )[0]
+                    if kq < PE_DIM:
+                        c = ld_f32(
+                            _rsrc(rope_cos),
+                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                        )
+                        sn = ld_f32(
+                            _rsrc(rope_sin),
+                            row_position(s) * (PE_DIM // 2) + kq // 2,
+                        )
+                        q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
+                    lds_st(xs, q_pair, bf16_pair(q0, q1))
+                gpu.barrier()
+
+                def score_key(tile):
+                    """Recompute one 64-key score tile; no context-sized storage."""
+
                     key_group = wave // 2
                     head_group = wave % 2
                     key_pos = tile * INDEX_KEYS_PER_TASK + key_group * 16 + lane % 16
-                    safe_key = fx.min(key_pos, bound - 1)
+                    safe_key = fx.min(key_pos, fx.max(bound - 1, fx.Int32(0)))
                     physical_key = logical_physical_slot(s, safe_key)
                     head = head_group * 16 + lane % 16
                     score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
@@ -1703,34 +1743,56 @@ def build_glm5_monokernel(
                             use_new = safe_key >= pos0
                             sn = safe_key - pos0
                         if use_new:
-                            kv_pairs = get_bf2_many([(mb("index_k_new"), sn * INDEX_DIM + k + j * 2) for j in range(4)])
+                            kv_pairs = get_bf2_many(
+                                [
+                                    (
+                                        mb("index_k_new"),
+                                        sn * INDEX_DIM + k + j * 2,
+                                    )
+                                    for j in range(4)
+                                ]
+                            )
                             kv_values = []
                             for pair in kv_pairs:
                                 kv_values += list(pair)
-                            kv = fx.Vector.from_elements(kv_values, fx.Float32).to(fx.BFloat16)
-                        score_frag = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [qv, kv, score_frag]))
+                            kv = fx.Vector.from_elements(
+                                kv_values, fx.Float32
+                            ).to(fx.BFloat16)
+                        score_frag = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32), [qv, kv, score_frag]
+                            )
+                        )
                     partial = fx.Float32(0.0)
                     for e in range_constexpr(4):
                         index_head = head_group * 16 + (lane // 16) * 4 + e
-                        weight = lds_ld(keys, index_head).bitcast(fx.Float32)
-                        partial = partial + fx.max(score_frag[e], fx.Float32(0.0)) * weight
+                        weight = lds_ld(
+                            index_weights,
+                            index_head,
+                        ).bitcast(fx.Float32)
+                        partial = (
+                            partial
+                            + fx.max(score_frag[e], fx.Float32(0.0)) * weight
+                        )
                     partial = _xred(partial, 16, lambda a, b: a + b)
                     partial = _xred(partial, 32, lambda a, b: a + b)
                     if lane < 16:
                         lds_st(red, wave * 16 + lane, partial)
                     gpu.barrier()
-                    if (wave % 2 == 0) & (lane < 16) & (key_pos < bound):
-                        score = lds_ld(red, wave * 16 + lane) + lds_ld(red, (wave + 1) * 16 + lane)
-                        put(mb("index_scores"), s * index_max_seq + key_pos, score)
-                stamp("index_score", tt, 4)
-
-            for s in range(start("index_select"), S, G):
-                s = fx.Int32(s)
-                stamp("index_select", s, 0)
-                bound = row_local_sparse_active(s).select(
-                    row_context_len(s),
-                    fx.Int32(0),
-                )
+                    score = lds_ld(red, wave * 16 + lane) + lds_ld(
+                        red, (wave + 1) * 16 + lane
+                    )
+                    bits = (score == 0.0).select(
+                        fx.Int32(0),
+                        score.bitcast(fx.Int32),
+                    )
+                    key = (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
+                    valid = (
+                        (wave % 2 == 0)
+                        & (lane < 16)
+                        & (key_pos < bound)
+                    )
+                    return fx.Uint32(key), key_pos, valid
 
                 def select_digit(shift, prefix, remain):
                     digit = 255 - fx.min(tid, 255)
@@ -1752,74 +1814,80 @@ def build_glm5_monokernel(
                     gpu.barrier()
                     return fx.Uint32(lds_ld(keys, 256)), lds_ld(keys, 257)
 
-                # Transform scores to monotonic integer keys and build the high
-                # byte histogram in the same pass, avoiding one extra 4-K LDS
-                # scan before the remaining radix digits.
-                if tid < 256:
-                    lds_st(keys, tid, fx.Int32(0))
-                gpu.barrier()
-                for batch in range_constexpr((index_max_seq + THREADS - 1) // THREADS):
-                    i = tid + batch * THREADS
-                    if i < bound:
-                        bits = getf(mb("index_scores"), s * index_max_seq + i).bitcast(fx.Int32)
-                        key = (bits >= 0).select(bits ^ fx.Int32(-(2**31)), ~bits)
-                        # The selector CTA no longer needs the large GEMV staging
-                        # region, so reuse it for the 4-K radix keys instead of
-                        # increasing the monokernel's LDS allocation.
-                        lds_st(xs, i, key.bitcast(fx.Float32))
-                        digit = fx.Int32((fx.Uint32(key) >> 24) & fx.Uint32(255))
-                        fx.atomic_add(keys + digit, fx.Int32(1), syncscope="workgroup")
-                gpu.barrier()
-                prefix, remain = select_digit(
-                    24,
-                    fx.Uint32(0),
-                    fx.min(fx.Int32(topk), bound),
-                )
-                prefix_mask = 255 << 24
-                for shift in (16, 8, 0):
+                prefix = fx.Uint32(0)
+                prefix_mask = fx.Uint32(0)
+                remain = fx.min(fx.Int32(topk), bound)
+                for shift in (24, 16, 8, 0):
                     if tid < 256:
                         lds_st(keys, tid, fx.Int32(0))
                     gpu.barrier()
-                    for batch in range_constexpr((index_max_seq + THREADS - 1) // THREADS):
-                        i = tid + batch * THREADS
-                        if i < bound:
-                            key = fx.Uint32(lds_ld(xs, i).bitcast(fx.Int32))
-                            if (key & fx.Uint32(prefix_mask)) == prefix:
-                                digit = fx.Int32((key >> shift) & fx.Uint32(255))
-                                fx.atomic_add(keys + digit, fx.Int32(1), syncscope="workgroup")
+                    for tile in range(0, N_INDEX_SPLIT):
+                        key, _, valid = score_key(tile)
+                        if valid & ((key & prefix_mask) == prefix):
+                            digit = fx.Int32(
+                                (key >> shift) & fx.Uint32(255)
+                            )
+                            fx.atomic_add(
+                                keys + digit,
+                                fx.Int32(1),
+                                syncscope="workgroup",
+                            )
+                        gpu.barrier()
                     gpu.barrier()
                     prefix, remain = select_digit(shift, prefix, remain)
-                    prefix_mask |= 255 << shift
+                    prefix_mask = prefix_mask | fx.Uint32(255 << shift)
 
                 threshold = prefix
-                r_index_out = _rsrc(mb("indices"))
-                items = index_max_seq // THREADS
-                item_indices = [tid * items + j for j in range_constexpr(items)]
-                item_keys = [
-                    fx.Uint32(
-                        lds_ld(
-                            xs,
-                            fx.min(i, fx.max(bound - 1, fx.Int32(0))),
-                        ).bitcast(fx.Int32)
+                if s > 0:
+                    get(mb("indices_ready"), s - 1)
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Acquire,
+                        syncscope="agent",
                     )
-                    for i in item_indices
-                ]
-                gt = [(i < bound) & (key > threshold) for i, key in zip(item_indices, item_keys)]
-                eq = [(i < bound) & (key == threshold) for i, key in zip(item_indices, item_keys)]
+                if tid == 0:
+                    if s == 0:
+                        bo.buffer_store(
+                            fx.Int32(0),
+                            _rsrc(sparse_kv_indptr),
+                            0,
+                            cache_modifier=CM_DEV,
+                        )
+                        lds_st(keys, 264 - 1, fx.Int32(0))
+                    else:
+                        base_out = bo.buffer_load(
+                            _rsrc(sparse_kv_indptr),
+                            s,
+                            vec_width=1,
+                            dtype=T.i32,
+                            cache_modifier=CM_DEV,
+                        )
+                        lds_st(keys, 264 - 1, fx.Int32(base_out))
+                gpu.barrier()
+                output_base = lds_ld(keys, 264 - 1)
+                r_index_out = _rsrc(indices)
+                # Preserve staged index Q while the final score passes run.
+                sort_keys = (
+                    fx.recast_iter(fx.Int32, xs)
+                    + INDEX_LDS["sort_keys"].start
+                )
+                sort_logical = (
+                    fx.recast_iter(fx.Int32, xs)
+                    + INDEX_LDS["sort_logical"].start
+                )
+                for batch in range_constexpr(
+                    (topk + THREADS - 1) // THREADS
+                ):
+                    j = tid + batch * THREADS
+                    if j < topk:
+                        lds_st(sort_keys, j, fx.Int32(0))
+                        lds_st(sort_logical, j, fx.Int32(-1))
+                gpu.barrier()
 
-                def scan_flags(flags):
-                    """Thread-major exclusive offsets for eight flags without extra LDS.
-
-                    The radix histogram already reserves keys[256:264] for wave
-                    totals, so the scan can reuse those words and keep S=8 at the
-                    96-KiB static-LDS boundary.
-                    """
-                    local = fx.Int32(0)
-                    local_offsets = []
-                    for flag in flags:
-                        local_offsets.append(local)
-                        local = local + flag.select(fx.Int32(1), fx.Int32(0))
-                    inclusive = fx.coop.warp_inclusive_scan(local, fx.ReductionOp.ADD, width=64)
+                def scan_flag(flag):
+                    count = flag.select(fx.Int32(1), fx.Int32(0))
+                    inclusive = fx.coop.warp_inclusive_scan(
+                        count, fx.ReductionOp.ADD, width=64
+                    )
                     wave_total = read_lane_i32(inclusive, 63)
                     if lane == 63:
                         lds_st(keys, 256 + wave, wave_total)
@@ -1830,46 +1898,141 @@ def build_glm5_monokernel(
                         wave_count = lds_ld(keys, 256 + w)
                         before_wave = before_wave + (wave > w).select(wave_count, fx.Int32(0))
                         total = total + wave_count
-                    thread_base = before_wave + inclusive - local
-                    return [thread_base + off for off in local_offsets], total
+                    return before_wave + inclusive - count, total
 
-                gt_offsets, out_gt = scan_flags(gt)
-                gpu.barrier()
-                eq_offsets, _ = scan_flags(eq)
-                gpu.barrier()
-                for j in range_constexpr(items):
-                    if gt[j]:
-                        selected = logical_physical_slot(s, item_indices[j])
+                out_gt = fx.Int32(0)
+                for tile in range(0, N_INDEX_SPLIT):
+                    key, logical, valid = score_key(tile)
+                    flag = valid & (key > threshold)
+                    offset, tile_total = scan_flag(flag)
+                    if flag:
+                        slot = out_gt + offset
+                        lds_st(sort_keys, slot, fx.Int32(key))
+                        lds_st(sort_logical, slot, logical)
+                    out_gt = out_gt + tile_total
+                    gpu.barrier()
+
+                need_eq = fx.min(fx.Int32(topk), bound) - out_gt
+                out_eq = fx.Int32(0)
+                for tile in range(0, N_INDEX_SPLIT):
+                    key, logical, valid = score_key(tile)
+                    flag = valid & (key == threshold)
+                    offset, tile_total = scan_flag(flag)
+                    if flag & (out_eq + offset < need_eq):
+                        slot = out_gt + out_eq + offset
+                        lds_st(sort_keys, slot, fx.Int32(key))
+                        lds_st(sort_logical, slot, logical)
+                    out_eq = out_eq + tile_total
+                    gpu.barrier()
+
+                selected_count = fx.min(fx.Int32(topk), bound)
+                # Sort only the bounded selected set.  Invalid tail entries stay
+                # behind valid keys; score ties use lower logical position.
+                for sort_log_size in range_constexpr(1, 12):
+                    sort_size = 1 << sort_log_size
+                    for reverse_stage in range_constexpr(11):
+                        if reverse_stage < sort_log_size:
+                            sort_stride = 1 << (
+                                sort_log_size - reverse_stage - 1
+                            )
+                            for batch in range_constexpr(
+                                (topk // 2 + THREADS - 1) // THREADS
+                            ):
+                                pair = tid + batch * THREADS
+                                if pair < topk // 2:
+                                    i = (
+                                        (pair // sort_stride)
+                                        * (sort_stride * 2)
+                                        + pair % sort_stride
+                                    )
+                                    partner = i + sort_stride
+                                    key_a = fx.Uint32(lds_ld(sort_keys, i))
+                                    key_b = fx.Uint32(
+                                        lds_ld(sort_keys, partner)
+                                    )
+                                    logical_a = lds_ld(sort_logical, i)
+                                    logical_b = lds_ld(
+                                        sort_logical, partner
+                                    )
+                                    valid_a = logical_a >= 0
+                                    valid_b = logical_b >= 0
+                                    a_before_b = valid_a & (
+                                        (~valid_b)
+                                        | (key_a > key_b)
+                                        | (
+                                            (key_a == key_b)
+                                            & (logical_a < logical_b)
+                                        )
+                                    )
+                                    b_before_a = valid_b & (
+                                        (~valid_a)
+                                        | (key_b > key_a)
+                                        | (
+                                            (key_a == key_b)
+                                            & (logical_b < logical_a)
+                                        )
+                                    )
+                                    want_before = (
+                                        i & sort_size
+                                    ) == 0
+                                    swap = (
+                                        want_before & b_before_a
+                                    ) | ((~want_before) & a_before_b)
+                                    if swap:
+                                        lds_st(sort_keys, i, fx.Int32(key_b))
+                                        lds_st(
+                                            sort_keys,
+                                            partner,
+                                            fx.Int32(key_a),
+                                        )
+                                        lds_st(
+                                            sort_logical, i, logical_b
+                                        )
+                                        lds_st(
+                                            sort_logical,
+                                            partner,
+                                            logical_a,
+                                        )
+                            gpu.barrier()
+
+                for batch in range_constexpr(
+                    (topk + THREADS - 1) // THREADS
+                ):
+                    j = tid + batch * THREADS
+                    if j < selected_count:
+                        logical = lds_ld(sort_logical, j)
+                        selected = logical_physical_slot(s, logical)
                         bo.buffer_store(
                             fx.Int32(selected),
                             r_index_out,
-                            s * topk + gt_offsets[j],
+                            output_base + j,
                             cache_modifier=CM_DEV,
                         )
-                    if eq[j] & (eq_offsets[j] < topk):
-                        selected = logical_physical_slot(s, item_indices[j])
-                        lds_st(
-                            red,
-                            eq_offsets[j],
-                            fx.Int32(selected).bitcast(fx.Float32),
-                        )
-                gpu.barrier()
-                need_eq = fx.min(fx.Int32(topk), bound) - out_gt
-                for batch in range_constexpr((topk + THREADS - 1) // THREADS):
-                    j = tid + batch * THREADS
-                    if j >= bound:
-                        bo.buffer_store(
-                            fx.Int32(0),
-                            r_index_out,
-                            s * topk + j,
-                            cache_modifier=CM_DEV,
-                        )
-                    if j < need_eq:
-                        i = lds_ld(red, j).bitcast(fx.Int32)
-                        bo.buffer_store(i, r_index_out, s * topk + out_gt + j, cache_modifier=CM_DEV)
-                # Every lane contributed compact indices.  Make all of those
-                # device-memory stores visible before lane 0 publishes the one
-                # readiness tag consumed by the attention CTAs.
+                if (s == S - 1) & (tid < THREADS):
+                    for batch in range_constexpr(
+                        (S * topk + THREADS - 1) // THREADS
+                    ):
+                        j = tid + batch * THREADS
+                        if j >= output_base + selected_count:
+                            bo.buffer_store(
+                                fx.Int32(0),
+                                r_index_out,
+                                j,
+                                cache_modifier=CM_DEV,
+                            )
+                if tid == 0:
+                    bo.buffer_store(
+                        selected_count,
+                        _rsrc(selected_counts),
+                        s,
+                        cache_modifier=CM_DEV,
+                    )
+                    bo.buffer_store(
+                        output_base + selected_count,
+                        _rsrc(sparse_kv_indptr),
+                        s + 1,
+                        cache_modifier=CM_DEV,
+                    )
                 fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="agent")
                 gpu.barrier()
                 if tid == 0:
@@ -1884,27 +2047,27 @@ def build_glm5_monokernel(
 
         def split_keys(t, s):
             """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
+            if const_expr(with_indexer):
+                # The selector publishes compact payload, counts, and indptr
+                # before this release tag.  Acquire it before any metadata load.
+                get(mb("indices_ready"), s)
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Acquire,
+                    syncscope="agent",
+                )
             if const_expr(use_atom_kv_cache):
                 index_base, index_end = row_index_bounds(s)
                 if const_expr(with_indexer):
-                    available = fx.min(row_context_len(s), fx.Int32(topk))
+                    available = index_end - index_base
                 else:
                     available = index_end - index_base
-                nkeys = fx.min(row_owned_count(s), available)
+                nkeys = available
                 sparse = row_local_sparse_active(s) & (nkeys > 0)
             else:
                 index_base = s * topk
                 kv_len = pos0 + s + 1
                 sparse = kv_len > topk
                 nkeys = sparse.select(fx.Int32(topk), kv_len)
-            if const_expr(with_indexer):
-                if sparse:
-                    if wave == 0:
-                        if lane == 0:
-                            get(mb("indices_ready"), s)
-                        # Only wave 0 consumes the compact index payload; its
-                        # divergent ready poll reconverges before this acquire.
-                        fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="agent")
             if wave == 0:
                 if lane < SPLIT_KEYS:
                     k_pos = t * SPLIT_KEYS + lane
@@ -1914,8 +2077,8 @@ def build_glm5_monokernel(
                         if sparse:
                             idx = fx.Int32(
                                 bo.buffer_load(
-                                    _rsrc(mb("indices")),
-                                    s * topk + k_cl,
+                                    r_idx,
+                                    index_base + k_cl,
                                     vec_width=1,
                                     dtype=T.i32,
                                     cache_modifier=CM_DEV,
@@ -3141,6 +3304,8 @@ def build_glm5_monokernel(
         pe_cache: Int64,
         kv_cache_scale: Int64,
         indices: Int64,
+        index_cache: Int64,
+        selected_counts: Int64,
         rope_cos: Int64,
         rope_sin: Int64,
         g_in: Int64,
@@ -3188,6 +3353,8 @@ def build_glm5_monokernel(
             pe_cache,
             kv_cache_scale,
             indices,
+            index_cache,
+            selected_counts,
             rope_cos,
             rope_sin,
             g_in,

@@ -39,6 +39,34 @@ INDEX_DIM = 128
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
+INDEX_RADIX_WORDS = 264
+
+
+def index_selection_lds_regions(
+    topk: int,
+    *,
+    histogram_offset: int | None = None,
+) -> dict[str, slice]:
+    """Return the disjoint LDS regions live during bounded index selection."""
+
+    if not 0 < topk <= 2048:
+        raise ValueError("index selection top-k must be in [1, 2048]")
+    q_words = INDEX_Q_ROWS // 2
+    regions = {
+        "index_q": slice(0, q_words),
+        "sort_keys": slice(q_words, q_words + topk),
+        "sort_logical": slice(q_words + topk, q_words + 2 * topk),
+        "index_weights": slice(
+            q_words + 2 * topk,
+            q_words + 2 * topk + INDEX_HEADS,
+        ),
+    }
+    if histogram_offset is not None:
+        regions["radix_histogram"] = slice(
+            histogram_offset,
+            histogram_offset + INDEX_RADIX_WORDS,
+        )
+    return regions
 
 
 def sparse_cache_rows(
@@ -199,8 +227,6 @@ def layout(
             ("index_ready", samples * pair_bytes),
             ("index_w", samples * INDEX_HEADS * pair_bytes),
             ("index_q", samples * INDEX_Q_ROWS // 2 * pair_bytes),
-            ("index_scores", samples * index_max_seq * pair_bytes),
-            ("indices", samples * sparse_attention_topk * 4),
             ("indices_ready", samples * pair_bytes),
         ]
 
@@ -250,7 +276,8 @@ def stage_tasks(
     tasks += [("uk", heads * config.kv_lora // UK_TILE)]
     if with_indexer:
         tasks += [
-            ("index_score", samples * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK)),
+            # Selection recomputes score tiles during bounded radix passes.
+            ("index_score", 0),
             ("index_select", samples),
         ]
     tasks += [

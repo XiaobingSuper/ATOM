@@ -255,6 +255,10 @@ class Glm5MonoKernel:
         )
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
+        self.index_counts = (
+            torch.empty(samples, dtype=torch.int32, device=dev)
+            if with_indexer else None
+        )
         if with_indexer:
             index_tensors = dict(t, **self.packed)
             self.index_params = torch.tensor(
@@ -337,7 +341,7 @@ class Glm5MonoKernel:
         cache_width = self.W.config.kv_lora + self.W.config.pe_dim
         if self.kv_cache_layout is KvCacheLayout.ATOM_FP8:
             if kv_cache_scale is None:
-                raise ValueError("ATOM FP8 KV cache requires a per-slot FP32 descale")
+                raise ValueError("ATOM FP8 KV cache requires one FP32 scalar descale")
             return validate_fp8_paged_cache(
                 kv_cache,
                 kv_cache_scale,
@@ -397,6 +401,7 @@ class Glm5MonoKernel:
         kv_cache_scale=None,
         block_tables=None,
         context_lens=None,
+        selected_counts=None,
     ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -466,6 +471,21 @@ class Glm5MonoKernel:
                             f"{self.S} values, got {got}"
                         )
         t = dict(self.W.t, **self.packed)
+        if self.with_indexer:
+            if indices.dtype is not torch.int32 or indices.numel() < self.S * self.topk:
+                raise ValueError(
+                    f"fused indexer output requires {self.S * self.topk} int32 slots"
+                )
+            if selected_counts is None:
+                selected_counts = self.index_counts
+            if (
+                selected_counts.dtype is not torch.int32
+                or selected_counts.numel() < self.S
+                or not selected_counts.is_contiguous()
+            ):
+                raise ValueError(
+                    f"selected_counts must contain {self.S} contiguous int32 values"
+                )
         if x_out is None:
             x_out = torch.empty(
                 self.S,
@@ -489,7 +509,9 @@ class Glm5MonoKernel:
             p(kv_cache),
             p(kv_cache if pe_cache is None else pe_cache),
             p(kv_cache if kv_cache_scale is None else kv_cache_scale),
-            p(index_cache) if self.with_indexer else p(indices),
+            p(indices),
+            p(indices if index_cache is None else index_cache),
+            p(indices if selected_counts is None else selected_counts),
             p(cos),
             p(sin),
             p(t["g_in"]),

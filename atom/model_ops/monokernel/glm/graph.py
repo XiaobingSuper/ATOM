@@ -16,6 +16,10 @@ from atom.model_ops.monokernel.config import (
     KvCacheLayout,
 )
 from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
+from atom.model_ops.monokernel.glm.index_share import (
+    GlmIndexShareMode,
+    GlmIndexSharePlan,
+)
 from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
 
 
@@ -39,13 +43,18 @@ class GlmAgenticLayerSpec:
     attention_weight: AttentionWeight = AttentionWeight.FP8_BLOCK128
     kv_cache_layout: KvCacheLayout = KvCacheLayout.ATOM_FP8
     uv_scale_block_m: int = 128
+    index_share_mode: GlmIndexShareMode | None = None
 
     def validate_cache_inputs(self) -> int | None:
+        if self.index_share_mode is GlmIndexShareMode.FULL and not self.with_indexer:
+            raise ValueError("full IndexShare layers require indexer weights")
+        if self.index_share_mode is GlmIndexShareMode.SHARED and self.with_indexer:
+            raise ValueError("shared IndexShare layers must skip the indexer")
         if self.kv_cache_layout is not KvCacheLayout.ATOM_FP8:
             return None
         scale = self.inputs.kv_cache_scale
         if scale is None:
-            raise ValueError("ATOM FP8 graph layer requires a per-slot FP32 descale")
+            raise ValueError("ATOM FP8 graph layer requires one FP32 scalar descale")
         return validate_fp8_paged_cache(
             self.inputs.kv_cache,
             scale,
@@ -60,6 +69,7 @@ class GlmAgenticLayer:
     kernels: dict[int, Any]
     inputs: GlmAgenticLayerInputs
     packed_artifacts: Any
+    index_share_mode: GlmIndexShareMode | None = None
 
     @property
     def workspace(self) -> GlmAgenticWorkspace:
@@ -123,6 +133,20 @@ class GlmAgenticGraphBucket:
     ) -> "GlmAgenticGraphBucket":
         if len(specs) > MAX_LAYERS_PER_STEP:
             raise ValueError("too many layers for the launch-tag ABI")
+        explicit_modes = tuple(
+            spec.index_share_mode for spec in specs
+            if spec.index_share_mode is not None
+        )
+        if explicit_modes:
+            if len(explicit_modes) != len(specs):
+                raise ValueError("IndexShare mode must be explicit for every graph layer")
+            GlmIndexSharePlan.from_runtime_pattern(
+                tuple(
+                    "F" if mode is GlmIndexShareMode.FULL else "S"
+                    for mode in explicit_modes
+                )
+            )
+            workspace.ensure_index_share(topk)
         if kernel_factory is None:
             from atom.model_ops.monokernel.glm.op import (
                 Glm5MonoKernel,
@@ -178,6 +202,7 @@ class GlmAgenticGraphBucket:
                         kernels=kernels,
                         inputs=spec.inputs,
                         packed_artifacts=artifacts,
+                        index_share_mode=spec.index_share_mode,
                     )
                 )
         except Exception:
@@ -249,15 +274,29 @@ class GlmAgenticGraphBucket:
             start, stop = tile.start, tile.stop
             state = hidden_states[start:stop]
             ownership = runtime.tile(tile)
+            selected_slots = self.workspace.selected_slots
+            selected_counts = self.workspace.selected_counts
+            selected_indptr = self.workspace.selected_indptr
             for layer_index, layer in enumerate(self.layers):
                 output = buffers[layer_index % 2][start:stop]
                 args = layer.inputs
+                index_share = layer.index_share_mode is not None
+                layer_indices = (
+                    selected_slots[start:stop].reshape(-1)
+                    if index_share and selected_slots is not None
+                    else args.indices
+                )
+                layer_indptr = (
+                    selected_indptr[start : stop + 1]
+                    if index_share and selected_indptr is not None
+                    else sparse_kv_indptr[start : stop + 1]
+                )
                 state = layer.kernels[tile.capacity].forward(
                     state,
                     positions[start:stop],
                     args.kv_cache,
                     args.pe_cache,
-                    args.indices,
+                    layer_indices,
                     args.cos,
                     args.sin,
                     x_out=output,
@@ -266,7 +305,12 @@ class GlmAgenticGraphBucket:
                     index_cache=args.index_cache,
                     positions=positions[start:stop],
                     slot_mapping=slot_mapping[start:stop],
-                    sparse_kv_indptr=sparse_kv_indptr[start : stop + 1],
+                    sparse_kv_indptr=layer_indptr,
+                    selected_counts=(
+                        selected_counts[start:stop]
+                        if index_share and selected_counts is not None
+                        else None
+                    ),
                     batch_ids=ownership.batch_ids,
                     owned_counts=ownership.owned_counts,
                     kv_cache_scale=args.kv_cache_scale,
