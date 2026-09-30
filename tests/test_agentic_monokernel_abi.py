@@ -1127,6 +1127,92 @@ def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
     assert all(item[4][:3].tolist() == [0, 3, 5] for item in observed)
 
 
+def test_glm_indexshare_attention_uses_counts_and_activity_before_splits():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1]
+        / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    split = source[source.index("def split_keys(t, s):"):]
+    split = split[: split.index("def gather_old_kv")]
+
+    assert "_rsrc(selected_counts)" in split
+    assert "published_count" in split
+    assert "row_local_sparse_active(s).select" in split
+    assert split.index("published_count") < split.index("nkeys =")
+
+
+def test_glm_indexshare_keeps_attention_moe_and_tp_tail_in_one_schedule():
+    from atom.model_ops.monokernel.config import glm5_shard_config
+    from atom.model_ops.monokernel.glm.layout import stage_tasks
+
+    stages = [
+        name
+        for name, _ in stage_tasks(
+            4,
+            16,
+            2048,
+            with_indexer=True,
+            model_config=glm5_shard_config(4),
+        )
+    ]
+    assert stages.index("index_select") < stages.index("split")
+    assert stages.index("split") < stages.index("uv") < stages.index("o")
+    assert stages.index("o") < stages.index("router")
+    assert stages.index("router") < stages.index("ug") < stages.index("down")
+
+
+def test_glm_full_to_shared_fp8_paged_attention_reference():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.cache import (
+        fp8_paged_sparse_attention_reference,
+    )
+    from atom.model_ops.monokernel.glm.index_share import stable_physical_topk
+
+    cache = torch.zeros(64, 576, dtype=torch.float8_e4m3fn)
+    cache[48, :512] = 4
+    index_scores = torch.zeros(17, dtype=torch.float32)
+    index_scores[16], index_scores[0] = 2, 1
+    selected, selected_count = stable_physical_topk(
+        index_scores,
+        torch.tensor([[3, 1]], dtype=torch.int32),
+        batch_id=0,
+        position=16,
+        request_context=17,
+        topk=2,
+    )
+    assert selected_count == 2 and selected.tolist() == [16, 48]
+    counts = torch.tensor([2, 2, 2], dtype=torch.int32)
+    indptr = torch.tensor([0, 2, 2, 2], dtype=torch.int32)
+    queries = torch.zeros(3, 1, 576, dtype=torch.bfloat16)
+    fresh = torch.zeros(1, 576, dtype=torch.bfloat16)
+    fresh[0, :512] = 2
+    kwargs = dict(
+        query=queries,
+        main_cache=cache,
+        main_scale=torch.ones(1, dtype=torch.float32),
+        selected_slots=selected,
+        selected_counts=counts,
+        selected_indptr=indptr,
+        batch_ids=torch.tensor([0, 0, -1], dtype=torch.int32),
+        owned_counts=torch.tensor([1, 0, 1], dtype=torch.int32),
+        fresh_slots=torch.tensor([16], dtype=torch.int64),
+        fresh_values=fresh,
+        softmax_scale=1.0,
+    )
+
+    full_o, full_lse = fp8_paged_sparse_attention_reference(**kwargs)
+    shared_o, shared_lse = fp8_paged_sparse_attention_reference(**kwargs)
+
+    assert selected.data_ptr() == kwargs["selected_slots"].data_ptr()
+    assert torch.equal(full_o, shared_o)
+    assert torch.equal(full_lse, shared_lse)
+    assert torch.equal(full_o[0], torch.full_like(full_o[0], 3.0))
+    assert torch.equal(full_o[1:], torch.zeros_like(full_o[1:]))
+    assert torch.isneginf(full_lse[1:]).all()
+
+
 @pytest.mark.parametrize(
     ("batch_capacity", "query_len", "dcp_size", "rows"),
     ((2, 8, 1, 16), (4, 8, 1, 32), (8, 8, 1, 64)),

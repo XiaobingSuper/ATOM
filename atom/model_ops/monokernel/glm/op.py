@@ -186,6 +186,7 @@ class Glm5MonoKernel:
         topk: int = 2048,
         launches_per_step: int = 1,
         with_indexer: bool = False,
+        index_share: bool = False,
         index_max_seq: int = 4096,
         attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
@@ -202,6 +203,7 @@ class Glm5MonoKernel:
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
         self.launches_per_step = launches_per_step
         self.with_indexer = with_indexer
+        self.index_share = index_share or with_indexer
         self.index_max_seq = index_max_seq
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
@@ -257,7 +259,7 @@ class Glm5MonoKernel:
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.index_counts = (
             torch.empty(samples, dtype=torch.int32, device=dev)
-            if with_indexer else None
+            if self.index_share else None
         )
         if with_indexer:
             index_tensors = dict(t, **self.packed)
@@ -315,6 +317,7 @@ class Glm5MonoKernel:
             topk,
             launches_per_step=launches_per_step,
             with_indexer=with_indexer,
+            index_share=self.index_share,
             index_max_seq=index_max_seq,
             expert_mxfp4=self.expert_mxfp4,
             attention_weight=self.attention_weight,
@@ -471,12 +474,16 @@ class Glm5MonoKernel:
                             f"{self.S} values, got {got}"
                         )
         t = dict(self.W.t, **self.packed)
-        if self.with_indexer:
+        if self.index_share:
             if indices.dtype is not torch.int32 or indices.numel() < self.S * self.topk:
                 raise ValueError(
-                    f"fused indexer output requires {self.S * self.topk} int32 slots"
+                    f"IndexShare requires {self.S * self.topk} int32 slots"
                 )
             if selected_counts is None:
+                if not self.with_indexer:
+                    raise ValueError(
+                        "shared IndexShare attention requires selected_counts"
+                    )
                 selected_counts = self.index_counts
             if (
                 selected_counts.dtype is not torch.int32

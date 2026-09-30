@@ -710,6 +710,27 @@ def test_glm_kernel_builder_accepts_tp4_fp8_paged_index_cache():
     assert callable(launch)
 
 
+def test_glm_kernel_builder_accepts_tp4_shared_fp8_paged_attention():
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import KvCacheLayout, glm5_shard_config
+    from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
+
+    config = glm5_shard_config(4)
+    launch = build_glm5_monokernel(
+        4,
+        config.local_heads,
+        4,
+        topk=2048,
+        with_indexer=False,
+        index_share=True,
+        kv_cache_layout=KvCacheLayout.ATOM_FP8,
+        agentic_row_contract=True,
+        model_config=config,
+    )
+
+    assert callable(launch)
+
+
 def test_glm_host_geometry_accepts_tp4_and_physical_shared_expert():
     pytest.importorskip("flydsl")
     from atom.model_ops.monokernel.config import glm5_shard_config

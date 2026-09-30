@@ -158,6 +158,7 @@ def build_glm5_monokernel(
     topk: int = 2048,
     launches_per_step: int = 1,
     with_indexer: bool = False,
+    index_share: bool = False,
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
@@ -208,6 +209,7 @@ def build_glm5_monokernel(
         KvCacheLayout.ATOM_FP8,
     )
     use_fp8_paged_cache = cache_layout is KvCacheLayout.ATOM_FP8
+    use_index_share = index_share or with_indexer
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S)
     assert topk % SPLIT_KEYS == 0 and 1 <= S <= 8
@@ -516,7 +518,7 @@ def build_glm5_monokernel(
                 batch = fx.max(row_batch_id(s), fx.Int32(0))
                 logical_block = position // 16
                 offset = position % 16
-                block = _uniform(
+                block = fx.Int32(
                     bo.buffer_load(
                         _rsrc(block_tables),
                         batch * block_table_stride + logical_block,
@@ -2041,6 +2043,7 @@ def build_glm5_monokernel(
 
         # ================================== 5. sparse MLA split: 32 keys x 8 heads
         r_kv = _rsrc(kv_cache)
+        r_kv_scale = _rsrc(kv_cache_scale)
         r_pe = _rsrc(pe_cache)
         r_idx = _rsrc(indices)
         KPW = SPLIT_KEYS // WAVES
@@ -2051,18 +2054,37 @@ def build_glm5_monokernel(
                 # The selector publishes compact payload, counts, and indptr
                 # before this release tag.  Acquire it before any metadata load.
                 get(mb("indices_ready"), s)
+            if const_expr(use_index_share):
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
                     syncscope="agent",
                 )
             if const_expr(use_atom_kv_cache):
                 index_base, index_end = row_index_bounds(s)
-                if const_expr(with_indexer):
-                    available = index_end - index_base
+                if const_expr(use_index_share):
+                    published_count = fx.max(
+                        fx.Int32(
+                            bo.buffer_load(
+                                _rsrc(selected_counts),
+                                s,
+                                vec_width=1,
+                                dtype=T.i32,
+                                cache_modifier=CM_DEV,
+                            )
+                        ),
+                        fx.Int32(0),
+                    )
+                    available = fx.min(
+                        fx.max(index_end - index_base, fx.Int32(0)),
+                        published_count,
+                    )
                 else:
                     available = index_end - index_base
-                nkeys = available
-                sparse = row_local_sparse_active(s) & (nkeys > 0)
+                nkeys = row_local_sparse_active(s).select(
+                    available,
+                    fx.Int32(0),
+                )
+                sparse = nkeys > 0
             else:
                 index_base = s * topk
                 kv_len = pos0 + s + 1

@@ -184,6 +184,7 @@ class GlmAgenticGraphBucket:
                             topk=topk,
                             launches_per_step=MAX_LAYERS_PER_STEP,
                             with_indexer=spec.with_indexer,
+                            index_share=spec.index_share_mode is not None,
                             index_max_seq=spec.index_max_seq,
                             attention_weight=spec.attention_weight,
                             kv_cache_layout=spec.kv_cache_layout,

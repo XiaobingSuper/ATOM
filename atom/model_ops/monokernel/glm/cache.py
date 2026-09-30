@@ -229,6 +229,100 @@ def publish_fp8_cache_rows(
     return True
 
 
+def fp8_paged_sparse_attention_reference(
+    *,
+    query: torch.Tensor,
+    main_cache: torch.Tensor,
+    main_scale: torch.Tensor,
+    selected_slots: torch.Tensor,
+    selected_counts: torch.Tensor,
+    selected_indptr: torch.Tensor,
+    batch_ids: torch.Tensor,
+    owned_counts: torch.Tensor,
+    fresh_slots: torch.Tensor | None = None,
+    fresh_values: torch.Tensor | None = None,
+    softmax_scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference physical-slot attention shared by FULL and SHARED layers."""
+
+    slots = validate_fp8_paged_cache(
+        main_cache,
+        main_scale,
+        None,
+        with_indexer=False,
+    )
+    if query.ndim != 3 or query.shape[-1] != MAIN_CACHE_ROW_BYTES:
+        raise ValueError("query must be [rows, heads, 576]")
+    rows, heads, _ = query.shape
+    for name, value, size in (
+        ("selected_counts", selected_counts, rows),
+        ("selected_indptr", selected_indptr, rows + 1),
+        ("batch_ids", batch_ids, rows),
+        ("owned_counts", owned_counts, rows),
+    ):
+        if value.dtype is not torch.int32 or value.numel() < size:
+            raise ValueError(f"{name} must contain {size} int32 values")
+    if selected_slots.dtype is not torch.int32:
+        raise ValueError("selected_slots must be int32")
+    if (fresh_slots is None) != (fresh_values is None):
+        raise ValueError("fresh slots and values must be provided together")
+    fresh: dict[int, torch.Tensor] = {}
+    if fresh_slots is not None and fresh_values is not None:
+        if (
+            fresh_slots.dtype is not torch.int64
+            or fresh_values.ndim != 2
+            or fresh_values.shape != (fresh_slots.numel(), MAIN_CACHE_ROW_BYTES)
+        ):
+            raise ValueError("fresh values must be [fresh_slots, 576]")
+        fresh = {
+            int(slot): fresh_values[i].float()
+            for i, slot in enumerate(fresh_slots.tolist())
+            if slot >= 0
+        }
+
+    output = torch.zeros(
+        rows,
+        heads,
+        512,
+        dtype=torch.float32,
+        device=query.device,
+    )
+    lse = torch.full(
+        (rows, heads),
+        float("-inf"),
+        dtype=torch.float32,
+        device=query.device,
+    )
+    cache = main_cache.reshape(slots, MAIN_CACHE_ROW_BYTES)
+    descale = main_scale.reshape(-1)[0]
+    for row in range(rows):
+        if int(batch_ids[row]) < 0 or int(owned_counts[row]) <= 0:
+            continue
+        begin = int(selected_indptr[row])
+        end = int(selected_indptr[row + 1])
+        count = min(max(end - begin, 0), max(int(selected_counts[row]), 0))
+        if count == 0:
+            continue
+        physical = selected_slots[begin : begin + count].tolist()
+        if any(not 0 <= slot < slots for slot in physical):
+            raise ValueError("selected physical slot exceeds cache capacity")
+        rows_kv = torch.stack(
+            [
+                fresh[slot]
+                if slot in fresh
+                else cache[slot].float() * descale
+                for slot in physical
+            ]
+        ).to(query.device)
+        scores = (
+            query[row].float() @ rows_kv.transpose(0, 1)
+        ) * softmax_scale
+        probabilities = torch.softmax(scores, dim=-1)
+        output[row] = probabilities @ rows_kv[:, :512]
+        lse[row] = torch.logsumexp(scores, dim=-1)
+    return output, lse
+
+
 __all__ = [
     "Fp8CacheRowPolicy",
     "Fp8CacheWorkPolicy",
@@ -240,6 +334,7 @@ __all__ = [
     "PHYSICAL_PAGE_SIZE",
     "fp8_cache_row_policy",
     "fp8_cache_work_policy",
+    "fp8_paged_sparse_attention_reference",
     "logical_to_physical_slot",
     "physical_cache_slot",
     "publish_fp8_cache_rows",
