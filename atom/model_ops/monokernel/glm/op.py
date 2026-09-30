@@ -69,6 +69,7 @@ class Glm5MonoKernel:
         index_max_seq: int = 4096,
         attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
+        uv_scale_block_m: int = 128,
         timeline=False,
     ):
         if W.config != GLM5_CONFIG:
@@ -166,6 +167,7 @@ class Glm5MonoKernel:
             expert_mxfp4=self.expert_mxfp4,
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
+            uv_scale_block_m=uv_scale_block_m,
             timeline=timeline,
         )
         self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter

@@ -95,6 +95,7 @@ from atom.model_ops.monokernel.glm.layout import (
     XQ_BLOCKS,
     XQ_WAVES,
     dn_tile,
+    fp8_scale_offset,
     layout,
     sparse_keys_per_task,
     stage_tasks,
@@ -156,6 +157,7 @@ def build_glm5_monokernel(
     expert_mxfp4: bool = False,
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
+    uv_scale_block_m: int = 128,
     scale: float = SOFTMAX_SCALE,
     timeline: bool = False,
 ):
@@ -177,6 +179,7 @@ def build_glm5_monokernel(
     assert 1 <= launches_per_step <= LAYER_SLOTS
     assert not with_indexer or (topk == 2048 and index_max_seq % INDEX_KEYS_PER_TASK == 0)
     assert not (attention_bf16 and with_indexer), "BF16 attention uses the external indexer"
+    assert uv_scale_block_m in (64, 128)
     H = heads
     W = npes
     G = BLOCKS
@@ -545,13 +548,31 @@ def build_glm5_monokernel(
                 s = s * coef
             return ("fp8", [wv], s, b_word + (lane // 16) * 4)
 
-        def unit_fp8x2(w_rsrc, s_rsrc, rg, kc, NKC, K, b_word, coef=None):
+        def unit_fp8x2(
+            w_rsrc,
+            s_rsrc,
+            rg,
+            kc,
+            NKC,
+            K,
+            b_word,
+            coef=None,
+            scale_block_m=128,
+        ):
             """Issue both 64-k halves of one 128-k FP8 weight-scale block."""
             wv = [
                 fx.Vector(bo.buffer_load(w_rsrc, ((rg * NKC + kc + h) * 64 + lane) * 4, vec_width=4, dtype=T.i32))
                 for h in range(2)
             ]
-            s = ld_f32(s_rsrc, (rg * 16 // SCALE_BM) * (K // 128) + kc // 2)
+            s = ld_f32(
+                s_rsrc,
+                fp8_scale_offset(
+                    rg,
+                    kc,
+                    k_size=K,
+                    block_m=scale_block_m,
+                ),
+            )
             if const_expr(callable(coef)):
                 return ("fp8x2", wv, lambda: s * coef(), b_word + (lane // 16) * 4)
             if const_expr(coef is not None):
@@ -595,12 +616,32 @@ def build_glm5_monokernel(
             ]
             return ("bf16", wv, None, b_word + (lane // 16) * 4)
 
-        def unit_attention(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word, ln=None):
+        def unit_attention(
+            w_rsrc,
+            s_rsrc,
+            rg,
+            kc,
+            NKC,
+            K,
+            BK,
+            b_word,
+            ln=None,
+            scale_block_m=128,
+        ):
             if const_expr(attention_bf16):
                 return unit_bf16(w_rsrc, rg, kc, NKC, b_word, ln)
             if const_expr(BK == 64):
                 return unit_fp8(w_rsrc, s_rsrc, rg, kc, NKC, K, BK, b_word)
-            return unit_fp8x2(w_rsrc, s_rsrc, rg, kc, NKC, K, b_word)
+            return unit_fp8x2(
+                w_rsrc,
+                s_rsrc,
+                rg,
+                kc,
+                NKC,
+                K,
+                b_word,
+                scale_block_m=scale_block_m,
+            )
 
         def mma_units(acc, units):
             """acc[4] += coef * (W_chunk @ X_chunk) for every issued unit."""
@@ -1750,6 +1791,7 @@ def build_glm5_monokernel(
                     KV_LORA,
                     128,
                     (kc * 64) // 2,
+                    scale_block_m=uv_scale_block_m,
                 )
 
             pre = [u_uv(c) for c in range(UV_UNITS)]

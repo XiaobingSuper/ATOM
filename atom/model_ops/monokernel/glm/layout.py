@@ -98,6 +98,21 @@ def sparse_keys_per_task(samples: int) -> int:
     return 32 if samples > 4 else 64
 
 
+def fp8_scale_offset(
+    row_group,
+    k_chunk,
+    *,
+    k_size: int,
+    block_m: int,
+    block_k: int = 128,
+):
+    """Address one FP8 weight scale for a 16-row MFMA row group."""
+
+    if block_m not in (64, 128) or block_k != 128:
+        raise ValueError("GLM FP8 scales require block_m 64/128 and block_k 128")
+    return (row_group * 16 // block_m) * (k_size // block_k) + k_chunk // 2
+
+
 def ug_split(samples: int):
     """Return the balanced up/gate leftover split for batches two and four."""
 
