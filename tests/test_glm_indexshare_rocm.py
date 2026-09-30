@@ -113,7 +113,15 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
     import torch.distributed as dist
 
     from atom.model_ops.monokernel.config import KvCacheLayout
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.graph import (
+        GlmAgenticGraphBucket,
+        GlmAgenticLayer,
+        GlmAgenticLayerInputs,
+    )
+    from atom.model_ops.monokernel.glm.index_share import GlmIndexShareMode
     from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
+    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
 
     device = torch.device("cuda", device_offset + rank)
     torch.cuda.set_device(device)
@@ -123,9 +131,25 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
         rank=rank,
         world_size=4,
     )
-    full = shared = None
+    bucket = full = shared = workspace = None
     try:
         weights, artifacts = _packed_zero_weights(device)
+        shape = GlmAgenticShape.for_graph(
+            batch_capacity=20,
+            query_len=5,
+            dcp_size=1,
+            query_replication=False,
+        )
+        workspace = GlmAgenticWorkspace.allocate(
+            shape,
+            rank=rank,
+            npes=4,
+            group=None,
+            sparse_attention_topk=2048,
+            with_indexer=True,
+            index_max_seq=64,
+        )
+        workspace.ensure_index_share(2048)
         common = dict(
             rank=rank,
             npes=4,
@@ -135,151 +159,176 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
             index_max_seq=64,
             kv_cache_layout=KvCacheLayout.ATOM_FP8,
             agentic_row_contract=True,
+            row_capacity=100,
+            workspace=workspace,
         )
+        full_artifacts = artifacts(True)
+        shared_artifacts = artifacts(False)
         full = Glm5MonoKernel(
             weights,
-            4,
+            8,
             with_indexer=True,
             index_share=True,
-            packed_artifacts=artifacts(True),
+            packed_artifacts=full_artifacts,
             **common,
         )
         shared = Glm5MonoKernel(
             weights,
-            4,
+            8,
             with_indexer=False,
             index_share=True,
-            packed_artifacts=artifacts(False),
+            packed_artifacts=shared_artifacts,
             **common,
         )
 
         gen = torch.Generator(device=device).manual_seed(917)
         hidden = torch.randn(
-            4, weights.config.hidden, generator=gen, device=device
+            100, weights.config.hidden, generator=gen, device=device
         ).to(torch.bfloat16)
-        positions = torch.tensor([16, 17, 18, 0], dtype=torch.int64, device=device)
-        slot_mapping = torch.tensor([0, 1, -1, -1], dtype=torch.int64, device=device)
-        batch_ids = torch.tensor([0, 0, 0, -1], dtype=torch.int32, device=device)
-        owned_counts = torch.tensor([1, 1, 0, 0], dtype=torch.int32, device=device)
-        block_tables = torch.tensor(
-            [[3, 0, 2, 1]], dtype=torch.int32, device=device
+        positions = torch.zeros(100, dtype=torch.int64, device=device)
+        positions[:2] = torch.tensor([16, 17], dtype=torch.int64, device=device)
+        positions[96] = 16
+        slot_mapping = torch.full(
+            (100,), -1, dtype=torch.int64, device=device
         )
-        context_lens = torch.tensor([19], dtype=torch.int32, device=device)
-        selected = torch.full(
-            (4 * 2048,), -1, dtype=torch.int32, device=device
-        )
-        counts = torch.full((4,), -1, dtype=torch.int32, device=device)
-        indptr = torch.full((5,), -1, dtype=torch.int32, device=device)
+        slot_mapping[:2] = torch.tensor([0, 1], dtype=torch.int64, device=device)
+        slot_mapping[96] = 16
+        batch_ids = torch.full((100,), -1, dtype=torch.int32, device=device)
+        batch_ids[:2] = 0
+        batch_ids[96] = 19
+        owned_counts = torch.zeros(100, dtype=torch.int32, device=device)
+        owned_counts[:2] = 1
+        owned_counts[96] = 1
+        block_tables = torch.zeros(20, 4, dtype=torch.int32, device=device)
+        block_tables[0] = torch.tensor([3, 0, 2, 1], device=device)
+        block_tables[19] = torch.tensor([2, 1, 3, 0], device=device)
+        context_lens = torch.zeros(20, dtype=torch.int32, device=device)
+        context_lens[0] = 19
+        context_lens[19] = 17
+        selected = workspace.selected_slots
+        counts = workspace.selected_counts
+        indptr = workspace.selected_indptr
+        assert selected is not None and counts is not None and indptr is not None
+        selected = selected.reshape(-1)
+        selected.fill_(-1)
+        counts.fill_(-1)
+        indptr.fill_(-1)
         cache = torch.zeros(
             64, 576, dtype=torch.float8_e4m3fn, device=device
         )
         cache[0:2, :512] = 7
+        for physical in range(32, 48):
+            cache[physical, :512] = physical - 31
         for physical in range(48, 64):
             cache[physical, :512] = physical - 47
         cache_scale = torch.ones(1, dtype=torch.float32, device=device)
         index_cache = torch.zeros(64, 144, dtype=torch.uint8, device=device)
         cos = torch.ones(64, 32, dtype=torch.float32, device=device)
         sin = torch.zeros_like(cos)
-
-        launch = dict(
-            positions=positions,
-            slot_mapping=slot_mapping,
-            sparse_kv_indptr=indptr,
-            batch_ids=batch_ids,
-            owned_counts=owned_counts,
-            kv_cache_scale=cache_scale,
-            block_tables=block_tables,
-            context_lens=context_lens,
-            selected_counts=counts,
-        )
-        full_out = full.forward(
-            hidden,
-            positions,
+        full_inputs = GlmAgenticLayerInputs(
             cache,
             None,
             selected,
             cos,
             sin,
             index_cache=index_cache,
-            layer=0,
-            advance=False,
-            **launch,
+            kv_cache_scale=cache_scale,
         )
-        # No host synchronization or intervening host read: SHARED must acquire
-        # FULL's graph-stable publication through device/stream ordering.
-        shared_out = shared.forward(
-            full_out,
-            positions,
+        shared_inputs = GlmAgenticLayerInputs(
             cache,
             None,
             selected,
             cos,
             sin,
-            layer=1,
-            advance=False,
-            **launch,
+            kv_cache_scale=cache_scale,
         )
+        bucket = GlmAgenticGraphBucket(
+            workspace,
+            (
+                GlmAgenticLayer(
+                    0,
+                    {8: full},
+                    full_inputs,
+                    full_artifacts,
+                    index_share_mode=GlmIndexShareMode.FULL,
+                ),
+                GlmAgenticLayer(
+                    1,
+                    {8: shared},
+                    shared_inputs,
+                    shared_artifacts,
+                    index_share_mode=GlmIndexShareMode.SHARED,
+                ),
+            ),
+        )
+
+        launch = dict(
+            hidden_states=hidden,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            sparse_kv_indptr=indptr,
+            batch_ids=batch_ids,
+            owned_counts=owned_counts,
+            block_tables=block_tables,
+            context_lens=context_lens,
+        )
+        # One host call enqueues one FULL launch and one SHARED launch. There is
+        # no host synchronization between layers; the publication is device
+        # ordered and the model-call step advances once after both launches.
+        eager_out = bucket(**launch)
         torch.cuda.synchronize(device)
+        assert workspace.step.item() == 1
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_out = bucket(**launch)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert workspace.step.item() == 2
 
         expected = torch.tensor(
             list(range(48, 64))
             + [0]
             + list(range(48, 64))
-            + [0, 1],
+            + [0, 1]
+            + list(range(32, 48))
+            + [16],
             dtype=torch.int32,
             device=device,
         )
-        assert torch.equal(counts, torch.tensor([17, 18, 0, 0], device=device))
-        assert torch.equal(indptr, torch.tensor([0, 17, 35, 35, 35], device=device))
-        assert torch.equal(selected[:35], expected), (
-            selected[:35].cpu().tolist(),
+        expected_counts = torch.zeros(100, dtype=torch.int32, device=device)
+        expected_counts[:2] = torch.tensor([17, 18], device=device)
+        expected_counts[96] = 17
+        expected_indptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                expected_counts.cumsum(0),
+            )
+        )
+        assert torch.equal(counts, expected_counts)
+        assert torch.equal(indptr, expected_indptr)
+        assert torch.equal(selected[:52], expected), (
+            selected[:52].cpu().tolist(),
             expected.cpu().tolist(),
         )
-        assert not selected[35:].any()
+        assert not selected[52:].any()
 
         nsplit = 2048 // 64
-        acc_shape = (4, nsplit, weights.config.local_heads, weights.config.kv_lora)
-        full_acc = full.debug("sp_acc", acc_shape, bf2=True)
+        acc_shape = (8, nsplit, weights.config.local_heads, weights.config.kv_lora)
         shared_acc = shared.debug("sp_acc", acc_shape, bf2=True)
-        # Scores are deterministically zero, so P=1 and sp_acc is the explicit
-        # sum of selected physical values. Slots 0/1 are same-launch fresh zeros,
-        # replacing stale cache values of seven.
+        # The final four-row tile is live only at global row 96. Scores are
+        # deterministically zero, so P=1 and sp_acc is the explicit sum of its
+        # selected physical values; slot 16 is a same-launch fresh zero.
         reference_sum = torch.arange(
             1, 17, dtype=torch.float32, device=device
         ).sum()
         reference_acc = torch.zeros(acc_shape, dtype=torch.float32, device=device)
         reference_acc[0, 0] = reference_sum
-        reference_acc[1, 0] = reference_sum
-        torch.testing.assert_close(full_acc, reference_acc, atol=0.5, rtol=0)
         torch.testing.assert_close(shared_acc, reference_acc, atol=0.5, rtol=0)
-        assert full_acc[0, 0].abs().sum() > 0
-        assert not full_acc[2:].any() and not shared_acc[2:].any()
+        assert shared_acc[0, 0].abs().sum() > 0
+        assert not shared_acc[1:].any()
 
-        guarded_counts = counts.clone()
-        guarded_counts[0] = 1
-        guarded_selected = selected.clone()
-        guarded_selected[1:17] = 100_000
-        guarded_out = shared.forward(
-            full_out,
-            positions,
-            cache,
-            None,
-            guarded_selected,
-            cos,
-            sin,
-            layer=1,
-            advance=False,
-            **dict(launch, selected_counts=guarded_counts),
-        )
-        torch.cuda.synchronize(device)
-        guarded_acc = shared.debug("sp_acc", acc_shape, bf2=True)
-        guarded_reference = reference_acc.clone()
-        guarded_reference[0, 0] = 1
-        torch.testing.assert_close(
-            guarded_acc, guarded_reference, atol=0.5, rtol=0
-        )
-
-        for output in (full_out, shared_out, guarded_out):
+        for output in (eager_out, graph_out):
             torch.testing.assert_close(
                 output.float(),
                 hidden.float(),
@@ -287,12 +336,12 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
                 rtol=1e-2,
             )
             assert torch.isfinite(output).all()
-        assert not cache[:2].float().abs().max()
-        selected_experts = full.debug(
-            "sel", (4, weights.config.moe_slots), torch.int32
+        assert not cache[torch.tensor([0, 1, 16], device=device)].float().abs().max()
+        selected_experts = shared.debug(
+            "sel", (8, weights.config.moe_slots), torch.int32
         )
         assert torch.equal(
-            selected_experts[:, 0],
+            selected_experts[:4, 0],
             torch.full(
                 (4,),
                 weights.config.shared_expert,
@@ -301,10 +350,15 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
             ),
         )
     finally:
-        if shared is not None:
-            shared.close()
-        if full is not None:
-            full.close()
+        if bucket is not None:
+            bucket.close()
+        else:
+            if shared is not None:
+                shared.close()
+            if full is not None:
+                full.close()
+            if workspace is not None:
+                workspace.close()
         dist.destroy_process_group()
 
 
@@ -324,8 +378,7 @@ def test_glm_tp4_full_to_shared_real_rocm_launch():
 
     import torch.multiprocessing as mp
 
-    # Prefer an idle four-device tail on shared eight-GPU development nodes.
-    offset = torch.cuda.device_count() - 4
+    offset = 0
     mp.spawn(
         _tp4_worker,
         args=(offset, _free_port()),

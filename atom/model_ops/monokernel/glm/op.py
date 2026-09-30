@@ -192,6 +192,7 @@ class Glm5MonoKernel:
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         uv_scale_block_m: int = 128,
         agentic_row_contract: bool = False,
+        row_capacity: int | None = None,
         timeline=False,
         workspace: GlmAgenticWorkspace | None = None,
         packed_artifacts: Glm5PackedArtifacts | None = None,
@@ -218,6 +219,17 @@ class Glm5MonoKernel:
                 raise ValueError(f"row tile size {samples} is outside the graph bucket")
             if timeline:
                 raise ValueError("shared Agentic workspace does not support per-op timelines")
+        row_capacity = samples if row_capacity is None else row_capacity
+        if row_capacity != samples and (
+            workspace is None
+            or not agentic_row_contract
+            or samples != workspace.shape.common.tile_rows
+            or row_capacity != workspace.shape.common.row_capacity
+        ):
+            raise ValueError(
+                "persistent row capacity must match the shared Agentic workspace"
+            )
+        self.row_capacity = row_capacity
         t = W.t
         if packed_artifacts is None:
             packed_artifacts = Glm5PackedArtifacts.pack(
@@ -258,7 +270,7 @@ class Glm5MonoKernel:
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         self.index_counts = (
-            torch.empty(samples, dtype=torch.int32, device=dev)
+            torch.empty(row_capacity, dtype=torch.int32, device=dev)
             if self.index_share else None
         )
         if with_indexer:
@@ -324,6 +336,7 @@ class Glm5MonoKernel:
             kv_cache_layout=self.kv_cache_layout,
             uv_scale_block_m=uv_scale_block_m,
             agentic_row_contract=agentic_row_contract,
+            row_capacity=row_capacity,
             timeline=timeline,
             model_config=config,
         )
@@ -406,12 +419,24 @@ class Glm5MonoKernel:
         context_lens=None,
         selected_counts=None,
     ):
-        """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
-        this scratch within a decode step need distinct ``layer``; call
-        ``advance_step`` (or pass ``advance=True``) once per step.  Both are
-        stream-ordered device ops, so the sequence can be captured in a HIP graph."""
+        """One layer across the configured row capacity.
+
+        Layers sharing this scratch within a model call need distinct ``layer``
+        slots. Call ``advance_step`` (or pass ``advance=True``) once per model
+        call; both operations are stream ordered and HIP-graph capturable.
+        """
         if not 0 <= layer < self.launches_per_step:
             raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
+        rows = self.row_capacity
+        hidden_shape = (rows, self.W.config.hidden)
+        if (
+            h.shape != hidden_shape
+            or h.dtype is not torch.bfloat16
+            or not h.is_contiguous()
+        ):
+            raise ValueError(
+                f"hidden states must be contiguous BF16 {list(hidden_shape)}"
+            )
         if (
             self.with_indexer
             and self.kv_cache_layout is not KvCacheLayout.ATOM_FP8
@@ -450,9 +475,9 @@ class Glm5MonoKernel:
                         "context_lens must be contiguous int32 [batch]"
                     )
             for name, value, dtype, size in (
-                ("positions", positions, torch.int64, self.S),
-                ("slot_mapping", slot_mapping, torch.int64, self.S),
-                ("sparse_kv_indptr", sparse_kv_indptr, torch.int32, self.S + 1),
+                ("positions", positions, torch.int64, rows),
+                ("slot_mapping", slot_mapping, torch.int64, rows),
+                ("sparse_kv_indptr", sparse_kv_indptr, torch.int32, rows + 1),
             ):
                 if value is None or value.dtype is not dtype or value.numel() < size or not value.is_contiguous():
                     got = None if value is None else (tuple(value.shape), value.dtype)
@@ -465,19 +490,19 @@ class Glm5MonoKernel:
                     if (
                         value is None
                         or value.dtype is not torch.int32
-                        or value.numel() < self.S
+                        or value.numel() < rows
                         or not value.is_contiguous()
                     ):
                         got = None if value is None else (tuple(value.shape), value.dtype)
                         raise ValueError(
                             f"{name} must be contiguous int32 with at least "
-                            f"{self.S} values, got {got}"
+                            f"{rows} values, got {got}"
                         )
         t = dict(self.W.t, **self.packed)
         if self.index_share:
-            if indices.dtype is not torch.int32 or indices.numel() < self.S * self.topk:
+            if indices.dtype is not torch.int32 or indices.numel() < rows * self.topk:
                 raise ValueError(
-                    f"IndexShare requires {self.S * self.topk} int32 slots"
+                    f"IndexShare requires {rows * self.topk} int32 slots"
                 )
             if selected_counts is None:
                 if not self.with_indexer:
@@ -487,18 +512,26 @@ class Glm5MonoKernel:
                 selected_counts = self.index_counts
             if (
                 selected_counts.dtype is not torch.int32
-                or selected_counts.numel() < self.S
+                or selected_counts.numel() < rows
                 or not selected_counts.is_contiguous()
             ):
                 raise ValueError(
-                    f"selected_counts must contain {self.S} contiguous int32 values"
+                    f"selected_counts must contain {rows} contiguous int32 values"
                 )
         if x_out is None:
             x_out = torch.empty(
-                self.S,
+                rows,
                 self.W.config.hidden,
                 dtype=torch.bfloat16,
                 device=h.device,
+            )
+        elif (
+            x_out.shape != hidden_shape
+            or x_out.dtype is not torch.bfloat16
+            or not x_out.is_contiguous()
+        ):
+            raise ValueError(
+                f"output must be contiguous BF16 {list(hidden_shape)}"
             )
         p = lambda x: x.data_ptr()  # noqa: E731
         self.launch(

@@ -661,7 +661,7 @@ def test_glm_layout_uses_tp4_heads_and_expert_width():
     assert one_row_stages["split"] == 2 * (2048 // 64)
 
 
-def test_glm_kernel_builder_accepts_tp4_agentic_tile_geometry():
+def test_glm_kernel_builder_accepts_tp4_agentic_capacity_100():
     torch = pytest.importorskip("torch")
     pytest.importorskip("flydsl")
     if not torch.cuda.is_available():
@@ -683,6 +683,7 @@ def test_glm_kernel_builder_accepts_tp4_agentic_tile_geometry():
         attention_weight=AttentionWeight.BF16,
         kv_cache_layout=KvCacheLayout.ATOM,
         agentic_row_contract=True,
+        row_capacity=100,
         model_config=config,
     )
 
@@ -1862,7 +1863,10 @@ def test_per_layer_mailboxes_alternate_between_decode_steps():
     assert sources["symmetric"].count("slot = step_value & 1") == 3
     assert "slot = step_value & 1" in sources["tail"]
     assert "slot = step_value & 1" in sources["k3"]
-    assert "peer_slot = step_value & 1" in sources["glm"]
+    assert (
+        "peer_slot = (step_value * TILE_COUNT + row_tile) & 1"
+        in sources["glm"]
+    )
     assert "slot = step_value & 1" in sources["gemm"]
     for source in sources.values():
         assert "(step_value * LAYER_SLOTS + layer) & 1" not in source

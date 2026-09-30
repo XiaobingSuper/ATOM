@@ -219,6 +219,8 @@ def layout(
         ("mid", samples * config.moe_slots * config.inter * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
         ("xqd", samples * config.hidden * 4),
+        ("grid_arrivals", BLOCKS * pair_bytes),
+        ("grid_release", pair_bytes),
     ]
     if with_indexer:
         items += [

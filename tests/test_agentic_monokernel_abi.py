@@ -538,7 +538,7 @@ def test_glm_agentic_workspace_is_shared_by_layer_bindings():
         workspace.layer(128)
 
 
-def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
+def test_glm_graph_bucket_launches_each_layer_once_and_advances_one_step():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
     from atom.model_ops.monokernel.glm.graph import (
@@ -581,6 +581,7 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
     class FakeKernel:
         def __init__(self, samples, slot, packed_artifacts):
             self.S = samples
+            self.row_capacity = shape.common.row_capacity
             self.workspace = workspace
             self.slot = slot
             self.packed_artifacts = packed_artifacts
@@ -593,6 +594,7 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
                 (
                     self.slot,
                     self.S,
+                    h.shape[0],
                     layer,
                     advance,
                     kwargs["batch_ids"].clone(),
@@ -622,10 +624,7 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
         layers.append(
             GlmAgenticLayer(
                 slot=slot,
-                kernels={
-                    size: FakeKernel(size, slot, packed_artifacts)
-                    for size in (4, 8)
-                },
+                kernels={8: FakeKernel(8, slot, packed_artifacts)},
                 inputs=inputs,
                 packed_artifacts=packed_artifacts,
             )
@@ -657,24 +656,26 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
 
     assert output.data_ptr() == hidden_buffers[1].data_ptr()
     assert torch.equal(output, hidden + 2)
-    assert [(slot, size) for slot, size, *_ in calls] == [
-        pair
-        for size in ([8] * 12 + [4])
-        for pair in ((3, size), (9, size))
+    assert [(slot, tile_rows, rows) for slot, tile_rows, rows, *_ in calls] == [
+        (3, 8, 100),
+        (9, 8, 100),
     ]
-    assert all(layer == slot and not advance for slot, _, layer, advance, *_ in calls)
-    assert calls[-1][-7].tolist() == [19, 19, -1, -1]
-    assert calls[-1][-6].tolist() == [1, 0, 0, 0]
+    assert all(
+        layer == slot and not advance
+        for slot, _, _, layer, advance, *_ in calls
+    )
+    assert calls[-1][-7].tolist() == batch_ids.tolist()
+    assert calls[-1][-6].tolist() == owned_counts.tolist()
     assert all(call[-5] is cache_scale for call in calls)
     assert all(call[-4] is block_tables for call in calls)
     assert all(call[-3] is context_lens for call in calls)
-    assert calls[-1][-2].tolist() == positions[-4:].tolist()
-    assert calls[-1][-1].tolist() == slot_mapping[-4:].tolist()
-    assert workspace.step.item() == 13
+    assert calls[-1][-2].tolist() == positions.tolist()
+    assert calls[-1][-1].tolist() == slot_mapping.tolist()
+    assert workspace.step.item() == 1
     assert all(layer.workspace is workspace for layer in layers)
 
 
-def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
+def test_glm_graph_bucket_builds_one_capacity_kernel_per_layer():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.config import KvCacheLayout
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
@@ -719,6 +720,7 @@ def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
         def __init__(self, weights, samples, **kwargs):
             made.append((weights, samples, kwargs))
             self.S = samples
+            self.row_capacity = kwargs["row_capacity"]
             self.workspace = kwargs["workspace"]
             self.packed_artifacts = kwargs["packed_artifacts"]
             self.scratch = self.workspace.scratch
@@ -750,12 +752,11 @@ def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
         artifact_factory=pack_once,
     )
 
-    assert [samples for _, samples, _ in made] == [4, 8, 4, 8]
+    assert [samples for _, samples, _ in made] == [8, 8]
     assert all(kwargs["workspace"] is workspace for _, _, kwargs in made)
+    assert all(kwargs["row_capacity"] == 100 for _, _, kwargs in made)
     assert len(packed) == 2
-    assert made[0][2]["packed_artifacts"] is made[1][2]["packed_artifacts"]
-    assert made[2][2]["packed_artifacts"] is made[3][2]["packed_artifacts"]
-    assert made[0][2]["packed_artifacts"] is not made[2][2]["packed_artifacts"]
+    assert made[0][2]["packed_artifacts"] is not made[1][2]["packed_artifacts"]
     assert [layer.packed_artifacts for layer in bucket.layers] == [
         packed[0][0],
         packed[1][0],
@@ -1068,6 +1069,7 @@ def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
     class FakeKernel:
         def __init__(self, mode):
             self.S = 4
+            self.row_capacity = 4
             self.workspace = workspace
             self.scratch = workspace.scratch
             self.peer_buffer = workspace.peer_buffer

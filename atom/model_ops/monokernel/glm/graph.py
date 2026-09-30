@@ -77,7 +77,7 @@ class GlmAgenticLayer:
 
 
 class GlmAgenticGraphBucket:
-    """Tile-major execution over full-layer kernels sharing one graph arena."""
+    """Layer-major execution over persistent row-tiled kernels."""
 
     def __init__(
         self,
@@ -91,16 +91,17 @@ class GlmAgenticGraphBucket:
             raise ValueError("GLM graph-bucket layer slots must be distinct")
         if any(not 0 <= slot < MAX_LAYERS_PER_STEP for slot in slots):
             raise ValueError("GLM graph-bucket layer slot is out of range")
-        tile_sizes = {tile.capacity for tile in workspace.shape.row_tiles}
+        row_capacity = workspace.shape.common.row_capacity
+        kernel_rows = min(workspace.shape.common.tile_rows, row_capacity)
         for layer in layers:
-            if set(layer.kernels) != tile_sizes:
+            if set(layer.kernels) != {kernel_rows}:
                 raise ValueError(
-                    f"layer {layer.slot} kernels must cover tile sizes "
-                    f"{sorted(tile_sizes)}"
+                    f"layer {layer.slot} must own one S{kernel_rows} capacity kernel"
                 )
             for size, kernel in layer.kernels.items():
                 if (
                     kernel.S != size
+                    or kernel.row_capacity != row_capacity
                     or kernel.workspace is not workspace
                     or kernel.scratch is not workspace.scratch
                     or kernel.peer_buffer is not workspace.peer_buffer
@@ -159,9 +160,8 @@ class GlmAgenticGraphBucket:
             from atom.model_ops.monokernel.glm.op import Glm5PackedArtifacts
 
             artifact_factory = Glm5PackedArtifacts.pack
-        tile_sizes = sorted(
-            {tile.capacity for tile in workspace.shape.row_tiles}
-        )
+        row_capacity = workspace.shape.common.row_capacity
+        kernel_rows = min(workspace.shape.common.tile_rows, row_capacity)
         layers = []
         try:
             for slot, spec in enumerate(specs):
@@ -174,25 +174,25 @@ class GlmAgenticGraphBucket:
                 )
                 kernels = {}
                 try:
-                    for size in tile_sizes:
-                        kernels[size] = kernel_factory(
-                            spec.weights,
-                            size,
-                            rank=rank,
-                            npes=npes,
-                            group=group,
-                            topk=topk,
-                            launches_per_step=MAX_LAYERS_PER_STEP,
-                            with_indexer=spec.with_indexer,
-                            index_share=spec.index_share_mode is not None,
-                            index_max_seq=spec.index_max_seq,
-                            attention_weight=spec.attention_weight,
-                            kv_cache_layout=spec.kv_cache_layout,
-                            uv_scale_block_m=spec.uv_scale_block_m,
-                            agentic_row_contract=True,
-                            workspace=workspace,
-                            packed_artifacts=artifacts,
-                        )
+                    kernels[kernel_rows] = kernel_factory(
+                        spec.weights,
+                        kernel_rows,
+                        rank=rank,
+                        npes=npes,
+                        group=group,
+                        topk=topk,
+                        launches_per_step=MAX_LAYERS_PER_STEP,
+                        with_indexer=spec.with_indexer,
+                        index_share=spec.index_share_mode is not None,
+                        index_max_seq=spec.index_max_seq,
+                        attention_weight=spec.attention_weight,
+                        kv_cache_layout=spec.kv_cache_layout,
+                        uv_scale_block_m=spec.uv_scale_block_m,
+                        agentic_row_contract=True,
+                        row_capacity=row_capacity,
+                        workspace=workspace,
+                        packed_artifacts=artifacts,
+                    )
                 except Exception:
                     for kernel in kernels.values():
                         kernel.close()
@@ -271,55 +271,51 @@ class GlmAgenticGraphBucket:
         runtime = self.workspace.bind_runtime(batch_ids, owned_counts)
         buffers = self.workspace.hidden_buffers
         assert buffers is not None
-        for tile in shape.work_tiles:
-            start, stop = tile.start, tile.stop
-            state = hidden_states[start:stop]
-            ownership = runtime.tile(tile)
-            selected_slots = self.workspace.selected_slots
-            selected_counts = self.workspace.selected_counts
-            selected_indptr = self.workspace.selected_indptr
-            for layer_index, layer in enumerate(self.layers):
-                output = buffers[layer_index % 2][start:stop]
-                args = layer.inputs
-                index_share = layer.index_share_mode is not None
-                layer_indices = (
-                    selected_slots[start:stop].reshape(-1)
+        state = hidden_states
+        selected_slots = self.workspace.selected_slots
+        selected_counts = self.workspace.selected_counts
+        selected_indptr = self.workspace.selected_indptr
+        kernel_rows = min(shape.common.tile_rows, rows)
+        for layer_index, layer in enumerate(self.layers):
+            output = buffers[layer_index % 2]
+            args = layer.inputs
+            index_share = layer.index_share_mode is not None
+            state = layer.kernels[kernel_rows].forward(
+                state,
+                positions,
+                args.kv_cache,
+                args.pe_cache,
+                (
+                    selected_slots.reshape(-1)
                     if index_share and selected_slots is not None
                     else args.indices
-                )
-                layer_indptr = (
-                    selected_indptr[start : stop + 1]
+                ),
+                args.cos,
+                args.sin,
+                x_out=output,
+                layer=layer.slot,
+                advance=False,
+                index_cache=args.index_cache,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                sparse_kv_indptr=(
+                    selected_indptr
                     if index_share and selected_indptr is not None
-                    else sparse_kv_indptr[start : stop + 1]
-                )
-                state = layer.kernels[tile.capacity].forward(
-                    state,
-                    positions[start:stop],
-                    args.kv_cache,
-                    args.pe_cache,
-                    layer_indices,
-                    args.cos,
-                    args.sin,
-                    x_out=output,
-                    layer=layer.slot,
-                    advance=False,
-                    index_cache=args.index_cache,
-                    positions=positions[start:stop],
-                    slot_mapping=slot_mapping[start:stop],
-                    sparse_kv_indptr=layer_indptr,
-                    selected_counts=(
-                        selected_counts[start:stop]
-                        if index_share and selected_counts is not None
-                        else None
-                    ),
-                    batch_ids=ownership.batch_ids,
-                    owned_counts=ownership.owned_counts,
-                    kv_cache_scale=args.kv_cache_scale,
-                    block_tables=block_tables,
-                    context_lens=context_lens,
-                )
-            self.workspace.advance_step()
-        return buffers[(len(self.layers) - 1) % 2]
+                    else sparse_kv_indptr
+                ),
+                selected_counts=(
+                    selected_counts
+                    if index_share and selected_counts is not None
+                    else None
+                ),
+                batch_ids=runtime.batch_ids,
+                owned_counts=runtime.owned_counts,
+                kv_cache_scale=args.kv_cache_scale,
+                block_tables=block_tables,
+                context_lens=context_lens,
+            )
+        self.workspace.advance_step()
+        return state
 
     def close(self) -> None:
         for layer in self.layers:
