@@ -2246,6 +2246,7 @@ def build_kimi_k3_monokernel(
         # norm CTAs remove the cross-split reduction from the recurrence path.
         if const_expr(mtp):
             conv_task = bid
+            resident_producer_task = fx.Int32(-1)
             conv_tasks = samples * _HEADS
             while conv_task < conv_tasks:
                 sample = conv_task // _HEADS
@@ -2318,11 +2319,15 @@ def build_kimi_k3_monokernel(
                 gpu.barrier()
                 if tid == 0:
                     store_i32(mtp_conv_ready_rsrc, sample * _HEADS + head, 1)
+                resident_producer_task = conv_task
                 conv_task = conv_task + _BLOCKS
 
             stamp(1)
 
-            def run_mtp_recurrence(sample, head, value_split, local_qkvg):
+            def run_mtp_recurrence(sample, head, value_split):
+                local_qkvg = (
+                    sample * _HEADS + head == resident_producer_task
+                )
                 if tid == 0:
                     if not local_qkvg:
                         load_i32(mtp_conv_ready_rsrc, sample * _HEADS + head)
@@ -2540,7 +2545,7 @@ def build_kimi_k3_monokernel(
                         partial_square,
                     )
 
-            def run_mtp_pair(pair, head, value_split, local_sample):
+            def run_mtp_pair(pair, head, value_split):
                 sample_base = pair * 2
                 token_base = sample_base
                 request = fx.Int32(0)
@@ -2619,7 +2624,9 @@ def build_kimi_k3_monokernel(
                     init=state_vectors,
                 ):
                     sample = sample_base + token_offset
-                    local_qkvg = sample == local_sample
+                    local_qkvg = (
+                        sample * _HEADS + head == resident_producer_task
+                    )
                     if tid == 0:
                         if not local_qkvg:
                             load_i32(mtp_conv_ready_rsrc, sample * _HEADS + head)
@@ -2833,7 +2840,6 @@ def build_kimi_k3_monokernel(
                 if bid < mtp_splits * mtp_recurrence_tasks:
                     value_split = bid // mtp_recurrence_tasks
                     mtp_recurrence_task = bid % mtp_recurrence_tasks
-                    local_qkvg = value_split == 0
                     sample = mtp_recurrence_task // _HEADS
                     head = mtp_recurrence_task % _HEADS
                     if tid == 0:
@@ -2843,26 +2849,25 @@ def build_kimi_k3_monokernel(
                                 ((sample - 1) * _HEADS + head) * mtp_splits + value_split,
                             )
                     gpu.barrier()
-                    run_mtp_recurrence(sample, head, value_split, local_qkvg)
+                    run_mtp_recurrence(sample, head, value_split)
             else:
                 mtp_pair_tasks = (samples // 2) * _HEADS
                 mtp_task = bid
                 while mtp_task < mtp_splits * mtp_pair_tasks:
-                    has_local_qkvg = mtp_task < mtp_recurrence_tasks
+                    primary_task = mtp_task < mtp_recurrence_tasks
                     conv_sample = mtp_task // _HEADS
                     local_pair = conv_sample // 2
                     local_split = conv_sample % 2
                     remote_task = mtp_task - mtp_recurrence_tasks
                     remote_split = 2 + remote_task // mtp_pair_tasks
                     remote_pair_task = remote_task % mtp_pair_tasks
-                    pair = has_local_qkvg.select(local_pair, remote_pair_task // _HEADS)
-                    head = has_local_qkvg.select(
+                    pair = primary_task.select(local_pair, remote_pair_task // _HEADS)
+                    head = primary_task.select(
                         mtp_task % _HEADS,
                         remote_pair_task % _HEADS,
                     )
-                    value_split = has_local_qkvg.select(local_split, remote_split)
-                    local_sample = has_local_qkvg.select(conv_sample, fx.Int32(-1))
-                    run_mtp_pair(pair, head, value_split, local_sample)
+                    value_split = primary_task.select(local_split, remote_split)
+                    run_mtp_pair(pair, head, value_split)
                     mtp_task = mtp_task + _BLOCKS
 
             mtp_norm_head_groups = _HEADS // 4

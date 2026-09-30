@@ -72,15 +72,21 @@ def _deterministic_weights(device, rank):
     ):
         tensors[name] = bf16(hidden, value=1)
 
-    rows = torch.arange(3 * projection, fused, device=device)
+    rows = torch.arange(fused, device=device)
     tensors["w_kda_in"][rows, rows.remainder(16)] = (
         0.015625 + rows.remainder(7).to(torch.float32) / 1024
     ).to(torch.bfloat16)
+    tensors["w_kda_conv"][:, 0] = 0.0625
+    tensors["w_kda_conv"][:, 1] = 0.125
+    tensors["w_kda_conv"][:, 2] = 0.25
     tensors["w_kda_conv"][:, 3] = 0.5
     gate_rows = torch.arange(projection, device=device)
     tensors["w_kda_fb"][gate_rows, gate_rows.remainder(config.v_dim)] = 0.03125
     output_rows = torch.arange(hidden, device=device)
-    tensors["w_kda_o"][output_rows, output_rows.remainder(projection)] = 0.0625
+    rank_scale = (rank + 1) / 1024
+    tensors["w_kda_o"][
+        output_rows, output_rows.remainder(projection)
+    ] = rank_scale
     tensors["w_r"][0, :16] = torch.linspace(
         -0.125, 0.125, 16, dtype=torch.bfloat16, device=device
     )
@@ -90,7 +96,11 @@ def _deterministic_weights(device, rank):
     tensors["w_shared_ug"][shared_rows, shared_rows.remainder(16)] = 0.03125
     tensors["w_shared_dn"][
         output_rows, output_rows.remainder(shared)
-    ] = 0.03125
+    ] = rank_scale
+    shard_rows = torch.arange(shard, device=device)
+    tensors["w_latent_up"][
+        shard_rows, shard_rows.remainder(routed)
+    ] = rank_scale
 
     experts = config.n_experts
     ug_rows = experts * 2 * config.inter
@@ -240,7 +250,7 @@ def _apply_reference(
         num_accepted_tokens=accepted,
         use_qk_l2norm_in_kernel=True,
         is_kda=True,
-        lower_bound=-2.5,
+        lower_bound=-5.0,
     )
     final_fp32 = next_recurrent[snapshots[:, -1].to(torch.int64)].clone()
     pairwise_final = torch.empty_like(final_fp32)
@@ -262,7 +272,7 @@ def _apply_reference(
                 inplace_final_state=False,
                 use_qk_l2norm_in_kernel=True,
                 is_kda=True,
-                lower_bound=-2.5,
+                lower_bound=-5.0,
             )
             state = pair_states[-1:].to(torch.float16).float()
         pairwise_final[request] = pair_states[-1]
@@ -329,6 +339,41 @@ def _check_fp32_handoff(op, batch, expected, pairwise):
     torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-3)
 
 
+def _check_moe_and_tp_output(op, rows, output):
+    import torch
+    import torch.distributed as dist
+
+    from atom.model_ops.monokernel.k3.kernel import monokernel_layout
+
+    layout = monokernel_layout(
+        rows,
+        fuse_attn_res=True,
+        fuse_moe=True,
+        mtp=True,
+    )
+    scratch = op.attention.monokernel_scratch
+    regions = (
+        ("router", rows * 896 * 4),
+        ("shared_mid", rows * 768 * 4),
+        ("routed", rows * 3584 * 2),
+    )
+    for name, size in regions:
+        region = scratch[layout[name] : layout[name] + size]
+        assert torch.count_nonzero(region) > 0, f"{name} path was not observable"
+
+    checksum = torch.stack(
+        (
+            output.float().sum(),
+            output.float().square().sum(),
+            output.float().abs().sum(),
+        )
+    )
+    gathered = [torch.empty_like(checksum) for _ in range(8)]
+    dist.all_gather(gathered, checksum)
+    for peer in gathered[1:]:
+        torch.testing.assert_close(peer, gathered[0], atol=1e-2, rtol=1e-5)
+
+
 def _slot_table(batch, slots, shift, device):
     import torch
 
@@ -344,7 +389,7 @@ def _exercise_batch(op, batch, device, weights):
     from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
 
     rows = batch * 8
-    slots = 13 if batch == 1 else 37
+    slots = {1: 13, 4: 37, 8: 67}[batch]
     snapshots = _slot_table(batch, slots, 1, device)
     conv_initial = torch.linspace(
         -0.125,
@@ -408,8 +453,20 @@ def _exercise_batch(op, batch, device, weights):
     )
 
     eager_counts = (
-        (4,) if batch == 1 else (1, 3, 6, 8),
-        (7,) if batch == 1 else (8, 2, 5, 1),
+        (4,)
+        if batch == 1
+        else (
+            (1, 3, 6, 8)
+            if batch == 4
+            else (1, 3, 6, 8, 2, 7, 4, 5)
+        ),
+        (7,)
+        if batch == 1
+        else (
+            (8, 2, 5, 1)
+            if batch == 4
+            else (8, 2, 5, 1, 7, 4, 6, 3)
+        ),
     )
     expected_conv = conv_initial.clone()
     expected_recurrent = recurrent_initial.clone()
@@ -445,15 +502,34 @@ def _exercise_batch(op, batch, device, weights):
         assert torch.isfinite(output).all()
         assert output.abs().max() > 0
         assert not torch.equal(output, prefix)
+        _check_moe_and_tp_output(op, rows, output)
 
     conv.copy_(conv_initial)
     recurrent.copy_(recurrent_initial)
     expected_conv.copy_(conv_initial)
     expected_recurrent.copy_(recurrent_initial)
     graph_counts = (
-        (2,) if batch == 1 else (2, 7, 1, 5),
-        (8,) if batch == 1 else (8, 1, 4, 6),
-        (3,) if batch == 1 else (3, 3, 8, 2),
+        (2,)
+        if batch == 1
+        else (
+            (2, 7, 1, 5)
+            if batch == 4
+            else (2, 7, 1, 5, 8, 3, 6, 4)
+        ),
+        (8,)
+        if batch == 1
+        else (
+            (8, 1, 4, 6)
+            if batch == 4
+            else (8, 1, 4, 6, 3, 5, 2, 7)
+        ),
+        (3,)
+        if batch == 1
+        else (
+            (3, 3, 8, 2)
+            if batch == 4
+            else (3, 3, 8, 2, 6, 1, 7, 5)
+        ),
     )
     accepted.copy_(torch.tensor(graph_counts[0], dtype=torch.int32, device=device))
     op.forward(
@@ -518,6 +594,7 @@ def _exercise_batch(op, batch, device, weights):
         _check_fp32_handoff(op, batch, expected_fp32, pairwise_fp32)
         torch.testing.assert_close(output, eager_output, atol=2e-2, rtol=2e-2)
         assert torch.isfinite(output).all() and output.abs().max() > 0
+        _check_moe_and_tp_output(op, rows, output)
         assert pointers == (
             conv.data_ptr(),
             recurrent.data_ptr(),
@@ -544,7 +621,7 @@ def _tp8_worker(rank: int, port: int) -> None:
     try:
         weights = _deterministic_weights(device, rank)
         packed = None
-        for batch in (1, 4):
+        for batch in (1, 4, 8):
             op = KimiK3MonoKernel(
                 weights,
                 batch * 8,

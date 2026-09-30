@@ -422,6 +422,8 @@ def test_kimi_agentic_pair_schedule_uses_fp32_state_handoff():
     assert 'offsets["mtp_state_handoff"]' in source
     assert "mtp_state_handoff_rsrc" in source
     assert "token_base == 0" in source
+    assert "resident_producer_task" in source
+    assert "sample * _HEADS + head == resident_producer_task" in source
 
 
 def test_kimi_full_monokernel_accepts_fp16_agentic_construction(monkeypatch):
