@@ -62,10 +62,11 @@ class RouterWeightLayout(str, Enum):
 
 
 class KvCacheLayout(str, Enum):
-    """Physical layout of the BF16 MLA KV cache."""
+    """Physical layout of the MLA KV cache."""
 
     SPLIT = "split"
     ATOM = "atom"
+    ATOM_FP8 = "atom_fp8"
 
 
 class ConvStateLayout(str, Enum):

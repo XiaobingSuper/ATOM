@@ -107,6 +107,223 @@ def test_active_new_request_can_write_cache_with_zero_prior_context():
     assert not row.local_sparse_active
 
 
+def test_glm_fp8_cache_flattens_block16_page1_slots():
+    import torch
+
+    from atom.model_ops.monokernel.glm.cache import (
+        logical_to_physical_slot,
+        physical_cache_slot,
+    )
+
+    assert physical_cache_slot(0, 0) == 0
+    assert physical_cache_slot(0, 15) == 15
+    assert physical_cache_slot(1, 0) == 16
+    assert physical_cache_slot(7, 15) == 127
+    block_tables = torch.tensor([[7, 2], [5, 9]], dtype=torch.int32)
+    assert logical_to_physical_slot(block_tables, batch_id=0, position=0) == 112
+    assert logical_to_physical_slot(block_tables, batch_id=0, position=15) == 127
+    assert logical_to_physical_slot(block_tables, batch_id=0, position=16) == 32
+    assert logical_to_physical_slot(block_tables, batch_id=1, position=17) == 145
+    with pytest.raises(ValueError, match="offset"):
+        physical_cache_slot(1, 16)
+
+
+def test_glm_mtp_visible_context_excludes_future_physical_slots():
+    import torch
+
+    from atom.model_ops.monokernel.glm.cache import (
+        visible_context_length,
+        visible_physical_slots,
+    )
+
+    block_tables = torch.tensor([[7, 2], [5, 9]], dtype=torch.int32)
+    rows = (
+        (0, 7, 10, 8, 119),
+        (0, 8, 10, 9, 120),
+        (0, 9, 10, 10, 121),
+        (1, 16, 19, 17, 144),
+        (1, 17, 19, 18, 145),
+        (1, 18, 19, 19, 146),
+    )
+
+    for batch_id, position, request_context, expected, last_slot in rows:
+        assert visible_context_length(position, request_context) == expected
+        slots = visible_physical_slots(
+            block_tables,
+            batch_id=batch_id,
+            position=position,
+            request_context=request_context,
+        )
+        assert len(slots) == expected
+        assert slots[-1] == last_slot
+        future = visible_physical_slots(
+            block_tables,
+            batch_id=batch_id,
+            position=request_context - 1,
+            request_context=request_context,
+        )[expected:]
+        assert not set(slots).intersection(future)
+
+
+def test_glm_fp8_cache_publishes_exact_main_and_index_bytes():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.config import FP8_MAX
+    from atom.model_ops.monokernel.glm.cache import (
+        INDEX_CACHE_ROW_BYTES,
+        INDEX_KEY_BYTES,
+        MAIN_CACHE_ROW_BYTES,
+        publish_fp8_cache_rows,
+    )
+
+    main = torch.zeros(
+        (2, 16, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn
+    )
+    main_scale = torch.tensor([0.125], dtype=torch.float32)
+    scale_before = main_scale.clone()
+    index = torch.full((2, 16, INDEX_CACHE_ROW_BYTES), 0x5A, dtype=torch.uint8)
+    main_row = torch.linspace(-8.0, 8.0, MAIN_CACHE_ROW_BYTES)
+    index_row = torch.linspace(-2.0, 3.0, INDEX_KEY_BYTES)
+
+    assert publish_fp8_cache_rows(
+        main,
+        main_scale,
+        index,
+        slot=16,
+        batch_id=3,
+        main_bf16=main_row.to(torch.bfloat16),
+        index_bf16=index_row.to(torch.bfloat16),
+    )
+
+    main_values = main_row.to(torch.bfloat16).float()
+    expected_main = (
+        (main_values / main_scale)
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    index_values = index_row.to(torch.bfloat16).float()
+    expected_index_scale = index_values.abs().max() / FP8_MAX
+    expected_index = (
+        (index_values / expected_index_scale)
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+
+    assert torch.equal(
+        main.view(torch.uint8).view(-1, MAIN_CACHE_ROW_BYTES)[16],
+        expected_main,
+    )
+    assert torch.equal(main_scale, scale_before)
+    index_flat = index.view(-1, INDEX_CACHE_ROW_BYTES)[16]
+    assert torch.equal(index_flat[:INDEX_KEY_BYTES], expected_index)
+    assert (
+        index_flat[INDEX_KEY_BYTES : INDEX_KEY_BYTES + 4]
+        .clone()
+        .view(torch.float32)
+        .item()
+        == pytest.approx(expected_index_scale.item())
+    )
+    assert torch.all(index_flat[INDEX_KEY_BYTES + 4 :] == 0x5A)
+    assert torch.all(main.view(torch.uint8)[0] == 0)
+
+
+@pytest.mark.parametrize(
+    ("batch_id", "slot", "query_active", "writes"),
+    ((2, -1, True, False), (-1, 17, False, False), (0, 17, True, True)),
+)
+def test_glm_fp8_cache_query_and_publication_ownership(
+    batch_id,
+    slot,
+    query_active,
+    writes,
+):
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.cache import (
+        INDEX_CACHE_ROW_BYTES,
+        MAIN_CACHE_ROW_BYTES,
+        fp8_cache_row_policy,
+        publish_fp8_cache_rows,
+    )
+
+    main = torch.zeros(
+        (32, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn
+    )
+    scale = torch.tensor([0.25], dtype=torch.float32)
+    index = torch.full((32, INDEX_CACHE_ROW_BYTES), 9, dtype=torch.uint8)
+    before = (main.clone(), scale.clone(), index.clone())
+    policy = fp8_cache_row_policy(batch_id=batch_id, slot=slot)
+    published = publish_fp8_cache_rows(
+        main,
+        scale,
+        index,
+        slot=slot,
+        batch_id=batch_id,
+        main_bf16=torch.ones(MAIN_CACHE_ROW_BYTES, dtype=torch.bfloat16),
+        index_bf16=torch.ones(128, dtype=torch.bfloat16),
+    )
+
+    assert policy.query_active is query_active
+    assert policy.cache_writer is writes
+    assert published is writes
+    if not writes:
+        assert torch.equal(main, before[0])
+        assert torch.equal(scale, before[1])
+        assert torch.equal(index, before[2])
+
+
+def test_glm_fp8_cache_validates_physical_storage():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
+
+    main = torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, dtype=torch.float32)
+    index = torch.empty(2, 16, 144, dtype=torch.uint8)
+
+    assert validate_fp8_paged_cache(main, scale, index, with_indexer=True) == 32
+    with pytest.raises(ValueError, match="576"):
+        validate_fp8_paged_cache(main[..., :-1], scale, index, with_indexer=True)
+    with pytest.raises(ValueError, match="FP32"):
+        validate_fp8_paged_cache(main, scale.half(), index, with_indexer=True)
+    with pytest.raises(ValueError, match="144"):
+        validate_fp8_paged_cache(main, scale, index[..., :-1], with_indexer=True)
+    with pytest.raises(ValueError, match="E4M3FN"):
+        validate_fp8_paged_cache(
+            main.view(torch.uint8), scale, index, with_indexer=True
+        )
+    if hasattr(torch, "float8_e4m3fnuz"):
+        with pytest.raises(ValueError, match="FNUZ"):
+            validate_fp8_paged_cache(
+                main.view(torch.float8_e4m3fnuz),
+                scale,
+                index,
+                with_indexer=True,
+            )
+
+
+@pytest.mark.parametrize(
+    ("batch_id", "owned_count", "index_work", "split_work"),
+    ((-1, 8, False, False), (0, 0, False, False), (2, 7, True, True)),
+)
+def test_glm_fp8_cache_work_policy_gates_padding_and_zero_owned(
+    batch_id,
+    owned_count,
+    index_work,
+    split_work,
+):
+    from atom.model_ops.monokernel.glm.cache import fp8_cache_work_policy
+
+    policy = fp8_cache_work_policy(
+        batch_id=batch_id,
+        owned_count=owned_count,
+    )
+
+    assert policy.index_score is index_work
+    assert policy.sparse_split is split_work
+    if not split_work:
+        assert policy.empty_output == (0.0, float("-inf"))
+
+
 @pytest.mark.parametrize(
     "kwargs",
     (
@@ -139,20 +356,32 @@ def test_glm_uv_scale_offsets_support_64_and_128_row_layouts():
     assert fp8_scale_offset(8, 0, k_size=512, block_m=128) == 4
 
 
-def test_glm_agentic_tp4_dcp4_qrep_geometry():
+def test_glm_agentic_tp4_small_concurrency_geometry():
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
 
     shape = GlmAgenticShape.for_graph(
-        batch_capacity=80,
+        batch_capacity=20,
         query_len=5,
-        dcp_size=4,
-        query_replication=True,
+        dcp_size=1,
+        query_replication=False,
     )
 
-    assert shape.common.row_capacity == 400
+    assert shape.common.row_capacity == 100
     assert shape.local_heads == 16
-    assert shape.query_heads == 64
+    assert shape.query_heads == 16
     assert shape.expert_intermediate == 512
+
+
+def test_glm_full_monokernel_rejects_dcp():
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+
+    with pytest.raises(ValueError, match="DCP1"):
+        GlmAgenticShape.for_graph(
+            batch_capacity=32,
+            query_len=5,
+            dcp_size=4,
+            query_replication=True,
+        )
 
 
 @pytest.mark.parametrize(
@@ -162,11 +391,6 @@ def test_glm_agentic_tp4_dcp4_qrep_geometry():
         (4, 6, 48, 6, 8),
         (8, 6, 96, 12, 8),
         (10, 5, 100, 13, 4),
-        (16, 5, 160, 20, 8),
-        (24, 5, 240, 30, 8),
-        (32, 5, 320, 40, 8),
-        (40, 5, 400, 50, 8),
-        (48, 4, 384, 48, 8),
     ),
 )
 def test_glm_agentic_recipe_capacities_are_row_tiled(
@@ -181,8 +405,8 @@ def test_glm_agentic_recipe_capacities_are_row_tiled(
     shape = GlmAgenticShape.for_graph(
         batch_capacity=concurrency * 2,
         query_len=query_len,
-        dcp_size=4 if concurrency >= 16 else 1,
-        query_replication=concurrency >= 16,
+        dcp_size=1,
+        query_replication=False,
     )
 
     assert shape.common.row_capacity == rows
@@ -216,16 +440,16 @@ def test_glm_agentic_workspace_layout_reuses_one_tile_across_layer_rows():
     from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
 
     shape = GlmAgenticShape.for_graph(
-        batch_capacity=80,
+        batch_capacity=20,
         query_len=5,
-        dcp_size=4,
-        query_replication=True,
+        dcp_size=1,
+        query_replication=False,
     )
     workspace = agentic_workspace_layout(shape, npes=4, sparse_attention_topk=2048)
 
-    assert workspace.row_capacity == 400
+    assert workspace.row_capacity == 100
     assert workspace.tile_rows == 8
-    assert workspace.tile_count == 50
+    assert workspace.tile_count == 13
     assert workspace.physical_experts == 257
     assert workspace.config.local_heads == 16
     assert workspace.config.inter == 512
@@ -373,17 +597,24 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
                     advance,
                     kwargs["batch_ids"].clone(),
                     kwargs["owned_counts"].clone(),
+                    kwargs["kv_cache_scale"],
+                    kwargs["block_tables"],
+                    kwargs["context_lens"],
+                    kwargs["positions"].clone(),
+                    kwargs["slot_mapping"].clone(),
                 )
             )
             x_out.copy_(h + 1)
             return x_out
 
+    cache_scale = torch.empty(1, dtype=torch.float32)
     inputs = GlmAgenticLayerInputs(
         kv_cache=torch.empty(1),
         pe_cache=torch.empty(1),
         indices=torch.empty(1, dtype=torch.int32),
         cos=torch.empty(1),
         sin=torch.empty(1),
+        kv_cache_scale=cache_scale,
     )
     layers = []
     for slot in (3, 9):
@@ -402,13 +633,16 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
     layers = tuple(layers)
     bucket = GlmAgenticGraphBucket(workspace, layers)
     hidden = torch.zeros(100, shape.config.hidden, dtype=torch.bfloat16)
-    positions = torch.arange(100, dtype=torch.int64)
-    slot_mapping = positions.clone()
+    row_ids = torch.arange(100, dtype=torch.int64)
+    positions = row_ids % 5 + (row_ids // 5) * 17
+    slot_mapping = (row_ids * 37) % 320
     sparse_indptr = torch.arange(101, dtype=torch.int32)
-    batch_ids = torch.arange(100, dtype=torch.int32)
+    batch_ids = torch.arange(100, dtype=torch.int32) // 5
     batch_ids[-2:] = -1
     owned_counts = torch.ones(100, dtype=torch.int32)
     owned_counts[-3:] = 0
+    block_tables = torch.arange(40, dtype=torch.int32).view(20, 2).flip(1)
+    context_lens = torch.arange(1, 21, dtype=torch.int32) * 17
 
     output = bucket(
         hidden,
@@ -417,6 +651,8 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
         sparse_kv_indptr=sparse_indptr,
         batch_ids=batch_ids,
         owned_counts=owned_counts,
+        block_tables=block_tables,
+        context_lens=context_lens,
     )
 
     assert output.data_ptr() == hidden_buffers[1].data_ptr()
@@ -427,14 +663,20 @@ def test_glm_graph_bucket_reuses_workspace_and_launches_s4_tail():
         for pair in ((3, size), (9, size))
     ]
     assert all(layer == slot and not advance for slot, _, layer, advance, *_ in calls)
-    assert calls[-1][-2].tolist() == [96, 97, -1, -1]
-    assert calls[-1][-1].tolist() == [1, 0, 0, 0]
+    assert calls[-1][-7].tolist() == [19, 19, -1, -1]
+    assert calls[-1][-6].tolist() == [1, 0, 0, 0]
+    assert all(call[-5] is cache_scale for call in calls)
+    assert all(call[-4] is block_tables for call in calls)
+    assert all(call[-3] is context_lens for call in calls)
+    assert calls[-1][-2].tolist() == positions[-4:].tolist()
+    assert calls[-1][-1].tolist() == slot_mapping[-4:].tolist()
     assert workspace.step.item() == 13
     assert all(layer.workspace is workspace for layer in layers)
 
 
 def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
     torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.config import KvCacheLayout
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
     from atom.model_ops.monokernel.glm.graph import (
         GlmAgenticGraphBucket,
@@ -490,8 +732,12 @@ def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
 
     args = GlmAgenticLayerInputs(*(torch.empty(1) for _ in range(5)))
     specs = (
-        GlmAgenticLayerSpec(object(), args),
-        GlmAgenticLayerSpec(object(), args),
+        GlmAgenticLayerSpec(
+            object(), args, kv_cache_layout=KvCacheLayout.ATOM
+        ),
+        GlmAgenticLayerSpec(
+            object(), args, kv_cache_layout=KvCacheLayout.ATOM
+        ),
     )
     bucket = GlmAgenticGraphBucket.build(
         workspace,
@@ -518,9 +764,51 @@ def test_glm_graph_bucket_builds_s8_and_s4_kernels_on_shared_storage():
     assert all(layer.workspace is workspace for layer in bucket.layers)
 
 
+def test_glm_graph_layer_spec_validates_fp8_physical_cache():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.config import KvCacheLayout
+    from atom.model_ops.monokernel.glm.graph import (
+        GlmAgenticLayerInputs,
+        GlmAgenticLayerSpec,
+    )
+
+    args = GlmAgenticLayerInputs(
+        kv_cache=torch.empty(1, 16, 576, dtype=torch.float8_e4m3fn),
+        pe_cache=None,
+        indices=torch.empty(1, dtype=torch.int32),
+        cos=torch.empty(1),
+        sin=torch.empty(1),
+        index_cache=torch.empty(1, 16, 144, dtype=torch.uint8),
+        kv_cache_scale=torch.empty(1, dtype=torch.float32),
+    )
+    spec = GlmAgenticLayerSpec(
+        object(),
+        args,
+        with_indexer=True,
+        kv_cache_layout=KvCacheLayout.ATOM_FP8,
+    )
+
+    assert spec.validate_cache_inputs() == 16
+    missing_scale = GlmAgenticLayerSpec(
+        object(),
+        GlmAgenticLayerInputs(
+            args.kv_cache,
+            None,
+            args.indices,
+            args.cos,
+            args.sin,
+            index_cache=args.index_cache,
+        ),
+        with_indexer=True,
+        kv_cache_layout=KvCacheLayout.ATOM_FP8,
+    )
+    with pytest.raises(ValueError, match="descale"):
+        missing_scale.validate_cache_inputs()
+
+
 @pytest.mark.parametrize(
     ("batch_capacity", "query_len", "dcp_size", "rows"),
-    ((32, 8, 1, 256), (32, 4, 8, 128), (160, 1, 8, 160)),
+    ((2, 8, 1, 16), (4, 8, 1, 32), (8, 8, 1, 64)),
 )
 def test_kimi_agentic_recipe_capacity_geometry(
     batch_capacity,
@@ -534,8 +822,20 @@ def test_kimi_agentic_recipe_capacity_geometry(
         batch_capacity=batch_capacity,
         query_len=query_len,
         dcp_size=dcp_size,
-        replay_ssm=query_len == 4,
+        replay_ssm=False,
     )
 
     assert shape.common.row_capacity == rows
     assert shape.local_heads == 12
+
+
+def test_kimi_full_monokernel_rejects_dcp_and_replayssm():
+    from atom.model_ops.monokernel.k3.abi import KimiAgenticShape
+
+    with pytest.raises(ValueError, match="DCP1"):
+        KimiAgenticShape.for_graph(
+            batch_capacity=32,
+            query_len=4,
+            dcp_size=8,
+            replay_ssm=True,
+        )

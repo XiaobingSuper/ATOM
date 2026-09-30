@@ -504,12 +504,13 @@ def test_model_specific_backend_selection():
     assert select_backend("glm52", "auto", **common) is None
     assert select_backend("glm52", "staged", **common) is None
     glm_bf16 = dict(samples=8, tp_size=8, kv_cache_dtype="bf16")
-    assert select_backend("glm52", "auto", **glm_bf16) == "mono"
+    assert select_backend("glm52", "auto", **glm_bf16) is None
     assert select_backend("glm52", "mono", **glm_bf16) == "mono"
     assert select_backend("glm52", "staged", **glm_bf16) is None
-    assert select_backend("kimi_k3", "auto", **common) == "staged"
+    assert select_backend("kimi_k3", "auto", **common) is None
+    assert select_backend("kimi_k3", "staged", **common) == "staged"
     assert select_backend("kimi_k3", "mono", **common) == "mono"
-    assert select_backend("kimi_k3", "auto", **common, dcp=True) == "staged"
+    assert select_backend("kimi_k3", "auto", **common, dcp=True) is None
     assert select_backend("kimi_k3", "auto", **common, is_kda=False) is None
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
 
@@ -688,6 +689,27 @@ def test_glm_kernel_builder_accepts_tp4_agentic_tile_geometry():
     assert callable(launch)
 
 
+def test_glm_kernel_builder_accepts_tp4_fp8_paged_index_cache():
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import KvCacheLayout, glm5_shard_config
+    from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
+
+    config = glm5_shard_config(4)
+    launch = build_glm5_monokernel(
+        4,
+        config.local_heads,
+        4,
+        topk=2048,
+        with_indexer=True,
+        index_max_seq=4096,
+        kv_cache_layout=KvCacheLayout.ATOM_FP8,
+        agentic_row_contract=True,
+        model_config=config,
+    )
+
+    assert callable(launch)
+
+
 def test_glm_host_geometry_accepts_tp4_and_physical_shared_expert():
     pytest.importorskip("flydsl")
     from atom.model_ops.monokernel.config import glm5_shard_config
@@ -853,6 +875,52 @@ def test_glm_op_binds_shared_workspace_without_owning_peer_buffer(monkeypatch):
     assert kernel.step is workspace.step
     kernel.close()
     assert peer.closes == 0
+
+
+def test_glm_host_validates_fp8_and_preserves_bf16_cache_abi():
+    import torch
+
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import KvCacheLayout, glm5_shard_config
+    from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
+
+    kernel = object.__new__(Glm5MonoKernel)
+    kernel.W = SimpleNamespace(config=glm5_shard_config(4))
+    kernel.with_indexer = True
+    kernel.kv_cache_layout = KvCacheLayout.ATOM_FP8
+    main = torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(1, dtype=torch.float32)
+    index = torch.empty(2, 16, 144, dtype=torch.uint8)
+
+    assert kernel._validate_cache_storage(main, None, index, scale) == 32
+    with pytest.raises(ValueError, match="descale"):
+        kernel._validate_cache_storage(main, None, index, None)
+
+    kernel.with_indexer = False
+    kernel.kv_cache_layout = KvCacheLayout.ATOM
+    legacy = torch.empty(32, 576, dtype=torch.bfloat16)
+    assert kernel._validate_cache_storage(legacy, legacy, None, None) == 32
+    with pytest.raises(ValueError, match="same fused tensor"):
+        kernel._validate_cache_storage(legacy, legacy.clone(), None, None)
+
+
+def test_glm_fp8_device_reloads_one_scalar_main_descale():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
+    gather = source[
+        source.index("        def gather_old_kv():") : source.index(
+            "        def patch_new_kv():"
+        )
+    ]
+
+    assert "descale = ld_f32(r_kv_scale, 0)" in gather
+    assert "ld_f32(r_kv_scale, row)" not in gather
 
 
 def test_glm_s4_s8_reuse_one_packed_artifact_owner(monkeypatch):
@@ -1135,35 +1203,28 @@ def test_glm_non_owner_row_attends_without_writing_cache():
 
 
 def test_glm_device_local_sparse_activity_requires_a_nonempty_row():
-    source = (
-        Path(__file__).parents[1]
-        / "atom"
-        / "model_ops"
-        / "monokernel"
-        / "glm"
-        / "kernel.py"
-    ).read_text()
-    predicate = source[
-        source.index("        def row_local_sparse_active(") : source.index(
-            "        def row_position("
-        )
-    ]
+    from atom.model_ops.monokernel.glm.cache import fp8_cache_work_policy
 
-    assert "return row_active(s) & (count > 0) & (end > begin)" in predicate
+    assert not fp8_cache_work_policy(
+        batch_id=-1,
+        owned_count=8,
+    ).sparse_split
+    assert not fp8_cache_work_policy(
+        batch_id=0,
+        owned_count=0,
+    ).sparse_split
+    assert fp8_cache_work_policy(
+        batch_id=0,
+        owned_count=1,
+    ).sparse_split
 
 
 def test_glm_empty_sparse_merge_avoids_divide_by_zero():
-    source = (
-        Path(__file__).parents[1]
-        / "atom"
-        / "model_ops"
-        / "monokernel"
-        / "glm"
-        / "kernel.py"
-    ).read_text()
+    from atom.model_ops.monokernel.glm.cache import fp8_cache_work_policy
 
-    assert "def row_writes_cache(s):" in source
-    assert "inv_den = (den > 0.0).select(_rcp(den), fx.Float32(0.0))" in source
+    policy = fp8_cache_work_policy(batch_id=0, owned_count=0)
+    assert policy.empty_output[0] == 0.0
+    assert policy.empty_output[1] == float("-inf")
 
 
 def test_glm_router_preserves_full_fp32_score_bits():
@@ -1302,7 +1363,7 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
     samples = 4
     runner = object.__new__(module.Glm52MonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "mono"
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=8,
         kv_cache_dtype="bf16",
@@ -1505,7 +1566,7 @@ def test_kimi_inputs_embeds_are_eligible(monkeypatch, samples):
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "staged"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
     monkeypatch.setattr(module, "get_forward_context", lambda: _kimi_decode_context(samples))
     input_ids = torch.arange(samples)
@@ -1526,7 +1587,7 @@ def test_kimi_supports_requires_contiguous_int32_decode_slots(monkeypatch):
     samples = 4
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "staged"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
     inputs = torch.zeros(samples, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16)
     positions = torch.arange(samples, dtype=torch.int64)
@@ -1554,7 +1615,7 @@ def test_kimi_supports_rejects_multi_token_decode(monkeypatch):
     samples = 4
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "staged"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
     context = _kimi_decode_context(samples)
     context.attn_metadata.kda_metadata.num_decodes = 1
@@ -1638,7 +1699,7 @@ def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
     samples = 4
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "staged"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
     layer = SimpleNamespace(
         layer_idx=1,
@@ -1677,7 +1738,7 @@ def test_kimi_graph_padding_dispatches(monkeypatch, samples, actual_tokens):
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._mode = "auto"
+    runner._mode = "staged"
     runner._atom_config = SimpleNamespace(tensor_parallel_size=8, kv_cache_dtype="bf16")
     state_indices = torch.cat(
         (

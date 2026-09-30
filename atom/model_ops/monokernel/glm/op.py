@@ -24,6 +24,7 @@ from atom.model_ops.monokernel.config import (
     validate_shard,
 )
 from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
+from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
 from atom.model_ops.monokernel.glm.layout import (
     INDEX_DIM,
     layout,
@@ -326,6 +327,40 @@ class Glm5MonoKernel:
 
         return self._packed_artifacts
 
+    def _validate_cache_storage(
+        self,
+        kv_cache: torch.Tensor,
+        pe_cache: torch.Tensor | None,
+        index_cache: torch.Tensor | None,
+        kv_cache_scale: torch.Tensor | None,
+    ) -> int:
+        cache_width = self.W.config.kv_lora + self.W.config.pe_dim
+        if self.kv_cache_layout is KvCacheLayout.ATOM_FP8:
+            if kv_cache_scale is None:
+                raise ValueError("ATOM FP8 KV cache requires a per-slot FP32 descale")
+            return validate_fp8_paged_cache(
+                kv_cache,
+                kv_cache_scale,
+                index_cache,
+                with_indexer=self.with_indexer,
+            )
+        if self.kv_cache_layout is not KvCacheLayout.ATOM:
+            return kv_cache.shape[0]
+        if (
+            kv_cache.dtype is not torch.bfloat16
+            or not kv_cache.is_contiguous()
+            or kv_cache.shape[-1] != cache_width
+        ):
+            raise ValueError(
+                f"ATOM KV cache must be contiguous BF16 with {cache_width} columns"
+            )
+        if pe_cache is None or kv_cache.data_ptr() != pe_cache.data_ptr():
+            raise ValueError(
+                "ATOM KV cache layout requires the same fused tensor for "
+                "kv_cache and pe_cache"
+            )
+        return kv_cache.numel() // cache_width
+
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
         ``bf2``: each pair's value word packs two bf16 elements)."""
@@ -359,6 +394,9 @@ class Glm5MonoKernel:
         sparse_kv_indptr=None,
         batch_ids=None,
         owned_counts=None,
+        kv_cache_scale=None,
+        block_tables=None,
+        context_lens=None,
     ):
         """One layer.  Mailbox epochs are ``step * 128 + layer + 1``: layers sharing
         this scratch within a decode step need distinct ``layer``; call
@@ -366,7 +404,10 @@ class Glm5MonoKernel:
         stream-ordered device ops, so the sequence can be captured in a HIP graph."""
         if not 0 <= layer < self.launches_per_step:
             raise ValueError(f"layer must be in [0, {self.launches_per_step}), got {layer}")
-        if self.with_indexer:
+        if (
+            self.with_indexer
+            and self.kv_cache_layout is not KvCacheLayout.ATOM_FP8
+        ):
             if index_cache is None:
                 raise ValueError("index_cache is required when with_indexer=True")
             if index_cache.shape != (self.index_max_seq, INDEX_DIM) or index_cache.dtype is not torch.bfloat16:
@@ -374,14 +415,32 @@ class Glm5MonoKernel:
                     f"index_cache must be bf16 [{self.index_max_seq}, {INDEX_DIM}], got "
                     f"{tuple(index_cache.shape)} {index_cache.dtype}"
                 )
-        if self.kv_cache_layout is KvCacheLayout.ATOM:
-            cache_width = self.W.config.kv_lora + self.W.config.pe_dim
-            if kv_cache.dtype is not torch.bfloat16 or not kv_cache.is_contiguous():
-                raise ValueError("ATOM KV cache must be contiguous BF16")
-            if kv_cache.shape[-1] != cache_width:
-                raise ValueError(f"ATOM KV cache last dimension must be {cache_width}, got {tuple(kv_cache.shape)}")
-            if kv_cache.data_ptr() != pe_cache.data_ptr():
-                raise ValueError("ATOM KV cache layout requires the same fused tensor for kv_cache and pe_cache")
+        if self.kv_cache_layout in (KvCacheLayout.ATOM, KvCacheLayout.ATOM_FP8):
+            self._validate_cache_storage(
+                kv_cache,
+                pe_cache,
+                index_cache,
+                kv_cache_scale,
+            )
+            if self.kv_cache_layout is KvCacheLayout.ATOM_FP8:
+                if (
+                    block_tables is None
+                    or block_tables.dtype is not torch.int32
+                    or block_tables.ndim != 2
+                    or not block_tables.is_contiguous()
+                ):
+                    raise ValueError(
+                        "block_tables must be contiguous int32 [batch, blocks]"
+                    )
+                if (
+                    context_lens is None
+                    or context_lens.dtype is not torch.int32
+                    or context_lens.ndim != 1
+                    or not context_lens.is_contiguous()
+                ):
+                    raise ValueError(
+                        "context_lens must be contiguous int32 [batch]"
+                    )
             for name, value, dtype, size in (
                 ("positions", positions, torch.int64, self.S),
                 ("slot_mapping", slot_mapping, torch.int64, self.S),
@@ -424,8 +483,12 @@ class Glm5MonoKernel:
             p(cur_pos if sparse_kv_indptr is None else sparse_kv_indptr),
             p(cur_pos if batch_ids is None else batch_ids),
             p(cur_pos if owned_counts is None else owned_counts),
+            p(cur_pos if block_tables is None else block_tables),
+            p(cur_pos if context_lens is None else context_lens),
+            0 if block_tables is None else block_tables.shape[1],
             p(kv_cache),
-            p(pe_cache),
+            p(kv_cache if pe_cache is None else pe_cache),
+            p(kv_cache if kv_cache_scale is None else kv_cache_scale),
             p(index_cache) if self.with_indexer else p(indices),
             p(cos),
             p(sin),

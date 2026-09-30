@@ -15,17 +15,19 @@ from atom.model_ops.monokernel.config import (
     AttentionWeight,
     KvCacheLayout,
 )
+from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
 from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
 
 
 @dataclass(frozen=True)
 class GlmAgenticLayerInputs:
     kv_cache: torch.Tensor
-    pe_cache: torch.Tensor
+    pe_cache: torch.Tensor | None
     indices: torch.Tensor
     cos: torch.Tensor
     sin: torch.Tensor
     index_cache: torch.Tensor | None = None
+    kv_cache_scale: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -35,8 +37,21 @@ class GlmAgenticLayerSpec:
     with_indexer: bool = False
     index_max_seq: int = 4096
     attention_weight: AttentionWeight = AttentionWeight.FP8_BLOCK128
-    kv_cache_layout: KvCacheLayout = KvCacheLayout.ATOM
+    kv_cache_layout: KvCacheLayout = KvCacheLayout.ATOM_FP8
     uv_scale_block_m: int = 128
+
+    def validate_cache_inputs(self) -> int | None:
+        if self.kv_cache_layout is not KvCacheLayout.ATOM_FP8:
+            return None
+        scale = self.inputs.kv_cache_scale
+        if scale is None:
+            raise ValueError("ATOM FP8 graph layer requires a per-slot FP32 descale")
+        return validate_fp8_paged_cache(
+            self.inputs.kv_cache,
+            scale,
+            self.inputs.index_cache,
+            with_indexer=self.with_indexer,
+        )
 
 
 @dataclass(frozen=True)
@@ -126,6 +141,7 @@ class GlmAgenticGraphBucket:
         layers = []
         try:
             for slot, spec in enumerate(specs):
+                spec.validate_cache_inputs()
                 artifacts = artifact_factory(
                     spec.weights,
                     npes=npes,
@@ -180,6 +196,8 @@ class GlmAgenticGraphBucket:
         sparse_kv_indptr: torch.Tensor,
         batch_ids: torch.Tensor,
         owned_counts: torch.Tensor,
+        block_tables: torch.Tensor,
+        context_lens: torch.Tensor,
     ) -> torch.Tensor:
         shape = self.workspace.shape
         rows = shape.common.row_capacity
@@ -205,6 +223,25 @@ class GlmAgenticGraphBucket:
                 raise ValueError(
                     f"{name} must be contiguous {dtype} with {size} values"
                 )
+        batch_capacity = shape.common.batch_capacity
+        if (
+            block_tables.ndim != 2
+            or block_tables.dtype is not torch.int32
+            or not block_tables.is_contiguous()
+            or block_tables.shape[0] < batch_capacity
+        ):
+            raise ValueError(
+                "block_tables must be contiguous int32 [batch_capacity, blocks]"
+            )
+        if (
+            context_lens.dtype is not torch.int32
+            or context_lens.ndim != 1
+            or context_lens.numel() < batch_capacity
+            or not context_lens.is_contiguous()
+        ):
+            raise ValueError(
+                "context_lens must be contiguous int32 [batch_capacity]"
+            )
         runtime = self.workspace.bind_runtime(batch_ids, owned_counts)
         buffers = self.workspace.hidden_buffers
         assert buffers is not None
@@ -232,6 +269,9 @@ class GlmAgenticGraphBucket:
                     sparse_kv_indptr=sparse_kv_indptr[start : stop + 1],
                     batch_ids=ownership.batch_ids,
                     owned_counts=ownership.owned_counts,
+                    kv_cache_scale=args.kv_cache_scale,
+                    block_tables=block_tables,
+                    context_lens=context_lens,
                 )
             self.workspace.advance_step()
         return buffers[(len(self.layers) - 1) % 2]

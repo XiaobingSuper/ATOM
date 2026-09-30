@@ -21,16 +21,16 @@ class KimiAgenticShape:
     local_heads: int = 12
 
     def __post_init__(self) -> None:
-        if self.dcp_size not in (1, 8):
-            raise ValueError(f"Kimi Agentic DCP must be 1 or 8, got {self.dcp_size}")
-        if self.common.query_len not in (1, 4, 8):
+        if self.dcp_size != 1:
+            raise ValueError("Kimi full MonoKernel supports TP-only DCP1")
+        if self.common.query_len not in (1, 8):
             raise ValueError(
-                f"Kimi Agentic query length must be 1, 4, or 8, got {self.common.query_len}"
+                f"Kimi TP-only query length must be 1 or 8, got {self.common.query_len}"
             )
         if self.state_dtype not in (torch.float16, torch.float32):
             raise ValueError("Kimi recurrent state must use FP16 or FP32")
-        if self.replay_ssm and self.common.query_len != 4:
-            raise ValueError("the published Kimi ReplaySSM band uses query length 4")
+        if self.replay_ssm:
+            raise ValueError("ReplaySSM is used only by unsupported DCP bands")
 
     @classmethod
     def for_graph(

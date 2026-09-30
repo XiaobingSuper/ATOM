@@ -12,7 +12,7 @@ import torch
 from atom.model_ops.monokernel.abi import AgenticDecodeShape
 from atom.model_ops.monokernel.config import LayerConfig, glm5_shard_config
 
-GLM_AGENTIC_MAX_ROWS = 400
+GLM_AGENTIC_MAX_ROWS = 100
 GLM_AGENTIC_TILE_ROWS = 8
 
 
@@ -90,10 +90,10 @@ class GlmAgenticShape:
     tp_size: int = 4
 
     def __post_init__(self) -> None:
-        if self.dcp_size not in (1, 4):
-            raise ValueError(f"GLM Agentic DCP must be 1 or 4, got {self.dcp_size}")
-        if self.query_replication and self.dcp_size == 1:
-            raise ValueError("query replication requires DCP")
+        if self.dcp_size != 1:
+            raise ValueError("GLM full MonoKernel supports TP-only DCP1")
+        if self.query_replication:
+            raise ValueError("GLM full MonoKernel does not use query replication")
         glm5_shard_config(self.tp_size)
         if self.common.row_capacity > GLM_AGENTIC_MAX_ROWS:
             raise ValueError(
@@ -123,7 +123,7 @@ class GlmAgenticShape:
 
     @property
     def query_heads(self) -> int:
-        return 64 if self.query_replication else self.local_heads
+        return self.local_heads
 
     @property
     def row_tiles(self) -> tuple[GlmRowTile, ...]:

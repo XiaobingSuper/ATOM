@@ -106,10 +106,13 @@ def select_backend(
             and has_moe
             and external_indexer
             and cache_layout == "atom"
-            and mode in ("auto", "mono")
+            and mode == "mono"
         ):
             return "mono"
         return None
     if model == "kimi_k3" and is_kda and has_moe:
-        return "staged" if mode in ("auto", "staged") else "mono"
+        if mode == "staged":
+            return "staged"
+        if mode == "mono":
+            return "mono"
     return None
