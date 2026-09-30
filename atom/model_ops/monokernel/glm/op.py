@@ -5,28 +5,22 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
+from types import MappingProxyType
+from typing import Mapping
 
 import torch
 
 from atom.model_ops.monokernel.config import (
     AttentionWeight,
     GLM5_CONFIG,
-    HIDDEN,
-    INTER,
-    KV_LORA,
-    MOE_SLOTS,
-    N_EXPERTS,
-    NOPE_DIM,
-    PE_DIM,
-    Q_LORA,
-    V_DIM,
     KvCacheLayout,
     MoeMode,
     Mxfp4ScaleLayout,
     Mxfp4WeightLayout,
     RouterWeightLayout,
     as_kv_cache_layout,
+    glm5_shard_config,
     validate_shard,
 )
 from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
@@ -35,12 +29,137 @@ from atom.model_ops.monokernel.glm.layout import (
     layout,
     stage_tasks,
 )
+from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
 from atom.model_ops.monokernel.layout import TL_COLS
 from atom.model_ops.monokernel.packing import pack_bf16, pack_fp8, pack_layer_weights
 from atom.model_ops.monokernel.runtime import SymmetricPeerBuffer
 from atom.model_ops.monokernel.weights import LayerWeights, prepare_mxfp4_expert_storage
 
-__all__ = ["Glm5MonoKernel"]
+__all__ = ["Glm5MonoKernel", "Glm5PackedArtifacts"]
+
+
+def _glm_kernel_config(weights: LayerWeights, npes: int):
+    config = weights.config
+    expected = glm5_shard_config(npes) if npes in (4, 8) else GLM5_CONFIG
+    if config != expected:
+        raise ValueError(
+            f"Glm5MonoKernel TP{npes} requires {expected.local_heads} local "
+            f"heads and expert width {expected.inter}, got "
+            f"{config.local_heads} heads and width {config.inter}"
+        )
+    if weights.heads != config.local_heads:
+        raise ValueError(
+            f"{config.name} requires {config.local_heads} local heads, "
+            f"got {weights.heads}"
+        )
+    physical = config.n_experts + config.num_shared_experts
+    if weights.physical_experts != physical:
+        raise ValueError(
+            f"GLM-5.2 requires {physical} physical experts, "
+            f"got {weights.physical_experts}"
+        )
+    return config
+
+
+@dataclass(frozen=True)
+class Glm5PackedArtifacts:
+    """Layer-owned immutable packed weights shared by all row-tile kernels."""
+
+    weights: LayerWeights
+    tensors: Mapping[str, torch.Tensor]
+    npes: int
+    attention_weight: AttentionWeight
+    with_indexer: bool
+    expert_mxfp4: bool
+
+    @classmethod
+    def pack(
+        cls,
+        weights: LayerWeights,
+        *,
+        npes: int,
+        attention_weight: AttentionWeight | str,
+        with_indexer: bool,
+    ) -> "Glm5PackedArtifacts":
+        config = _glm_kernel_config(weights, npes)
+        attention_weight = AttentionWeight(attention_weight)
+        t = weights.t
+        expert_mxfp4 = t["w_ug"].dtype is torch.uint8
+        moe_mode = MoeMode.A16W4 if expert_mxfp4 else MoeMode.W8A8
+        profile = replace(config, attention_weight=attention_weight)
+        atom_experts = (
+            expert_mxfp4
+            and weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+            and weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+        )
+        if (
+            weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
+            or weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
+        ) and not atom_experts:
+            raise ValueError("ATOM expert storage requires MXFP4 values and scales together")
+        if atom_experts:
+            packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
+            packed["w_r"] = pack_bf16(t["w_r"])
+            packed.update(
+                dict(
+                    zip(
+                        ("w_ug", "s_ug", "w_dn", "s_dn"),
+                        prepare_mxfp4_expert_storage(weights),
+                    )
+                )
+            )
+        else:
+            packed = pack_layer_weights(
+                t,
+                moe_mode,
+                profile,
+                mxfp4_weight_layout=Mxfp4WeightLayout.NATIVE,
+                mxfp4_scale_layout=Mxfp4ScaleLayout.NATIVE,
+                router_weight_layout=RouterWeightLayout.NATIVE,
+            )
+        if with_indexer:
+            required = (
+                "w_index_k",
+                "s_index_k",
+                "w_index_w",
+                "w_index_q",
+                "s_index_q",
+                "g_index_k",
+                "b_index_k",
+            )
+            missing = [name for name in required if name not in t]
+            if missing:
+                raise ValueError(
+                    f"with_indexer=True requires weights: {', '.join(missing)}"
+                )
+            packed["w_index_k"] = pack_fp8(t["w_index_k"])
+            packed["w_index_q"] = pack_fp8(t["w_index_q"])
+            packed["w_index_w"] = pack_bf16(t["w_index_w"])
+        return cls(
+            weights=weights,
+            tensors=MappingProxyType(packed),
+            npes=npes,
+            attention_weight=attention_weight,
+            with_indexer=with_indexer,
+            expert_mxfp4=expert_mxfp4,
+        )
+
+    def validate(
+        self,
+        weights: LayerWeights,
+        *,
+        npes: int,
+        attention_weight: AttentionWeight,
+        with_indexer: bool,
+    ) -> None:
+        if self.weights is not weights:
+            raise ValueError("packed artifacts belong to a different GLM layer")
+        if (
+            self.npes != npes
+            or self.attention_weight is not attention_weight
+            or self.with_indexer != with_indexer
+        ):
+            raise ValueError("packed artifacts do not match the GLM kernel profile")
 
 
 class Glm5MonoKernel:
@@ -72,10 +191,11 @@ class Glm5MonoKernel:
         uv_scale_block_m: int = 128,
         agentic_row_contract: bool = False,
         timeline=False,
+        workspace: GlmAgenticWorkspace | None = None,
+        packed_artifacts: Glm5PackedArtifacts | None = None,
     ):
-        if W.config != GLM5_CONFIG:
-            raise ValueError(f"Glm5MonoKernel requires GLM-5 weights, got {W.config.name!r}")
-        validate_shard(samples, W.heads, rank, npes, topk, GLM5_CONFIG)
+        config = _glm_kernel_config(W, npes)
+        validate_shard(samples, W.heads, rank, npes, topk, config)
         if not 1 <= launches_per_step <= 128:
             raise ValueError(f"launches_per_step must be in [1, 128], got {launches_per_step}")
         self.W, self.S, self.rank, self.npes, self.topk = W, samples, rank, npes, topk
@@ -85,51 +205,53 @@ class Glm5MonoKernel:
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
         self.agentic_row_contract = agentic_row_contract
+        self.workspace = workspace
+        if workspace is not None:
+            if not agentic_row_contract:
+                raise ValueError("shared Agentic workspace requires row ownership")
+            if workspace.shape.config != config:
+                raise ValueError("shared workspace geometry does not match weights")
+            if samples not in {tile.capacity for tile in workspace.shape.row_tiles}:
+                raise ValueError(f"row tile size {samples} is outside the graph bucket")
+            if timeline:
+                raise ValueError("shared Agentic workspace does not support per-op timelines")
         t = W.t
-        self.expert_mxfp4 = t["w_ug"].dtype is torch.uint8
-        moe_mode = MoeMode.A16W4 if self.expert_mxfp4 else MoeMode.W8A8
-        profile = replace(GLM5_CONFIG, attention_weight=self.attention_weight)
-        atom_experts = (
-            self.expert_mxfp4
-            and W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
-            and W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
-        )
-        if (
-            W.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
-            or W.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
-        ) and not atom_experts:
-            raise ValueError("ATOM expert storage requires MXFP4 values and scales together")
-        if atom_experts:
-            self.packed = pack_layer_weights(t, moe_mode, profile, attention_only=True)
-            self.packed["w_r"] = pack_bf16(t["w_r"])
-            self.packed.update(
-                dict(
-                    zip(
-                        ("w_ug", "s_ug", "w_dn", "s_dn"),
-                        prepare_mxfp4_expert_storage(W),
-                    )
-                )
+        if packed_artifacts is None:
+            packed_artifacts = Glm5PackedArtifacts.pack(
+                W,
+                npes=npes,
+                attention_weight=self.attention_weight,
+                with_indexer=with_indexer,
             )
         else:
-            self.packed = pack_layer_weights(
-                t,
-                moe_mode,
-                profile,
-                mxfp4_weight_layout=Mxfp4WeightLayout.NATIVE,
-                mxfp4_scale_layout=Mxfp4ScaleLayout.NATIVE,
-                router_weight_layout=RouterWeightLayout.NATIVE,
+            packed_artifacts.validate(
+                W,
+                npes=npes,
+                attention_weight=self.attention_weight,
+                with_indexer=with_indexer,
             )
-        if with_indexer:
-            required = ("w_index_k", "s_index_k", "w_index_w", "w_index_q", "s_index_q", "g_index_k", "b_index_k")
-            missing = [name for name in required if name not in t]
-            if missing:
-                raise ValueError(f"with_indexer=True requires weights: {', '.join(missing)}")
-            self.packed["w_index_k"] = pack_fp8(t["w_index_k"])
-            self.packed["w_index_q"] = pack_fp8(t["w_index_q"])
-            self.packed["w_index_w"] = pack_bf16(t["w_index_w"])
-        self.scr_layout, self.sym_layout = layout(samples, W.heads, npes, topk, with_indexer, index_max_seq)
+        self._packed_artifacts = packed_artifacts
+        self.packed = packed_artifacts.tensors
+        self.expert_mxfp4 = packed_artifacts.expert_mxfp4
+        self.scr_layout, self.sym_layout = layout(
+            samples,
+            W.heads,
+            npes,
+            topk,
+            with_indexer,
+            index_max_seq,
+            config,
+        )
         dev = torch.device("cuda", torch.cuda.current_device())
-        self.stages = stage_tasks(samples, W.heads, topk, with_indexer, index_max_seq, self.expert_mxfp4)
+        self.stages = stage_tasks(
+            samples,
+            W.heads,
+            topk,
+            with_indexer,
+            index_max_seq,
+            self.expert_mxfp4,
+            config,
+        )
         n_tasks = sum(n for _, n in self.stages)
         self.timeline = torch.zeros(n_tasks, TL_COLS, dtype=torch.int64, device=dev) if timeline else None
         if with_indexer:
@@ -153,8 +275,31 @@ class Glm5MonoKernel:
             )
         else:
             self.index_params = None
-        self.scratch = torch.zeros(self.scr_layout["_bytes"], dtype=torch.uint8, device=dev)
-        self.peer_buffer = SymmetricPeerBuffer(self.sym_layout["_bytes"], rank=rank, npes=npes, group=group)
+        if workspace is None:
+            self.scratch = torch.zeros(
+                self.scr_layout["_bytes"],
+                dtype=torch.uint8,
+                device=dev,
+            )
+            self.peer_buffer = SymmetricPeerBuffer(
+                self.sym_layout["_bytes"],
+                rank=rank,
+                npes=npes,
+                group=group,
+            )
+            self.step = torch.zeros(
+                1,
+                dtype=torch.int32,
+                device=dev,
+            )
+            self._owns_peer_buffer = True
+        else:
+            if workspace.scratch.numel() < self.scr_layout["_bytes"]:
+                raise ValueError("shared scratch is smaller than the tile layout")
+            self.scratch = workspace.scratch
+            self.peer_buffer = workspace.peer_buffer
+            self.step = workspace.step
+            self._owns_peer_buffer = False
         self.sym_storage = self.peer_buffer.storage
         self.sym = self.peer_buffer.local_address
         self.peers = self.peer_buffer.addresses
@@ -172,8 +317,14 @@ class Glm5MonoKernel:
             uv_scale_block_m=uv_scale_block_m,
             agentic_row_contract=agentic_row_contract,
             timeline=timeline,
+            model_config=config,
         )
-        self.step = torch.zeros(1, dtype=torch.int32, device=dev)  # decode-step counter
+
+    @property
+    def packed_artifacts(self) -> Glm5PackedArtifacts:
+        """Strong reference to the layer-owned packed-weight lifetime."""
+
+        return self._packed_artifacts
 
     def debug(self, name: str, shape, dtype=torch.float32, pairs=True, bf2=False) -> torch.Tensor:
         """Values of a scratch mailbox (``(value, tag)`` pairs unless ``pairs=False``;
@@ -224,7 +375,7 @@ class Glm5MonoKernel:
                     f"{tuple(index_cache.shape)} {index_cache.dtype}"
                 )
         if self.kv_cache_layout is KvCacheLayout.ATOM:
-            cache_width = GLM5_CONFIG.kv_lora + GLM5_CONFIG.pe_dim
+            cache_width = self.W.config.kv_lora + self.W.config.pe_dim
             if kv_cache.dtype is not torch.bfloat16 or not kv_cache.is_contiguous():
                 raise ValueError("ATOM KV cache must be contiguous BF16")
             if kv_cache.shape[-1] != cache_width:
@@ -257,7 +408,12 @@ class Glm5MonoKernel:
                         )
         t = dict(self.W.t, **self.packed)
         if x_out is None:
-            x_out = torch.empty(self.S, HIDDEN, dtype=torch.bfloat16, device=h.device)
+            x_out = torch.empty(
+                self.S,
+                self.W.config.hidden,
+                dtype=torch.bfloat16,
+                device=h.device,
+            )
         p = lambda x: x.data_ptr()  # noqa: E731
         self.launch(
             p(h),
@@ -312,7 +468,8 @@ class Glm5MonoKernel:
     def close(self):
         """Release this rank's remote HIP IPC mappings."""
 
-        self.peer_buffer.close()
+        if self._owns_peer_buffer:
+            self.peer_buffer.close()
 
     def __enter__(self):
         return self
@@ -347,20 +504,20 @@ class Glm5MonoKernel:
         return "\n".join(rows)
 
     def intermediates(self):
-        S, H = self.S, self.W.heads
+        S, H, config = self.S, self.W.heads, self.W.config
         result = dict(
-            q_a=self.debug("q_a", (S, Q_LORA)),
-            kv_a=self.debug("kv_a", (S, KV_LORA + PE_DIM)),
-            q_nope=self.debug("q_nope", (S, H, NOPE_DIM), bf2=True),
-            q_pe=self.debug("q_pe", (S, H, PE_DIM), bf2=True),
-            q_lat=self.debug("q_lat", (S, H, KV_LORA), bf2=True),
-            o=self.debug("o", (S, H * V_DIM), bf2=True),
-            a=self.debug("a", (S, HIDDEN), bf2=True).to(torch.bfloat16),
-            scores=self.debug("scores", (S, N_EXPERTS)),
-            sel=self.debug("sel", (S, MOE_SLOTS), torch.int32),
-            prob=self.debug("prob", (S, MOE_SLOTS)),
-            mid=self.debug("mid", (S, MOE_SLOTS, INTER)),
-            xq=self.debug("xqd", (S, HIDDEN), pairs=False),
+            q_a=self.debug("q_a", (S, config.q_lora)),
+            kv_a=self.debug("kv_a", (S, config.kv_lora + config.pe_dim)),
+            q_nope=self.debug("q_nope", (S, H, config.nope_dim), bf2=True),
+            q_pe=self.debug("q_pe", (S, H, config.pe_dim), bf2=True),
+            q_lat=self.debug("q_lat", (S, H, config.kv_lora), bf2=True),
+            o=self.debug("o", (S, H * config.v_dim), bf2=True),
+            a=self.debug("a", (S, config.hidden), bf2=True).to(torch.bfloat16),
+            scores=self.debug("scores", (S, config.n_experts)),
+            sel=self.debug("sel", (S, config.moe_slots), torch.int32),
+            prob=self.debug("prob", (S, config.moe_slots)),
+            mid=self.debug("mid", (S, config.moe_slots, config.inter)),
+            xq=self.debug("xqd", (S, config.hidden), pairs=False),
         )
         if self.with_indexer:
             result["index_q"] = self.debug("index_q", (S, 32, INDEX_DIM), bf2=True)

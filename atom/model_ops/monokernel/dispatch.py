@@ -73,7 +73,7 @@ def select_backend(
     mode = normalize_mode(mode)
     if model == "glm52" and segment == "moe":
         if (
-            mode in ("auto", "staged")
+            mode == "staged"
             and native
             and decode
             and samples > 0

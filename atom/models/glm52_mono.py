@@ -110,7 +110,7 @@ def _mxfp4_expert_tensors(experts, config, physical_experts: int) -> dict[str, t
 
 
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
-    cfg = GLM5_CONFIG
+    cfg = glm5_shard_config(npes)
     attn = layer.self_attn
     moe = layer.mlp
     experts = moe.experts
@@ -294,7 +294,7 @@ class Glm52MonoDecode:
 
         config = atom_config.hf_config
         staged_checks = (
-            mode in ("auto", "staged"),
+            mode == "staged",
             getattr(config, "model_type", None) == "glm_moe_dsa",
             atom_config.tensor_parallel_size == 4,
             atom_config.parallel_config.data_parallel_size == 1,

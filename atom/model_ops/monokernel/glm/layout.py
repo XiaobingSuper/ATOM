@@ -3,10 +3,14 @@
 
 """Compile-time storage layout and CTA schedule for the GLM-5 MonoKernel."""
 
+from dataclasses import dataclass
+
 from atom.model_ops.monokernel.config import (
+    GLM5_CONFIG,
     HIDDEN,
     INTER,
     KV_LORA,
+    LayerConfig,
     MOE_SLOTS,
     N_EXPERTS,
     NOPE_DIM,
@@ -15,7 +19,9 @@ from atom.model_ops.monokernel.config import (
     QKV_A_ROWS,
     TOP_K,
     V_DIM,
+    as_layer_config,
 )
+from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
 from atom.model_ops.monokernel.layout import (
     BLOCKS,
     Q_B_TILE,
@@ -86,10 +92,19 @@ XQ_WAVES = (XQ_BLOCKS + N_ROUTER - 1) // N_ROUTER
 assert XQ_WAVES * 4 <= WAVES
 
 
-def dn_tile(samples: int, expert_mxfp4: bool = False) -> int:
+def dn_tile(
+    samples: int,
+    expert_mxfp4: bool = False,
+    model_config: LayerConfig = GLM5_CONFIG,
+) -> int:
     """Return rows per expert-down/FFN-reduce task for the tuned schedule."""
 
-    return 32 if samples == 1 or (samples > 4 and expert_mxfp4) else HIDDEN // BLOCKS
+    config = as_layer_config(model_config)
+    return (
+        32
+        if samples == 1 or (samples > 4 and expert_mxfp4)
+        else config.hidden // BLOCKS
+    )
 
 
 def sparse_keys_per_task(samples: int) -> int:
@@ -113,14 +128,22 @@ def fp8_scale_offset(
     return (row_group * 16 // block_m) * (k_size // block_k) + k_chunk // 2
 
 
-def ug_split(samples: int):
+def ug_split(samples: int, model_config: LayerConfig = GLM5_CONFIG):
     """Return the balanced up/gate leftover split for batches two and four."""
 
-    full_tiles, remainder = divmod((samples * TOP_K + 1) * N_UG_PER_SLOT, BLOCKS)
+    config = as_layer_config(model_config)
+    n_ug_per_slot = config.inter // UG_TILE
+    full_tiles, remainder = divmod(
+        (samples * config.top_k + 1) * n_ug_per_slot,
+        BLOCKS,
+    )
     if samples not in (2, 4) or remainder == 0 or BLOCKS % remainder:
         return None
     segments = BLOCKS // remainder
-    if (HIDDEN // 128) % segments or (HIDDEN // 128) // segments > WAVES // 2:
+    if (
+        (config.hidden // 128) % segments
+        or (config.hidden // 128) // segments > WAVES // 2
+    ):
         return None
     return full_tiles, segments
 
@@ -136,33 +159,38 @@ def layout(
     sparse_attention_topk: int,
     with_indexer: bool = False,
     index_max_seq: int = 4096,
+    model_config: LayerConfig = GLM5_CONFIG,
 ):
     """Return byte offsets for per-rank scratch and symmetric peer buffers."""
 
+    config = as_layer_config(model_config)
     split_count = sparse_attention_topk // sparse_keys_per_task(samples)
     pair_bytes = 8
     items = [
-        ("q_a", samples * Q_LORA * pair_bytes),
-        ("q_an", samples * Q_LORA // 2 * pair_bytes),
-        ("kv_a", samples * (KV_LORA + PE_DIM) * pair_bytes),
-        ("kvnew", samples * KV_LORA * pair_bytes),
-        ("penew", samples * PE_DIM * pair_bytes),
-        ("q_nope", samples * heads * NOPE_DIM * pair_bytes),
-        ("q_pe", samples * heads * PE_DIM * pair_bytes),
-        ("q_lat", samples * heads * KV_LORA * pair_bytes),
-        ("sp_acc", samples * split_count * heads * KV_LORA * pair_bytes),
+        ("q_a", samples * config.q_lora * pair_bytes),
+        ("q_an", samples * config.q_lora // 2 * pair_bytes),
+        ("kv_a", samples * (config.kv_lora + config.pe_dim) * pair_bytes),
+        ("kvnew", samples * config.kv_lora * pair_bytes),
+        ("penew", samples * config.pe_dim * pair_bytes),
+        ("q_nope", samples * heads * config.nope_dim * pair_bytes),
+        ("q_pe", samples * heads * config.pe_dim * pair_bytes),
+        ("q_lat", samples * heads * config.kv_lora * pair_bytes),
+        (
+            "sp_acc",
+            samples * split_count * heads * config.kv_lora * pair_bytes,
+        ),
         ("sp_m", samples * split_count * heads * pair_bytes),
         ("sp_l", samples * split_count * heads * pair_bytes),
-        ("o", samples * heads * V_DIM * pair_bytes),
-        ("a", samples * HIDDEN * pair_bytes),
-        ("scores", samples * N_EXPERTS * pair_bytes),
-        ("xq", samples * HIDDEN // 4 * pair_bytes),
-        ("xqs", samples * XQ_BLOCKS * pair_bytes),
-        ("sel", samples * MOE_SLOTS * pair_bytes),
-        ("prob", samples * MOE_SLOTS * pair_bytes),
-        ("mid", samples * MOE_SLOTS * INTER * pair_bytes),
+        ("o", samples * heads * config.v_dim * pair_bytes),
+        ("a", samples * config.hidden * pair_bytes),
+        ("scores", samples * config.n_experts * pair_bytes),
+        ("xq", samples * config.hidden // 4 * pair_bytes),
+        ("xqs", samples * (config.hidden // 128) * pair_bytes),
+        ("sel", samples * config.moe_slots * pair_bytes),
+        ("prob", samples * config.moe_slots * pair_bytes),
+        ("mid", samples * config.moe_slots * config.inter * pair_bytes),
         ("ugp", BLOCKS * samples * 2 * UG_TILE * pair_bytes),
-        ("xqd", samples * HIDDEN * 4),
+        ("xqd", samples * config.hidden * 4),
     ]
     if with_indexer:
         items += [
@@ -182,7 +210,7 @@ def layout(
         offset += _align(size)
     scratch["_bytes"] = offset
 
-    part = npes * samples * HIDDEN * pair_bytes
+    part = npes * samples * config.hidden * pair_bytes
     region = 2 * part
     symmetric = {
         "attn": 0,
@@ -200,29 +228,93 @@ def stage_tasks(
     with_indexer: bool = False,
     index_max_seq: int = 4096,
     expert_mxfp4: bool = False,
+    model_config: LayerConfig = GLM5_CONFIG,
 ):
     """Return ``(stage name, task count)`` pairs in execution order."""
 
+    config = as_layer_config(model_config)
+    n_qkv_a = config.qkv_a_rows // QKV_A_TILE
+    n_row_tiles = config.hidden // ROW_TILE
+    n_router = config.n_experts // ROUTER_TILE
+    head_groups = (heads + WAVES - 1) // WAVES
+    split_ctas_per_tile = head_groups if samples == 1 else 1
+    ug_rounds = (config.inter + BLOCKS - 1) // BLOCKS
     tasks = [
-        ("qkv_a", N_QKV_A),
+        ("qkv_a", n_qkv_a),
         ("q_norm", samples),
         ("cache", 1),
-        ("q_b", heads * (NOPE_DIM + PE_DIM) // Q_B_TILE),
+        ("q_b", heads * (config.nope_dim + config.pe_dim) // Q_B_TILE),
     ]
     if with_indexer:
         tasks += [("index_q", INDEX_Q_ROWS // INDEX_TILE)]
-    tasks += [("uk", heads * KV_LORA // UK_TILE)]
+    tasks += [("uk", heads * config.kv_lora // UK_TILE)]
     if with_indexer:
         tasks += [
             ("index_score", samples * ((index_max_seq + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK)),
             ("index_select", samples),
         ]
     tasks += [
-        ("split", samples * (sparse_attention_topk // sparse_keys_per_task(samples))),
-        ("uv", samples * (heads * V_DIM // UV_TILE)),
-        ("o", N_ROW_TILES),
-        ("router", samples * N_ROUTER),
-        ("ug", BLOCKS if samples == 1 else samples * BLOCKS),
-        ("down", HIDDEN // dn_tile(samples, expert_mxfp4)),
+        (
+            "split",
+            samples
+            * (sparse_attention_topk // sparse_keys_per_task(samples))
+            * split_ctas_per_tile,
+        ),
+        ("uv", samples * (heads * config.v_dim // UV_TILE)),
+        ("o", n_row_tiles),
+        ("router", samples * n_router),
+        (
+            "ug",
+            ug_rounds * BLOCKS
+            if samples == 1
+            else samples * ug_rounds * BLOCKS,
+        ),
+        (
+            "down",
+            config.hidden // dn_tile(samples, expert_mxfp4, config),
+        ),
     ]
     return tasks
+
+
+@dataclass(frozen=True)
+class GlmAgenticWorkspaceLayout:
+    """One row-tile arena reusable by every layer in an Agentic graph bucket."""
+
+    config: LayerConfig
+    row_capacity: int
+    tile_rows: int
+    tile_count: int
+    physical_experts: int
+    scratch: dict[str, int]
+    symmetric: dict[str, int]
+
+
+def agentic_workspace_layout(
+    shape: GlmAgenticShape,
+    *,
+    npes: int,
+    sparse_attention_topk: int,
+    with_indexer: bool = False,
+    index_max_seq: int = 4096,
+) -> GlmAgenticWorkspaceLayout:
+    """Plan the shared tile arena without pretending the full launch is ready."""
+
+    scratch, symmetric = layout(
+        shape.common.tile_rows,
+        shape.local_heads,
+        npes,
+        sparse_attention_topk,
+        with_indexer,
+        index_max_seq,
+        shape.config,
+    )
+    return GlmAgenticWorkspaceLayout(
+        config=shape.config,
+        row_capacity=shape.common.row_capacity,
+        tile_rows=shape.common.tile_rows,
+        tile_count=shape.common.tiles,
+        physical_experts=shape.physical_experts,
+        scratch=scratch,
+        symmetric=symmetric,
+    )

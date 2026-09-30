@@ -56,10 +56,12 @@ from atom.model_ops.monokernel.config import (
     AttentionWeight,
     EPS,
     FP8_MAX,
+    GLM5_CONFIG,
     HIDDEN,
     INTER,
     KV_LORA,
     KvCacheLayout,
+    LayerConfig,
     MOE_SLOTS,
     N_EXPERTS,
     NOPE_DIM,
@@ -72,6 +74,7 @@ from atom.model_ops.monokernel.config import (
     TOP_K,
     V_DIM,
     as_kv_cache_layout,
+    as_layer_config,
 )
 from atom.model_ops.monokernel.glm.layout import (
     BLOCKS,
@@ -159,8 +162,9 @@ def build_glm5_monokernel(
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
     uv_scale_block_m: int = 128,
     agentic_row_contract: bool = False,
-    scale: float = SOFTMAX_SCALE,
+    scale: float | None = None,
     timeline: bool = False,
+    model_config: LayerConfig = GLM5_CONFIG,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -169,7 +173,31 @@ def build_glm5_monokernel(
     int64 ``[sum(task counts), TL_COLS]`` (start, hint seen, inputs staged, compute
     done, end, then free debug marks) in ``stage_tasks`` order.
     """
-    assert heads == 8, "the split-attention mapping uses one wave per local head"
+    config = as_layer_config(model_config)
+    HIDDEN = config.hidden
+    Q_LORA = config.q_lora
+    KV_LORA = config.kv_lora
+    PE_DIM = config.pe_dim
+    NOPE_DIM = config.nope_dim
+    V_DIM = config.v_dim
+    QKV_A_ROWS = config.qkv_a_rows
+    N_EXPERTS = config.n_experts
+    TOP_K = config.top_k
+    MOE_SLOTS = config.moe_slots
+    SHARED_EXPERT = config.shared_expert
+    INTER = config.inter
+    ROUTE_SCALE = config.route_scale
+    scale = config.softmax_scale if scale is None else scale
+    N_QKV_A = QKV_A_ROWS // QKV_A_TILE
+    N_ROW_TILES = HIDDEN // ROW_TILE
+    N_ROUTER = N_EXPERTS // ROUTER_TILE
+    N_UG_PER_SLOT = INTER // UG_TILE
+    XQ_BLOCKS = HIDDEN // 128
+    XQ_WAVES = (XQ_BLOCKS + N_ROUTER - 1) // N_ROUTER
+    assert XQ_WAVES * 4 <= WAVES
+    assert heads == config.local_heads, (
+        f"{config.name} requires {config.local_heads} local heads"
+    )
     attention_weight = AttentionWeight(attention_weight)
     cache_layout = as_kv_cache_layout(kv_cache_layout)
     attention_bf16 = attention_weight is AttentionWeight.BF16
@@ -184,7 +212,15 @@ def build_glm5_monokernel(
     H = heads
     W = npes
     G = BLOCKS
-    SC, SY = layout(S, H, W, topk, with_indexer, index_max_seq)
+    SC, SY = layout(
+        S,
+        H,
+        W,
+        topk,
+        with_indexer,
+        index_max_seq,
+        config,
+    )
     N_SPLIT = topk // SPLIT_KEYS
     QB_ROWS = H * (NOPE_DIM + PE_DIM)
     N_QB = QB_ROWS // Q_B_TILE
@@ -195,6 +231,9 @@ def build_glm5_monokernel(
     N_UV = H * V_DIM // UV_TILE
     O_K = H * V_DIM
     N_UG = S * MOE_SLOTS * N_UG_PER_SLOT
+    HEAD_GROUPS = (H + WAVES - 1) // WAVES
+    SPLIT_CTAS_PER_TILE = HEAD_GROUPS if S == 1 else 1
+    HEAD_GROUPS_PER_CTA = 1 if S == 1 else HEAD_GROUPS
     QK_DIM = KV_LORA + PE_DIM
     # split LDS: bf16 q of all heads, then the KV latent / k_pe tiles (bf16 pairs); row
     # strides are padded by 4 words so the MFMA operand rows spread over the banks
@@ -208,7 +247,7 @@ def build_glm5_monokernel(
     # 48 KiB for S=8.  Later stages either consume a smaller tensor or use the
     # FP8 representation and therefore fit all samples at once.
     SAMPLE_TILE = min(S, 4)
-    DN_TILE = dn_tile(S, expert_mxfp4)
+    DN_TILE = dn_tile(S, expert_mxfp4, config)
     N_DN_TILES = HIDDEN // DN_TILE
     RED_WORDS = WAVES * 64 * 4
     LDS_KEYS = max(264 if with_indexer else 0, SPLIT_KEYS, S * MOE_SLOTS)
@@ -233,12 +272,30 @@ def build_glm5_monokernel(
     assert WORK_WORDS <= 32768, "keep static LDS below the MI355X per-workgroup budget"
 
     base, first, acc = {}, {}, 0
-    for name, n in stage_tasks(S, H, topk, with_indexer, index_max_seq, expert_mxfp4):
+    for name, n in stage_tasks(
+        S,
+        H,
+        topk,
+        with_indexer,
+        index_max_seq,
+        expert_mxfp4,
+        config,
+    ):
         first[name] = acc
         acc += n
     # CTA placement: split before uk, so every split tile lands on a CTA freed by
     # qkv_a (uk shares the q_b CTAs it waits on anyway)
-    tasks = dict(stage_tasks(S, H, topk, with_indexer, index_max_seq, expert_mxfp4))
+    tasks = dict(
+        stage_tasks(
+            S,
+            H,
+            topk,
+            with_indexer,
+            index_max_seq,
+            expert_mxfp4,
+            config,
+        )
+    )
     acc = 0
     for name in ("qkv_a", "q_norm", "cache", "q_b", "split", "uk", "uv", "o", "router", "ug", "down"):
         base[name] = acc % G
@@ -369,7 +426,8 @@ def build_glm5_monokernel(
                             dtype=T.i32,
                         )
                     )
-                    return row_active(s) & (count > 0)
+                    begin, end = row_index_bounds(s)
+                    return row_active(s) & (count > 0) & (end > begin)
                 begin, end = row_index_bounds(s)
                 return end > begin
             return True
@@ -1673,12 +1731,17 @@ def build_glm5_monokernel(
                         a0, a1 = get2(mb("penew"), sn * PE_DIM + lane * 2)
                         lds_st(petile, j * PS + lane, bf16_pair(a0, a1))
 
-        for tt in range(start("split"), S * N_SPLIT, G):
+        for tt in range(
+            start("split"),
+            S * N_SPLIT * SPLIT_CTAS_PER_TILE,
+            G,
+        ):
             tt = fx.Int32(tt)
             stamp("split", tt, 0)
-            s = tt // N_SPLIT  # sample
-            t = tt % N_SPLIT  # sparse-key chunk
-            h = wave
+            s = tt // (N_SPLIT * SPLIT_CTAS_PER_TILE)
+            split_group = tt % (N_SPLIT * SPLIT_CTAS_PER_TILE)
+            t = split_group // SPLIT_CTAS_PER_TILE
+            task_head_group = split_group % SPLIT_CTAS_PER_TILE
             nkeys, sparse = split_keys(t, s)
             gpu.barrier()
             gather_old_kv()  # before waiting for q: these rows are from earlier launches
@@ -1731,7 +1794,8 @@ def build_glm5_monokernel(
             # (four row groups, two K halves); the batch-8 32-key tile uses two
             # row groups and four waves per K half.  All waves subsequently own
             # one attention head for softmax and P@V.
-            hn = fx.min(lane % 16, H - 1)
+            score_head_base = task_head_group * WAVES
+            hn = fx.min(score_head_base + lane % 16, H - 1)
             rgk = wave % (SPLIT_KEYS // 16)
             c = fx.Vector.filled(4, 0.0, fx.Float32)
             for st in range_constexpr(QK_DIM // 32 // 2):
@@ -1748,53 +1812,119 @@ def build_glm5_monokernel(
                 fx.ptr_store(c, red + (wave * 64 + lane) * 4)
             gpu.barrier()
             stamp("split", tt, 6)
-            # split-local softmax: wave h, lane = key j (score = sum of the two K halves)
-            kidx = t * SPLIT_KEYS + lane
-            valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
-            r16 = lane % 16
-            cl = h + 16 * (r16 // 4)
-            key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
-            half_stride = SPLIT_KEYS // 16
-            raw = lds_ld(red, (key_rg * 64 + cl) * 4 + r16 % 4) + lds_ld(
-                red, ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4
-            )
-            sc_v = valid.select(raw * scale, fx.Float32(NEG))
-            m = wave_max(sc_v)
-            p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
-            lsum = wave_sum(p)
-            p_n = _xshfl(p, 1)
-            if (lane < SPLIT_KEYS) & (lane % 2 == 0):
-                lds_st(pl, h * (SPLIT_KEYS // 2) + lane // 2, bf16_pair(p, p_n))
-            gpu.barrier()
-            stamp("split", tt, 3)
-            # O = P V on MFMA: heads M, keys K, latent dims N.  Each V word holds
-            # a dim pair (even dim low), so one read feeds two MFMAs (even / odd dims):
-            # each wave owns 2 groups of 32 dims.  V is read key-strided from the tile.
-            for g in range_constexpr(KV_LORA // 32 // WAVES):
-                dw = (wave * (KV_LORA // 32 // WAVES) + g) * 16 + lane % 16  # dim pair word
-                c0 = fx.Vector.filled(4, 0.0, fx.Float32)
-                c1 = fx.Vector.filled(4, 0.0, fx.Float32)
-                for js in range_constexpr(SPLIT_KEYS // 32):
-                    a = fx.ptr_load(
-                        pl + (hn * (SPLIT_KEYS // 2) + js * 16 + (lane // 16) * 4), result_type=v4f
-                    ).bitcast(fx.BFloat16)
-                    ws = [
-                        fx.ptr_load(ktile + ((js * 32 + (lane // 16) * 8 + i) * KS + dw)).bitcast(fx.Int32)
-                        for i in range(8)
-                    ]
-                    w_lo = [(ws[2 * i] & 0xFFFF) | (ws[2 * i + 1] << 16) for i in range(4)]
-                    w_hi = [fx.Int32(fx.Uint32(ws[2 * i]) >> 16) | (ws[2 * i + 1] & -65536) for i in range(4)]
-                    b0 = fx.Vector.from_elements(w_lo, fx.Int32).bitcast(fx.BFloat16)
-                    b1 = fx.Vector.from_elements(w_hi, fx.Int32).bitcast(fx.BFloat16)
-                    c0 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b0, c0]))
-                    c1 = fx.Vector(rocdl.mfma_f32_16x16x32_bf16(T.vec(4, T.f32), [a, b1, c1]))
-                if lane < 32:  # rows (heads) 4 * (lane // 16) + e < 8
-                    for e in range_constexpr(4):
-                        hh = (lane // 16) * 4 + e
-                        put_bf(mb("sp_acc"), ((s * N_SPLIT + t) * H + hh) * KV_LORA + dw * 2, [c0[e], c1[e]])
-            if lane == 0:  # written last: the merge's readiness hint
-                put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
-                put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+            for local_head_group in range_constexpr(HEAD_GROUPS_PER_CTA):
+                head_base = (task_head_group + local_head_group) * WAVES
+                h = head_base + wave
+                # split-local softmax: wave h, lane = key j (score = sum of
+                # the two K halves).
+                kidx = t * SPLIT_KEYS + lane
+                valid = (lane < SPLIT_KEYS) & (kidx < nkeys)
+                r16 = lane % 16
+                score_head = local_head_group * WAVES + wave
+                cl = score_head + 16 * (r16 // 4)
+                key_rg = fx.min(lane // 16, SPLIT_KEYS // 16 - 1)
+                half_stride = SPLIT_KEYS // 16
+                raw = lds_ld(
+                    red,
+                    (key_rg * 64 + cl) * 4 + r16 % 4,
+                ) + lds_ld(
+                    red,
+                    ((key_rg + half_stride) * 64 + cl) * 4 + r16 % 4,
+                )
+                sc_v = valid.select(raw * scale, fx.Float32(NEG))
+                m = wave_max(sc_v)
+                p = valid.select(_exp(sc_v - m), fx.Float32(0.0))
+                lsum = wave_sum(p)
+                p_n = _xshfl(p, 1)
+                if (lane < SPLIT_KEYS) & (lane % 2 == 0):
+                    lds_st(
+                        pl,
+                        h * (SPLIT_KEYS // 2) + lane // 2,
+                        bf16_pair(p, p_n),
+                    )
+                gpu.barrier()
+                stamp("split", tt, 3)
+                # O = P V on MFMA. Process heads in eight-wave groups so TP4's
+                # heads 8..15 reuse the staged Q/KV and score tile.
+                hn = fx.min(head_base + lane % 16, H - 1)
+                for g in range_constexpr(KV_LORA // 32 // WAVES):
+                    dw = (
+                        wave * (KV_LORA // 32 // WAVES) + g
+                    ) * 16 + lane % 16
+                    c0 = fx.Vector.filled(4, 0.0, fx.Float32)
+                    c1 = fx.Vector.filled(4, 0.0, fx.Float32)
+                    for js in range_constexpr(SPLIT_KEYS // 32):
+                        a = fx.ptr_load(
+                            pl
+                            + (
+                                hn * (SPLIT_KEYS // 2)
+                                + js * 16
+                                + (lane // 16) * 4
+                            ),
+                            result_type=v4f,
+                        ).bitcast(fx.BFloat16)
+                        ws = [
+                            fx.ptr_load(
+                                ktile
+                                + (
+                                    (
+                                        js * 32
+                                        + (lane // 16) * 8
+                                        + i
+                                    )
+                                    * KS
+                                    + dw
+                                )
+                            ).bitcast(fx.Int32)
+                            for i in range(8)
+                        ]
+                        w_lo = [
+                            (ws[2 * i] & 0xFFFF)
+                            | (ws[2 * i + 1] << 16)
+                            for i in range(4)
+                        ]
+                        w_hi = [
+                            fx.Int32(fx.Uint32(ws[2 * i]) >> 16)
+                            | (ws[2 * i + 1] & -65536)
+                            for i in range(4)
+                        ]
+                        b0 = fx.Vector.from_elements(
+                            w_lo,
+                            fx.Int32,
+                        ).bitcast(fx.BFloat16)
+                        b1 = fx.Vector.from_elements(
+                            w_hi,
+                            fx.Int32,
+                        ).bitcast(fx.BFloat16)
+                        c0 = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32),
+                                [a, b0, c0],
+                            )
+                        )
+                        c1 = fx.Vector(
+                            rocdl.mfma_f32_16x16x32_bf16(
+                                T.vec(4, T.f32),
+                                [a, b1, c1],
+                            )
+                        )
+                    if lane < 32:
+                        for e in range_constexpr(4):
+                            hh = head_base + (lane // 16) * 4 + e
+                            if hh < H:
+                                put_bf(
+                                    mb("sp_acc"),
+                                    (
+                                        (s * N_SPLIT + t) * H + hh
+                                    )
+                                    * KV_LORA
+                                    + dw * 2,
+                                    [c0[e], c1[e]],
+                                )
+                if (lane == 0) & (h < H):
+                    put(mb("sp_m"), (s * N_SPLIT + t) * H + h, m)
+                    put(mb("sp_l"), (s * N_SPLIT + t) * H + h, lsum)
+                gpu.barrier()
             stamp("split", tt, 4)
 
         # ========================== 6. split merge + W_UV: o = W_UV (softmax . KV)
@@ -2102,7 +2232,7 @@ def build_glm5_monokernel(
             # + 8 up rows are one MFMA row group and all waves split K
             UG8 = 8
             UG8_CPW = UG_NKC // WAVES
-            for u in range(start("ug"), G, G):
+            for u in range(start("ug"), INTER, G):
                 u = fx.Int32(u)
                 stamp("ug", u, 0)
                 s_u, c = fx.Int32(0), u % (INTER // UG8)
@@ -2221,112 +2351,194 @@ def build_glm5_monokernel(
             UG8 = 8
             UG8_UNITS = (HIDDEN // 128) // WAVES
             XW = HIDDEN // 4
-            u = fx.Int32(start("ug"))
-            c = u % (INTER // UG8)
-            has_sh = u < INTER // UG8
-            slot = has_sh.select(fx.Int32(MOE_SLOTS - 1), u // (INTER // UG8))
-            w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
-            w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
-            s_rg = (lane // 32) * (INTER // 16) + c // 2
+            UG_TASKS = ((INTER + G - 1) // G) * G
 
-            def ug8_units(e, sample, live=None):
-                if const_expr(live is None):
-                    rw = _rsrc(w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES))
-                    rs = _rsrc(s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES))
-                else:
-                    rw = bo.create_buffer_resource_from_addr(
-                        w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
-                        num_records_bytes=live.select(fx.Int32(UG_W_BYTES), fx.Int32(0)),
-                    )
-                    rs = bo.create_buffer_resource_from_addr(
-                        s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
-                        num_records_bytes=live.select(fx.Int32(UG_S_BYTES), fx.Int32(0)),
-                    )
-                sn = n_sel() if sample is None else fx.Int32(sample)
-                units = []
-                for cc in range_constexpr(UG8_UNITS):
-                    unit = wave * UG8_UNITS + cc
-                    kc = unit * 2
-                    if const_expr(expert_mxfp4):
+            def ug8_task(u):
+                u = fx.Int32(u)
+                c = u % (INTER // UG8)
+                has_sh = u < INTER // UG8
+                slot = has_sh.select(
+                    fx.Int32(MOE_SLOTS - 1),
+                    u // (INTER // UG8),
+                )
+                w_rg = ((lane % 16) // 8) * (INTER // 16) + c // 2
+                w_ln = (lane & -16) | ((c % 2) * 8 + lane % 8)
+                s_rg = (lane // 32) * (INTER // 16) + c // 2
+
+                def ug8_units(e, sample, live=None):
+                    if const_expr(live is None):
+                        rw = _rsrc(
+                            w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES)
+                        )
+                        rs = _rsrc(
+                            s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES)
+                        )
+                    else:
+                        rw = bo.create_buffer_resource_from_addr(
+                            w_ug + fx.Int64(e) * fx.Int64(UG_W_BYTES),
+                            num_records_bytes=live.select(
+                                fx.Int32(UG_W_BYTES),
+                                fx.Int32(0),
+                            ),
+                        )
+                        rs = bo.create_buffer_resource_from_addr(
+                            s_ug + fx.Int64(e) * fx.Int64(UG_S_BYTES),
+                            num_records_bytes=live.select(
+                                fx.Int32(UG_S_BYTES),
+                                fx.Int32(0),
+                            ),
+                        )
+                    sn = n_sel() if sample is None else fx.Int32(sample)
+                    units = []
+                    for cc in range_constexpr(UG8_UNITS):
+                        unit = wave * UG8_UNITS + cc
+                        kc = unit * 2
+                        if const_expr(expert_mxfp4):
+                            units.append(
+                                unit_mxfp4(
+                                    rw,
+                                    rs,
+                                    w_rg,
+                                    unit,
+                                    HIDDEN,
+                                    sn * XW + unit * 32,
+                                    lambda unit=unit, sn=sn: lds_ld(
+                                        misc,
+                                        8 + sn * XQ_BLOCKS + unit,
+                                    ),
+                                    w_ln,
+                                )
+                            )
+                            continue
+                        wv = [
+                            fx.Vector(
+                                bo.buffer_load(
+                                    rw,
+                                    (
+                                        (
+                                            w_rg * UG_NKC
+                                            + kc
+                                            + j
+                                        )
+                                        * 64
+                                        + w_ln
+                                    )
+                                    * 4,
+                                    vec_width=4,
+                                    dtype=T.i32,
+                                )
+                            )
+                            for j in range(2)
+                        ]
+                        sc = ld_f32(
+                            rs,
+                            (s_rg * 16 // SCALE_BM)
+                            * (HIDDEN // 128)
+                            + kc // 2,
+                        )
                         units.append(
-                            unit_mxfp4(
-                                rw,
-                                rs,
-                                w_rg,
-                                unit,
-                                HIDDEN,
-                                sn * XW + unit * 32,
-                                lambda unit=unit, sn=sn: lds_ld(misc, 8 + sn * XQ_BLOCKS + unit),
-                                w_ln,
+                            (
+                                "f8f8",
+                                wv,
+                                lambda sc=sc, kc=kc, sn=sn: sc
+                                * lds_ld(
+                                    misc,
+                                    8 + sn * XQ_BLOCKS + kc // 2,
+                                ),
+                                sn * XW + kc * 16 + (lane // 16) * 4,
                             )
                         )
-                        continue
-                    wv = [
-                        fx.Vector(
-                            bo.buffer_load(rw, ((w_rg * UG_NKC + kc + j) * 64 + w_ln) * 4, vec_width=4, dtype=T.i32)
+                    return units
+
+                def ug8_emit(sample, shared):
+                    if tid < (S if shared else 1) * UG8 // 2:
+                        n = tid // (UG8 // 2)
+                        r = (tid % (UG8 // 2)) * 2
+                        g0 = lds_ld(outs, n * 16 + r)
+                        g1 = lds_ld(outs, n * 16 + r + 1)
+                        v0 = lds_ld(outs, n * 16 + UG8 + r)
+                        v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
+                        sn = n if shared else fx.Int32(sample)
+                        sl = fx.Int32(0) if shared else slot
+                        put2(
+                            mb("mid"),
+                            (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r,
+                            g0 * _rcp(1.0 + _exp(-g0)) * v0,
+                            g1 * _rcp(1.0 + _exp(-g1)) * v1,
                         )
-                        for j in range(2)
-                    ]
-                    sc = ld_f32(rs, (s_rg * 16 // SCALE_BM) * (HIDDEN // 128) + kc // 2)
-                    units.append(
-                        (
-                            "f8f8",
-                            wv,
-                            lambda sc=sc, kc=kc, sn=sn: sc * lds_ld(misc, 8 + sn * XQ_BLOCKS + kc // 2),
-                            sn * XW + kc * 16 + (lane // 16) * 4,
+                    if (c == 0) & (
+                        tid < S if shared else tid == 0
+                    ):
+                        sn = tid if shared else fx.Int32(sample)
+                        sl = fx.Int32(0) if shared else slot
+                        put(
+                            mb("sel"),
+                            sn * MOE_SLOTS + sl,
+                            lds_ld(keys, sn * MOE_SLOTS + sl),
                         )
-                    )
-                return units
+                        put(
+                            mb("prob"),
+                            sn * MOE_SLOTS + sl,
+                            lds_ld(dnw, sn * MOE_SLOTS + sl),
+                        )
 
-            def ug8_emit(sample, shared):
-                if tid < (S if shared else 1) * UG8 // 2:
-                    n = tid // (UG8 // 2)
-                    r = (tid % (UG8 // 2)) * 2
-                    g0, g1 = lds_ld(outs, n * 16 + r), lds_ld(outs, n * 16 + r + 1)
-                    v0 = lds_ld(outs, n * 16 + UG8 + r)
-                    v1 = lds_ld(outs, n * 16 + UG8 + r + 1)
-                    sn = n if shared else fx.Int32(sample)
-                    sl = fx.Int32(0) if shared else slot
-                    put2(
-                        mb("mid"),
-                        (sn * MOE_SLOTS + sl) * INTER + c * UG8 + r,
-                        g0 * _rcp(1.0 + _exp(-g0)) * v0,
-                        g1 * _rcp(1.0 + _exp(-g1)) * v1,
-                    )
-                if (c == 0) & (tid < S if shared else tid == 0):
-                    sn = tid if shared else fx.Int32(sample)
-                    sl = fx.Int32(0) if shared else slot
-                    put(mb("sel"), sn * MOE_SLOTS + sl, lds_ld(keys, sn * MOE_SLOTS + sl))
-                    put(mb("prob"), sn * MOE_SLOTS + sl, lds_ld(dnw, sn * MOE_SLOTS + sl))
-
-            dn_route(load_bias())
-            gpu.barrier()
-            shared_pre = ug8_units(fx.Int32(SHARED_EXPERT), None, has_sh)
-            cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
-            stage_xq(list(range(S)))
-            gpu.barrier()
-            if has_sh:
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], shared_pre), emit_out(16))
+                dn_route(load_bias())
                 gpu.barrier()
-                ug8_emit(0, True)
-            for sample in range_constexpr(S):
-                stamp("ug", sample * G + u, 0)
-                pre = cur
-                if const_expr(sample + 1 < S):
-                    cur = ug8_units(_uniform(lds_ld(keys, (sample + 1) * MOE_SLOTS + slot)), sample + 1)
-                reduce_rows(1, mma_units([fx.Float32(0.0) for _ in range(4)], pre), emit_out(16))
+                shared_pre = ug8_units(
+                    fx.Int32(SHARED_EXPERT),
+                    None,
+                    has_sh,
+                )
+                cur = ug8_units(_uniform(lds_ld(keys, slot)), 0)
+                stage_xq(list(range(S)))
                 gpu.barrier()
-                ug8_emit(sample, False)
-                stamp("ug", sample * G + u, 4)
+                if has_sh:
+                    reduce_rows(
+                        1,
+                        mma_units(
+                            [fx.Float32(0.0) for _ in range(4)],
+                            shared_pre,
+                        ),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    ug8_emit(0, True)
+                for sample in range_constexpr(S):
+                    stamp("ug", sample * UG_TASKS + u, 0)
+                    pre = cur
+                    if const_expr(sample + 1 < S):
+                        cur = ug8_units(
+                            _uniform(
+                                lds_ld(
+                                    keys,
+                                    (sample + 1) * MOE_SLOTS + slot,
+                                )
+                            ),
+                            sample + 1,
+                        )
+                    reduce_rows(
+                        1,
+                        mma_units(
+                            [fx.Float32(0.0) for _ in range(4)],
+                            pre,
+                        ),
+                        emit_out(16),
+                    )
+                    gpu.barrier()
+                    ug8_emit(sample, False)
+                    stamp("ug", sample * UG_TASKS + u, 4)
 
-        elif const_expr(ug_split(S) is not None):
+            for u in range(start("ug"), INTER, G):
+                ug8_task(u)
+
+        elif const_expr(ug_split(S, config) is not None):
             # S = 2, 4 (the router already quantized every sample's activation): job 0 is
             # this CTA's K-segment of a leftover tile (partial sums -> ugp; the segment-0
             # CTA sums them after its own tiles), jobs 1..NF whole tiles.  Tile x: expert
             # slot x // 16 (0 = the shared expert with MFMA column n = sample n, then
             # sample-major routed slots), intermediates (x % 16) * 16.  Job k + 1 is
             # routed and its weights are in flight while job k computes.
-            NF, SEG = ug_split(S)
+            NF, SEG = ug_split(S, config)
             KB = XQ_BLOCKS // SEG  # 128-k blocks per segment and row group
             XW = HIDDEN // 4  # LDS words of one sample's FP8 activation
             gu_row = (wave // (WAVES // 2)) * (INTER // 16)  # waves 0-3: gate rows, 4-7: up rows
@@ -2478,7 +2690,7 @@ def build_glm5_monokernel(
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
             stamp("down", t, 0)
-            if const_expr(ug_split(S) is None):  # else routed before up/gate
+            if const_expr(ug_split(S, config) is None):  # else routed before up/gate
                 dn_route(load_bias())
             gpu.barrier()
             gu = wave // DN_WPR

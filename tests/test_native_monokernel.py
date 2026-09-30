@@ -525,7 +525,7 @@ def test_glm_agentic_selects_moe_stage_for_flattened_rows(rows, mtp, dcp):
         segment="moe",
     )
 
-    assert select_backend("glm52", "auto", **common) == "staged_moe"
+    assert select_backend("glm52", "auto", **common) is None
     assert select_backend("glm52", "staged", **common) == "staged_moe"
     assert select_backend("glm52", "mono", **common) is None
     assert select_backend("glm52", "auto", **common, plugin=True) is None
@@ -622,6 +622,433 @@ def test_glm_layout_covers_only_requested_decode_batches():
         assert symmetric["_bytes"] > 0
 
 
+def test_glm_layout_uses_tp4_heads_and_expert_width():
+    from atom.model_ops.monokernel.config import glm5_shard_config
+
+    config = glm5_shard_config(4)
+    scratch, symmetric = glm_layout.layout(
+        8,
+        config.local_heads,
+        4,
+        2048,
+        model_config=config,
+    )
+    stages = dict(
+        glm_layout.stage_tasks(
+            8,
+            config.local_heads,
+            2048,
+            expert_mxfp4=True,
+            model_config=config,
+        )
+    )
+    one_row_stages = dict(
+        glm_layout.stage_tasks(
+            1,
+            config.local_heads,
+            2048,
+            expert_mxfp4=True,
+            model_config=config,
+        )
+    )
+
+    assert scratch["ugp"] - scratch["mid"] >= 8 * 9 * config.inter * 8
+    assert symmetric["_part_stride"] == 4 * 8 * config.hidden * 8
+    assert stages["router"] == 8 * (config.n_experts // 8)
+    assert stages["ug"] == 8 * 2 * 256
+    assert stages["down"] == config.hidden // 32
+    assert one_row_stages["split"] == 2 * (2048 // 64)
+
+
+def test_glm_kernel_builder_accepts_tp4_agentic_tile_geometry():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5.2 MonoKernel requires a visible ROCm device")
+
+    from atom.model_ops.monokernel.config import (
+        AttentionWeight,
+        KvCacheLayout,
+        glm5_shard_config,
+    )
+    from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
+
+    config = glm5_shard_config(4)
+    launch = build_glm5_monokernel(
+        8,
+        config.local_heads,
+        4,
+        expert_mxfp4=True,
+        attention_weight=AttentionWeight.BF16,
+        kv_cache_layout=KvCacheLayout.ATOM,
+        agentic_row_contract=True,
+        model_config=config,
+    )
+
+    assert callable(launch)
+
+
+def test_glm_host_geometry_accepts_tp4_and_physical_shared_expert():
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import glm5_shard_config
+    from atom.model_ops.monokernel.glm.op import _glm_kernel_config
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    config = glm5_shard_config(4)
+    weights = LayerWeights(
+        heads=config.local_heads,
+        t={},
+        config=config,
+        npes=4,
+        physical_experts=257,
+    )
+
+    assert _glm_kernel_config(weights, 4) == config
+    weights.physical_experts = 256
+    with pytest.raises(ValueError, match="physical experts"):
+        _glm_kernel_config(weights, 4)
+    weights.physical_experts = None
+    with pytest.raises(ValueError, match="physical experts"):
+        _glm_kernel_config(weights, 4)
+
+
+def test_glm_tp8_geometry_and_builder_regression():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available():
+        pytest.skip("GLM-5.2 MonoKernel requires a visible ROCm device")
+
+    from atom.model_ops.monokernel.config import (
+        AttentionWeight,
+        KvCacheLayout,
+        glm5_shard_config,
+    )
+    from atom.model_ops.monokernel.glm.kernel import build_glm5_monokernel
+    from atom.model_ops.monokernel.glm.op import _glm_kernel_config
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    config = glm5_shard_config(8)
+    weights = LayerWeights(
+        heads=8,
+        t={},
+        config=config,
+        npes=8,
+        physical_experts=257,
+    )
+    stages = dict(
+        glm_layout.stage_tasks(
+            8,
+            8,
+            2048,
+            model_config=config,
+        )
+    )
+
+    assert _glm_kernel_config(weights, 8) == config
+    assert stages["split"] == 8 * (2048 // 32)
+    assert stages["ug"] == 8 * 256
+    launch = build_glm5_monokernel(
+        8,
+        8,
+        8,
+        attention_weight=AttentionWeight.BF16,
+        kv_cache_layout=KvCacheLayout.ATOM,
+        agentic_row_contract=True,
+        model_config=config,
+    )
+    assert callable(launch)
+
+
+def test_glm_op_binds_shared_workspace_without_owning_peer_buffer(monkeypatch):
+    import torch
+
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import glm5_shard_config
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
+    from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
+    from atom.model_ops.monokernel.glm import op as glm_op
+    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    config = glm5_shard_config(4)
+    shape = GlmAgenticShape.for_graph(
+        batch_capacity=20,
+        query_len=5,
+        dcp_size=1,
+        query_replication=False,
+    )
+    plan = agentic_workspace_layout(
+        shape,
+        npes=4,
+        sparse_attention_topk=64,
+    )
+
+    class Peer:
+        storage = object()
+        local_address = 17
+        addresses = torch.empty(4, dtype=torch.int64)
+        closes = 0
+
+        def close(self):
+            self.closes += 1
+
+    peer = Peer()
+    workspace = GlmAgenticWorkspace(
+        shape=shape,
+        layout=plan,
+        scratch=torch.empty(plan.scratch["_bytes"], dtype=torch.uint8),
+        peer_buffer=peer,
+        step=torch.zeros(1, dtype=torch.int32),
+        hidden_buffers=(
+            torch.empty(100, config.hidden, dtype=torch.bfloat16),
+            torch.empty(100, config.hidden, dtype=torch.bfloat16),
+        ),
+    )
+    tensors = {
+        name: torch.empty(1, dtype=torch.bfloat16)
+        for name in (
+            "g_in",
+            "g_q",
+            "g_kv",
+            "g_post",
+            "w_qkv_a",
+            "w_q_b",
+            "w_uk",
+            "w_uv",
+            "w_o",
+            "w_r",
+            "bias",
+            "w_ug",
+            "s_ug",
+            "w_dn",
+            "s_dn",
+        )
+    }
+    weights = LayerWeights(
+        heads=16,
+        t=tensors,
+        config=config,
+        npes=4,
+        physical_experts=257,
+    )
+    monkeypatch.setattr(glm_op, "pack_layer_weights", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(glm_op, "build_glm5_monokernel", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(glm_op.torch.cuda, "current_device", lambda: 0)
+
+    kernel = Glm5MonoKernel(
+        weights,
+        4,
+        rank=0,
+        npes=4,
+        topk=64,
+        launches_per_step=128,
+        agentic_row_contract=True,
+        workspace=workspace,
+    )
+
+    assert kernel.workspace is workspace
+    assert kernel.scratch is workspace.scratch
+    assert kernel.peer_buffer is peer
+    assert kernel.step is workspace.step
+    kernel.close()
+    assert peer.closes == 0
+
+
+def test_glm_s4_s8_reuse_one_packed_artifact_owner(monkeypatch):
+    import torch
+
+    pytest.importorskip("flydsl")
+    from atom.model_ops.monokernel.config import glm5_shard_config
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
+    from atom.model_ops.monokernel.glm.op import (
+        Glm5MonoKernel,
+        Glm5PackedArtifacts,
+    )
+    from atom.model_ops.monokernel.glm import op as glm_op
+    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    config = glm5_shard_config(4)
+    shape = GlmAgenticShape.for_graph(
+        batch_capacity=20,
+        query_len=5,
+        dcp_size=1,
+        query_replication=False,
+    )
+    plan = agentic_workspace_layout(shape, npes=4, sparse_attention_topk=64)
+
+    class Peer:
+        storage = object()
+        local_address = 17
+        addresses = torch.empty(4, dtype=torch.int64)
+
+        def close(self):
+            raise AssertionError("tile kernels do not own the shared peer buffer")
+
+    workspace = GlmAgenticWorkspace(
+        shape=shape,
+        layout=plan,
+        scratch=torch.empty(plan.scratch["_bytes"], dtype=torch.uint8),
+        peer_buffer=Peer(),
+        step=torch.zeros(1, dtype=torch.int32),
+        hidden_buffers=(
+            torch.empty(100, config.hidden, dtype=torch.bfloat16),
+            torch.empty(100, config.hidden, dtype=torch.bfloat16),
+        ),
+    )
+    tensors = {
+        name: torch.empty(1, dtype=torch.bfloat16)
+        for name in (
+            "g_in",
+            "g_q",
+            "g_kv",
+            "g_post",
+            "w_qkv_a",
+            "w_q_b",
+            "w_uk",
+            "w_uv",
+            "w_o",
+            "w_r",
+            "bias",
+            "w_ug",
+            "s_ug",
+            "w_dn",
+            "s_dn",
+        )
+    }
+    weights = LayerWeights(
+        heads=16,
+        t=tensors,
+        config=config,
+        npes=4,
+        physical_experts=257,
+    )
+    packed_tensors = {
+        "packed_probe": torch.empty(3, dtype=torch.uint8),
+        "packed_router": torch.empty(5, dtype=torch.bfloat16),
+    }
+    pack_calls = []
+
+    def pack(*_args, **_kwargs):
+        pack_calls.append(1)
+        return packed_tensors.copy()
+
+    monkeypatch.setattr(glm_op, "pack_layer_weights", pack)
+    monkeypatch.setattr(
+        glm_op, "build_glm5_monokernel", lambda *_args, **_kwargs: object()
+    )
+    monkeypatch.setattr(glm_op.torch.cuda, "current_device", lambda: 0)
+
+    artifacts = Glm5PackedArtifacts.pack(
+        weights,
+        npes=4,
+        attention_weight="fp8_block128",
+        with_indexer=False,
+    )
+    s4 = Glm5MonoKernel(
+        weights,
+        4,
+        npes=4,
+        topk=64,
+        launches_per_step=128,
+        agentic_row_contract=True,
+        workspace=workspace,
+        packed_artifacts=artifacts,
+    )
+    s8 = Glm5MonoKernel(
+        weights,
+        8,
+        npes=4,
+        topk=64,
+        launches_per_step=128,
+        agentic_row_contract=True,
+        workspace=workspace,
+        packed_artifacts=artifacts,
+    )
+
+    assert pack_calls == [1]
+    assert s4.packed_artifacts is artifacts
+    assert s8.packed_artifacts is artifacts
+    assert s4.packed is s8.packed
+    for name, packed in packed_tensors.items():
+        assert s4.packed[name] is packed
+        assert s8.packed[name].data_ptr() == packed.data_ptr()
+    with pytest.raises(TypeError):
+        s4.packed["replacement"] = torch.empty(1)
+    s4.close()
+    assert s8.packed["packed_probe"].data_ptr() == packed_tensors[
+        "packed_probe"
+    ].data_ptr()
+
+
+def test_glm_full_layer_weight_mapping_uses_tp4_geometry(monkeypatch):
+    import torch
+
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    config = module.glm5_shard_config(4)
+    calls = {}
+
+    monkeypatch.setattr(
+        module,
+        "_bf16_vector",
+        lambda _tensor, _name, _size: torch.empty(1, dtype=torch.bfloat16),
+    )
+    monkeypatch.setattr(
+        module,
+        "_mxfp4_expert_tensors",
+        lambda *_args: {
+            name: torch.empty(1, dtype=torch.uint8)
+            for name in ("w_ug", "s_ug", "w_dn", "s_dn")
+        },
+    )
+
+    def linear(_linear, *, name, logical_rows, logical_cols, **_kwargs):
+        calls[name] = (logical_rows, logical_cols)
+        if name == "kv_b_proj":
+            return torch.empty(logical_rows, logical_cols, dtype=torch.bfloat16)
+        return torch.empty(1, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(module, "linear_bf16", linear)
+    norm = SimpleNamespace(eps=module.EPS, weight=torch.empty(1))
+    experts = SimpleNamespace(
+        global_num_experts=config.n_experts,
+        num_fused_shared_experts=config.num_shared_experts,
+        use_ep=False,
+        quant_method=SimpleNamespace(is_guinterleave=False),
+        intermediate_size_per_partition=config.inter,
+    )
+    gate = SimpleNamespace(
+        e_score_correction_bias=torch.zeros(config.n_experts, dtype=torch.float32)
+    )
+    attention = SimpleNamespace(
+        q_a_layernorm=norm,
+        kv_a_layernorm=norm,
+        kv_b_proj=object(),
+        fused_qkv_a_proj=object(),
+        q_b_proj=object(),
+        o_proj=object(),
+    )
+    layer = SimpleNamespace(
+        input_layernorm=norm,
+        post_attention_layernorm=norm,
+        self_attn=attention,
+        mlp=SimpleNamespace(experts=experts, gate=gate),
+    )
+
+    weights = module._layer_weights(layer, rank=0, npes=4)
+
+    assert weights.config == config
+    assert weights.heads == 16
+    assert weights.physical_experts == 257
+    assert calls["q_b_proj"][0] == 16 * (config.nope_dim + config.pe_dim)
+    assert calls["o_proj"][1] == 16 * config.v_dim
+
+
 def test_glm_flat_atom_cache_requires_page_one():
     from atom.model_ops.monokernel.dispatch import is_flat_atom_cache_page_size
 
@@ -705,6 +1132,24 @@ def test_glm_non_owner_row_attends_without_writing_cache():
         "safe_row": 17,
         "write_cache": False,
     }
+
+
+def test_glm_device_local_sparse_activity_requires_a_nonempty_row():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "glm"
+        / "kernel.py"
+    ).read_text()
+    predicate = source[
+        source.index("        def row_local_sparse_active(") : source.index(
+            "        def row_position("
+        )
+    ]
+
+    assert "return row_active(s) & (count > 0) & (end > begin)" in predicate
 
 
 def test_glm_empty_sparse_merge_avoids_divide_by_zero():
