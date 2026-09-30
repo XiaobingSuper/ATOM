@@ -272,15 +272,18 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
             block_tables=block_tables,
             context_lens=context_lens,
         )
-        # One host call enqueues one FULL launch and one SHARED launch. There is
-        # no host synchronization between layers; the publication is device
-        # ordered and the model-call step advances once after both launches.
+        # Start rank 0 late so faster ranks can enter SHARED while rank 0 may
+        # still be consuming FULL's TP slot. There is no inter-layer host sync.
+        if rank == 0:
+            torch.cuda._sleep(5_000_000)
         eager_out = bucket(**launch)
         torch.cuda.synchronize(device)
         assert workspace.step.item() == 1
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
+            if rank == 0:
+                torch.cuda._sleep(5_000_000)
             graph_out = bucket(**launch)
         graph.replay()
         torch.cuda.synchronize(device)

@@ -1863,10 +1863,7 @@ def test_per_layer_mailboxes_alternate_between_decode_steps():
     assert sources["symmetric"].count("slot = step_value & 1") == 3
     assert "slot = step_value & 1" in sources["tail"]
     assert "slot = step_value & 1" in sources["k3"]
-    assert (
-        "peer_slot = (step_value * TILE_COUNT + row_tile) & 1"
-        in sources["glm"]
-    )
+    assert "peer_slot = tile_epoch & 1" in sources["glm"]
     assert "slot = step_value & 1" in sources["gemm"]
     for source in sources.values():
         assert "(step_value * LAYER_SLOTS + layer) & 1" not in source

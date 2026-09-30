@@ -230,6 +230,9 @@ def build_glm5_monokernel(
     H = heads
     W = npes
     G = BLOCKS
+    assert ROW_CAPACITY == S or G == 256, (
+        "persistent row tiling requires the 256-CTA co-resident grid"
+    )
     SC, SY = layout(
         S,
         H,
@@ -436,7 +439,7 @@ def build_glm5_monokernel(
             row_base = fx.Int32(row_tile * S)
             tile_epoch = (step_value * LAYER_SLOTS + layer) * TILE_COUNT + row_tile
             tag = tile_epoch + 1
-            peer_slot = (step_value * TILE_COUNT + row_tile) & 1
+            peer_slot = tile_epoch & 1
 
             # ------------------------------------------------------------ helpers
             def ld_f32(r, i):
@@ -1072,24 +1075,31 @@ def build_glm5_monokernel(
                 if tid == 0:
                     put(mb("grid_arrivals"), bid, fx.Int32(1))
                 gpu.barrier()
-                if bid == 0:
-                    if tid < G:
-                        get(mb("grid_arrivals"), tid)
-                    gpu.barrier()
-                    if tid == 0:
-                        fx.memory_fence(
-                            ordering=fx.AtomicOrdering.Acquire,
-                            syncscope="agent",
-                        )
-                        put(mb("grid_release"), 0, fx.Int32(1))
+                if (bid == 0) & (tid == 0):
+                    poll(
+                        [
+                            (mb("grid_arrivals"), arrival, 1)
+                            for arrival in range(G)
+                        ]
+                    )
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Acquire,
+                        syncscope="agent",
+                    )
+                    fx.memory_fence(
+                        ordering=fx.AtomicOrdering.Release,
+                        syncscope="agent",
+                    )
+                    put(mb("grid_release"), 0, fx.Int32(1))
                 else:
-                    if tid == 0:
+                    if (bid != 0) & (tid == 0):
                         get(mb("grid_release"), 0)
                 gpu.barrier()
                 fx.memory_fence(
                     ordering=fx.AtomicOrdering.Acquire,
                     syncscope="agent",
                 )
+                gpu.barrier()
 
             def global_row(s):
                 return row_base + fx.Int32(s)
