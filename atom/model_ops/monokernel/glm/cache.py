@@ -16,6 +16,9 @@ MAIN_CACHE_ROW_BYTES = 576
 INDEX_KEY_BYTES = 128
 INDEX_CACHE_ROW_BYTES = 144
 INDEX_SCALE_OFFSET = INDEX_KEY_BYTES
+INDEX_CACHE_BLOCK_TOKENS = 16
+INDEX_CACHE_BLOCK_BYTES = INDEX_CACHE_BLOCK_TOKENS * INDEX_CACHE_ROW_BYTES
+INDEX_CACHE_KEYS_BYTES = INDEX_CACHE_BLOCK_TOKENS * INDEX_KEY_BYTES
 
 
 @dataclass(frozen=True)
@@ -131,16 +134,16 @@ def validate_fp8_paged_cache(
     if fnuz is not None and main_cache.dtype is fnuz:
         raise ValueError("E4M3FNUZ main caches are unsupported on the MI355 path")
     if (
-        main_cache.ndim < 2
-        or main_cache.shape[-1] != MAIN_CACHE_ROW_BYTES
+        main_cache.ndim != 3
+        or main_cache.shape[1:] != (PHYSICAL_PAGE_SIZE, MAIN_CACHE_ROW_BYTES)
         or not main_cache.is_contiguous()
         or main_cache.dtype is not torch.float8_e4m3fn
     ):
         raise ValueError(
-            "main FP8 cache must be contiguous E4M3FN with 576-element rows, "
+            "main FP8 cache must be contiguous token-major E4M3FN [slots,1,576], "
             f"got {tuple(main_cache.shape)} {main_cache.dtype}"
         )
-    slots = main_cache.numel() // MAIN_CACHE_ROW_BYTES
+    slots = main_cache.shape[0]
     if (
         main_scale.dtype is not torch.float32
         or not main_scale.is_contiguous()
@@ -150,19 +153,69 @@ def validate_fp8_paged_cache(
     if with_indexer:
         if index_cache is None:
             raise ValueError("FP8 indexed cache requires index_cache")
-        if (
-            index_cache.ndim < 2
-            or index_cache.shape[-1] != INDEX_CACHE_ROW_BYTES
-            or not index_cache.is_contiguous()
-            or index_cache.dtype is not torch.uint8
-        ):
-            raise ValueError(
-                "index FP8 cache must be contiguous byte storage with "
-                f"144-byte rows, got {tuple(index_cache.shape)} {index_cache.dtype}"
-            )
-        if index_cache.numel() // INDEX_CACHE_ROW_BYTES != slots:
-            raise ValueError("main and index FP8 caches must have equal slot capacity")
+        _validate_index_cache(index_cache, slots)
     return slots
+
+
+def _validate_index_cache(index_cache: torch.Tensor, slots: int) -> None:
+    if (
+        index_cache.ndim != 3
+        or index_cache.shape[1:]
+        != (INDEX_CACHE_BLOCK_TOKENS, INDEX_CACHE_ROW_BYTES)
+        or not index_cache.is_contiguous()
+        or index_cache.dtype is not torch.float8_e4m3fn
+    ):
+        raise ValueError(
+            "index FP8 cache must be contiguous block-major E4M3FN "
+            f"[blocks,16,144], got {tuple(index_cache.shape)} {index_cache.dtype}"
+        )
+    if index_cache.shape[0] * INDEX_CACHE_BLOCK_TOKENS != slots:
+        raise ValueError("main and index FP8 caches must have equal slot capacity")
+
+
+def index_cache_key_byte_offset(slot: int, dim: int) -> int:
+    """Address one preshuffled index-key byte in block16 production storage."""
+
+    if slot < 0:
+        raise ValueError(f"physical slot must be non-negative, got {slot}")
+    if not 0 <= dim < INDEX_KEY_BYTES:
+        raise ValueError(f"index dimension must be in [0,128), got {dim}")
+    block, token = divmod(slot, INDEX_CACHE_BLOCK_TOKENS)
+    return (
+        block * INDEX_CACHE_BLOCK_BYTES
+        + (dim // 16) * 256
+        + token * 16
+        + dim % 16
+    )
+
+
+def index_cache_scale_byte_offset(slot: int) -> int:
+    """Address one embedded FP32 row scale in block16 production storage."""
+
+    if slot < 0:
+        raise ValueError(f"physical slot must be non-negative, got {slot}")
+    block, token = divmod(slot, INDEX_CACHE_BLOCK_TOKENS)
+    return block * INDEX_CACHE_BLOCK_BYTES + INDEX_CACHE_KEYS_BYTES + token * 4
+
+
+def read_fp8_index_cache_row(
+    index_cache: torch.Tensor,
+    *,
+    slot: int,
+) -> torch.Tensor:
+    """Pure reference dequantization of one preshuffled physical index row."""
+
+    blocks = index_cache.shape[0] if index_cache.ndim else 0
+    _validate_index_cache(index_cache, blocks * INDEX_CACHE_BLOCK_TOKENS)
+    if slot >= blocks * INDEX_CACHE_BLOCK_TOKENS:
+        raise ValueError("physical slot exceeds index-cache capacity")
+    storage = index_cache.view(torch.uint8).reshape(-1)
+    key = torch.stack(
+        [storage[index_cache_key_byte_offset(slot, dim)] for dim in range(128)]
+    ).view(torch.float8_e4m3fn)
+    scale_at = index_cache_scale_byte_offset(slot)
+    scale = storage[scale_at : scale_at + 4].clone().view(torch.float32)[0]
+    return key.float() * scale
 
 
 def _quantize_row(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -219,13 +272,11 @@ def publish_fp8_cache_rows(
         if index_bf16.numel() != INDEX_KEY_BYTES:
             raise ValueError("index BF16 source must contain 128 values")
         index_q, index_s = _quantize_row(index_bf16.reshape(-1))
-        row = index_cache.view(torch.uint8).view(slots, INDEX_CACHE_ROW_BYTES)[
-            slot
-        ]
-        row[:INDEX_KEY_BYTES].copy_(index_q)
-        row[INDEX_SCALE_OFFSET : INDEX_SCALE_OFFSET + 4].copy_(
-            index_s.reshape(1).view(torch.uint8)
-        )
+        storage = index_cache.view(torch.uint8).reshape(-1)
+        for dim in range(INDEX_KEY_BYTES):
+            storage[index_cache_key_byte_offset(slot, dim)] = index_q[dim]
+        scale_at = index_cache_scale_byte_offset(slot)
+        storage[scale_at : scale_at + 4].copy_(index_s.reshape(1).view(torch.uint8))
     return True
 
 
@@ -327,6 +378,9 @@ __all__ = [
     "Fp8CacheRowPolicy",
     "Fp8CacheWorkPolicy",
     "INDEX_CACHE_ROW_BYTES",
+    "INDEX_CACHE_BLOCK_BYTES",
+    "INDEX_CACHE_BLOCK_TOKENS",
+    "INDEX_CACHE_KEYS_BYTES",
     "INDEX_KEY_BYTES",
     "INDEX_SCALE_OFFSET",
     "MAIN_CACHE_ROW_BYTES",
@@ -336,8 +390,11 @@ __all__ = [
     "fp8_cache_work_policy",
     "fp8_paged_sparse_attention_reference",
     "logical_to_physical_slot",
+    "index_cache_key_byte_offset",
+    "index_cache_scale_byte_offset",
     "physical_cache_slot",
     "publish_fp8_cache_rows",
+    "read_fp8_index_cache_row",
     "validate_fp8_paged_cache",
     "visible_context_length",
     "visible_physical_slots",

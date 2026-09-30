@@ -34,13 +34,14 @@ class GlmAgenticWorkspace:
     shape: GlmAgenticShape
     layout: GlmAgenticWorkspaceLayout
     scratch: torch.Tensor
-    peer_buffer: object
+    peer_buffer: object | None
     step: torch.Tensor
     hidden_buffers: tuple[torch.Tensor, torch.Tensor] | None = None
     runtime: GlmAgenticRuntime | None = None
     selected_slots: torch.Tensor | None = None
     selected_counts: torch.Tensor | None = None
     selected_indptr: torch.Tensor | None = None
+    owned_counts: torch.Tensor | None = None
 
     def __post_init__(self) -> None:
         if self.layout.config != self.shape.config:
@@ -75,13 +76,11 @@ class GlmAgenticWorkspace:
                     )
 
     @classmethod
-    def allocate(
+    def allocate_local(
         cls,
         shape: GlmAgenticShape,
         *,
-        rank: int,
         npes: int,
-        group,
         sparse_attention_topk: int,
         with_indexer: bool = False,
         index_max_seq: int = 4096,
@@ -99,12 +98,6 @@ class GlmAgenticWorkspace:
             dtype=torch.uint8,
             device=device,
         )
-        peers = SymmetricPeerBuffer(
-            layout.symmetric["_bytes"],
-            rank=rank,
-            npes=npes,
-            group=group,
-        )
         step = torch.zeros(1, dtype=torch.int32, device=device)
         hidden_buffers = tuple(
             torch.empty(
@@ -115,14 +108,73 @@ class GlmAgenticWorkspace:
             )
             for _ in range(2)
         )
+        owned_counts = torch.empty(
+            shape.common.row_capacity,
+            dtype=torch.int32,
+            device=device,
+        )
         return cls(
             shape,
             layout,
             scratch,
-            peers,
+            None,
             step,
             hidden_buffers=hidden_buffers,
+            owned_counts=owned_counts,
         )
+
+    @classmethod
+    def allocate(
+        cls,
+        shape: GlmAgenticShape,
+        *,
+        rank: int,
+        npes: int,
+        group,
+        sparse_attention_topk: int,
+        with_indexer: bool = False,
+        index_max_seq: int = 4096,
+    ) -> "GlmAgenticWorkspace":
+        workspace = cls.allocate_local(
+            shape,
+            npes=npes,
+            sparse_attention_topk=sparse_attention_topk,
+            with_indexer=with_indexer,
+            index_max_seq=index_max_seq,
+        )
+        workspace.initialize_collective(rank=rank, npes=npes, group=group)
+        return workspace
+
+    def initialize_collective(self, *, rank: int, npes: int, group) -> None:
+        """Attach symmetric storage after all ranks finish local allocation."""
+
+        if self.peer_buffer is not None:
+            raise ValueError("workspace symmetric storage is already initialized")
+        self.peer_buffer = SymmetricPeerBuffer(
+            self.layout.symmetric["_bytes"],
+            rank=rank,
+            npes=npes,
+            group=group,
+        )
+
+    def publish_owned_counts(self, sparse_indptr: torch.Tensor) -> torch.Tensor:
+        """Publish graph-stable per-row counts without allocating."""
+
+        rows = self.shape.common.row_capacity
+        if (
+            sparse_indptr.dtype is not torch.int32
+            or not sparse_indptr.is_contiguous()
+            or sparse_indptr.numel() < rows + 1
+        ):
+            raise ValueError("sparse indptr must cover the workspace row capacity")
+        if self.owned_counts is None:
+            raise ValueError("workspace has no owned-count publication buffer")
+        torch.sub(
+            sparse_indptr[1 : rows + 1],
+            sparse_indptr[:rows],
+            out=self.owned_counts,
+        )
+        return self.owned_counts
 
     def ensure_index_share(self, topk: int) -> None:
         """Allocate graph-stable full→shared selection storage once."""
@@ -183,6 +235,7 @@ class GlmAgenticWorkspace:
         close = getattr(self.peer_buffer, "close", None)
         if close is not None:
             close()
+        self.peer_buffer = None
 
 
 __all__ = ["GlmAgenticLayerBinding", "GlmAgenticWorkspace"]

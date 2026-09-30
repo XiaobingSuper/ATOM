@@ -10,6 +10,7 @@ from dataclasses import dataclass
 import torch
 
 from atom.model_ops.monokernel.config import (
+    FP8_MAX,
     GLM5_CONFIG,
     LayerConfig,
     Mxfp4ScaleLayout,
@@ -190,6 +191,93 @@ def linear_bf16(
     return result
 
 
+def quantize_fp8_blocks(
+    weight: torch.Tensor,
+    *,
+    block_k: int = 128,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert one logical matrix to E4M3FN with 128x``block_k`` descales."""
+
+    rows, cols = weight.shape
+    _need(block_k in (64, 128), f"unsupported FP8 K block {block_k}")
+    _need(
+        cols % block_k == 0,
+        f"FP8 block128x{block_k} K={cols} must be divisible by {block_k}",
+    )
+    row_blocks = (rows + 127) // 128
+    padded = torch.zeros(
+        row_blocks * 128,
+        cols,
+        dtype=torch.float32,
+        device=weight.device,
+    )
+    padded[:rows].copy_(weight.float())
+    blocks = padded.view(row_blocks, 128, cols // block_k, block_k)
+    scale = blocks.abs().amax(dim=(1, 3))
+    scale = torch.where(scale > 0, scale / FP8_MAX, torch.ones_like(scale))
+    quantized = (
+        (blocks / scale[:, None, :, None])
+        .clamp(-FP8_MAX, FP8_MAX)
+        .to(torch.float8_e4m3fn)
+        .view(row_blocks * 128, cols)[:rows]
+        .contiguous()
+    )
+    return quantized, scale.contiguous()
+
+
+def quantize_fp8_block128(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert one logical matrix to E4M3FN with FP32 128x128 descales."""
+
+    return quantize_fp8_blocks(weight)
+
+
+def linear_fp8_block128(
+    linear,
+    *,
+    name: str,
+    logical_rows: int,
+    logical_cols: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return row-major E4M3FN weights and true FP32 block descales.
+
+    Existing per-1x128 storage is preserved after undoing ATOM's preshuffle.
+    PTPC/per-channel storage is explicitly dequantized and requantized because
+    its row scale cannot be reinterpreted as a 128x128 block scale.
+    """
+
+    quant_name = getattr(getattr(linear, "quant_type", None), "name", None)
+    weight = linear.weight
+    if quant_name == "per_1x128":
+        _need(
+            weight.dtype is torch.float8_e4m3fn,
+            f"{name} must use E4M3FN, got {weight.dtype}",
+        )
+        _need(
+            weight.shape == (logical_rows, logical_cols),
+            f"{name} shape {tuple(weight.shape)}",
+        )
+        scale = getattr(linear, "weight_scale", None)
+        expected = ((logical_rows + 127) // 128, logical_cols // 128)
+        _need(
+            scale is not None
+            and scale.dtype is torch.float32
+            and scale.shape == expected,
+            f"{name} block scale must be FP32 {expected}",
+        )
+        return _unshuffle_linear_weight(weight), scale.contiguous()
+    _need(
+        quant_name == "per_Token",
+        f"{name} requires per_1x128 or PTPC FP8 storage, got {quant_name}",
+    )
+    bf16 = linear_bf16(
+        linear,
+        name=name,
+        logical_rows=logical_rows,
+        logical_cols=logical_cols,
+    )
+    return quantize_fp8_block128(bf16)
+
+
 @dataclass
 class LayerWeights:
     """One tensor-parallel rank's weights and model geometry."""
@@ -291,5 +379,7 @@ __all__ = [
     "LayerWeights",
     "atom_mxfp4_storage_view",
     "linear_bf16",
+    "linear_fp8_block128",
+    "quantize_fp8_block128",
     "prepare_mxfp4_expert_storage",
 ]

@@ -39,7 +39,22 @@ INDEX_DIM = 128
 INDEX_Q_ROWS = INDEX_HEADS * INDEX_DIM
 INDEX_TILE = 16
 INDEX_KEYS_PER_TASK = 64
+INDEX_MAX_LOGICAL_CONTEXT = 1 << 20
 INDEX_RADIX_WORDS = 264
+
+
+def index_scan_tiles(bound: int, index_max_seq: int) -> int:
+    """Reference runtime score-tile count under the compile-time safety cap."""
+
+    if not 0 <= bound <= index_max_seq:
+        raise ValueError(f"context bound {bound} exceeds index cap {index_max_seq}")
+    if (
+        index_max_seq <= 0
+        or index_max_seq > INDEX_MAX_LOGICAL_CONTEXT
+        or index_max_seq % INDEX_KEYS_PER_TASK
+    ):
+        raise ValueError("index context cap is unsupported or unaligned")
+    return (bound + INDEX_KEYS_PER_TASK - 1) // INDEX_KEYS_PER_TASK
 
 
 def index_selection_lds_regions(

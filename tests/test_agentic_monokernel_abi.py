@@ -172,15 +172,17 @@ def test_glm_fp8_cache_publishes_exact_main_and_index_bytes():
         INDEX_CACHE_ROW_BYTES,
         INDEX_KEY_BYTES,
         MAIN_CACHE_ROW_BYTES,
+        index_cache_key_byte_offset,
+        index_cache_scale_byte_offset,
         publish_fp8_cache_rows,
+        read_fp8_index_cache_row,
     )
 
-    main = torch.zeros(
-        (2, 16, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn
-    )
+    main = torch.zeros((32, 1, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn)
     main_scale = torch.tensor([0.125], dtype=torch.float32)
     scale_before = main_scale.clone()
-    index = torch.full((2, 16, INDEX_CACHE_ROW_BYTES), 0x5A, dtype=torch.uint8)
+    index = torch.empty(2, 16, INDEX_CACHE_ROW_BYTES, dtype=torch.float8_e4m3fn)
+    index.view(torch.uint8).fill_(0x5A)
     main_row = torch.linspace(-8.0, 8.0, MAIN_CACHE_ROW_BYTES)
     index_row = torch.linspace(-2.0, 3.0, INDEX_KEY_BYTES)
 
@@ -215,17 +217,101 @@ def test_glm_fp8_cache_publishes_exact_main_and_index_bytes():
         expected_main,
     )
     assert torch.equal(main_scale, scale_before)
-    index_flat = index.view(-1, INDEX_CACHE_ROW_BYTES)[16]
-    assert torch.equal(index_flat[:INDEX_KEY_BYTES], expected_index)
+    index_flat = index.view(torch.uint8).reshape(-1)
+    for dim in range(INDEX_KEY_BYTES):
+        assert (
+            index_flat[index_cache_key_byte_offset(16, dim)] == expected_index[dim]
+        )
+    scale_at = index_cache_scale_byte_offset(16)
     assert (
-        index_flat[INDEX_KEY_BYTES : INDEX_KEY_BYTES + 4]
+        index_flat[scale_at : scale_at + 4]
         .clone()
         .view(torch.float32)
         .item()
         == pytest.approx(expected_index_scale.item())
     )
-    assert torch.all(index_flat[INDEX_KEY_BYTES + 4 :] == 0x5A)
+    torch.testing.assert_close(
+        read_fp8_index_cache_row(index, slot=16),
+        expected_index.view(torch.float8_e4m3fn).float() * expected_index_scale,
+        atol=0,
+        rtol=0,
+    )
     assert torch.all(main.view(torch.uint8)[0] == 0)
+
+
+def test_glm_index_cache_preshuffle_roundtrip_across_fragmented_blocks():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.cache import (
+        INDEX_CACHE_BLOCK_BYTES,
+        INDEX_KEY_BYTES,
+        MAIN_CACHE_ROW_BYTES,
+        index_cache_key_byte_offset,
+        index_cache_scale_byte_offset,
+        publish_fp8_cache_rows,
+        read_fp8_index_cache_row,
+    )
+
+    main = torch.zeros(48, 1, MAIN_CACHE_ROW_BYTES, dtype=torch.float8_e4m3fn)
+    main_scale = torch.ones(1, dtype=torch.float32)
+    index = torch.empty(3, 16, 144, dtype=torch.float8_e4m3fn)
+    index.view(torch.uint8).fill_(0xA5)
+    rows = {
+        1: torch.linspace(-1.0, 2.0, INDEX_KEY_BYTES),
+        17: torch.linspace(3.0, -2.0, INDEX_KEY_BYTES),
+        31: torch.arange(INDEX_KEY_BYTES, dtype=torch.float32).remainder(19) - 9,
+    }
+
+    for slot, values in rows.items():
+        assert publish_fp8_cache_rows(
+            main,
+            main_scale,
+            index,
+            slot=slot,
+            batch_id=0,
+            main_bf16=torch.zeros(MAIN_CACHE_ROW_BYTES, dtype=torch.bfloat16),
+            index_bf16=values.to(torch.bfloat16),
+        )
+
+    storage = index.view(torch.uint8).reshape(-1)
+    assert index_cache_key_byte_offset(17, 0) == INDEX_CACHE_BLOCK_BYTES + 16
+    assert index_cache_key_byte_offset(17, 16) == INDEX_CACHE_BLOCK_BYTES + 272
+    assert index_cache_key_byte_offset(31, 127) == 2 * INDEX_CACHE_BLOCK_BYTES - 257
+    assert index_cache_scale_byte_offset(31) == 2 * INDEX_CACHE_BLOCK_BYTES - 196
+    for slot, values in rows.items():
+        source = values.to(torch.bfloat16).float()
+        scale = source.abs().max() / 448.0
+        expected = (
+            (source / scale)
+            .clamp(-448, 448)
+            .to(torch.float8_e4m3fn)
+            .float()
+            * scale
+        )
+        torch.testing.assert_close(
+            read_fp8_index_cache_row(index, slot=slot),
+            expected,
+            atol=0,
+            rtol=0,
+        )
+        key_offsets = {
+            index_cache_key_byte_offset(slot, dim) for dim in range(INDEX_KEY_BYTES)
+        }
+        assert len(key_offsets) == INDEX_KEY_BYTES
+        assert not any(
+            index_cache_scale_byte_offset(slot) + byte in key_offsets
+            for byte in range(4)
+        )
+    # Untouched token 0 key and scale bytes remain the sentinel.
+    assert all(
+        storage[index_cache_key_byte_offset(0, dim)] == 0xA5
+        for dim in range(INDEX_KEY_BYTES)
+    )
+    assert torch.all(
+        storage[
+            index_cache_scale_byte_offset(0) : index_cache_scale_byte_offset(0) + 4
+        ]
+        == 0xA5
+    )
 
 
 @pytest.mark.parametrize(
@@ -246,11 +332,10 @@ def test_glm_fp8_cache_query_and_publication_ownership(
         publish_fp8_cache_rows,
     )
 
-    main = torch.zeros(
-        (32, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn
-    )
+    main = torch.zeros((32, 1, MAIN_CACHE_ROW_BYTES), dtype=torch.float8_e4m3fn)
     scale = torch.tensor([0.25], dtype=torch.float32)
-    index = torch.full((32, INDEX_CACHE_ROW_BYTES), 9, dtype=torch.uint8)
+    index = torch.empty(2, 16, INDEX_CACHE_ROW_BYTES, dtype=torch.float8_e4m3fn)
+    index.view(torch.uint8).fill_(9)
     before = (main.clone(), scale.clone(), index.clone())
     policy = fp8_cache_row_policy(batch_id=batch_id, slot=slot)
     published = publish_fp8_cache_rows(
@@ -276,11 +361,11 @@ def test_glm_fp8_cache_validates_physical_storage():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.glm.cache import validate_fp8_paged_cache
 
-    main = torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn)
+    main = torch.empty(48, 1, 576, dtype=torch.float8_e4m3fn)
     scale = torch.empty(1, dtype=torch.float32)
-    index = torch.empty(2, 16, 144, dtype=torch.uint8)
+    index = torch.empty(3, 16, 144, dtype=torch.float8_e4m3fn)
 
-    assert validate_fp8_paged_cache(main, scale, index, with_indexer=True) == 32
+    assert validate_fp8_paged_cache(main, scale, index, with_indexer=True) == 48
     with pytest.raises(ValueError, match="576"):
         validate_fp8_paged_cache(main[..., :-1], scale, index, with_indexer=True)
     with pytest.raises(ValueError, match="FP32"):
@@ -538,6 +623,76 @@ def test_glm_agentic_workspace_is_shared_by_layer_bindings():
         workspace.layer(128)
 
 
+def test_glm_workspace_defers_symmetric_collective_until_explicit_init(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
+    from atom.model_ops.monokernel.glm import workspace as workspace_module
+
+    shape = GlmAgenticShape.for_graph(
+        batch_capacity=1,
+        query_len=5,
+        dcp_size=1,
+        query_replication=False,
+    )
+    plan = agentic_workspace_layout(shape, npes=4, sparse_attention_topk=8)
+    workspace = workspace_module.GlmAgenticWorkspace(
+        shape,
+        plan,
+        torch.empty(plan.scratch["_bytes"], dtype=torch.uint8),
+        None,
+        torch.zeros(1, dtype=torch.int32),
+    )
+    calls = []
+
+    class Peer:
+        def __init__(self, size, **kwargs):
+            calls.append((size, kwargs))
+
+    monkeypatch.setattr(workspace_module, "SymmetricPeerBuffer", Peer)
+    assert workspace.peer_buffer is None
+    assert calls == []
+    workspace.initialize_collective(rank=2, npes=4, group="tp")
+    assert calls == [
+        (plan.symmetric["_bytes"], {"rank": 2, "npes": 4, "group": "tp"})
+    ]
+    with pytest.raises(ValueError, match="already initialized"):
+        workspace.initialize_collective(rank=2, npes=4, group="tp")
+
+
+def test_glm_workspace_publishes_owned_counts_without_reallocation():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
+    from atom.model_ops.monokernel.glm.layout import agentic_workspace_layout
+    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
+
+    shape = GlmAgenticShape.for_graph(
+        batch_capacity=2,
+        query_len=6,
+        dcp_size=1,
+        query_replication=False,
+    )
+    plan = agentic_workspace_layout(shape, npes=4, sparse_attention_topk=8)
+    counts = torch.empty(12, dtype=torch.int32)
+    workspace = GlmAgenticWorkspace(
+        shape,
+        plan,
+        torch.empty(plan.scratch["_bytes"], dtype=torch.uint8),
+        SimpleNamespace(),
+        torch.zeros(1, dtype=torch.int32),
+        owned_counts=counts,
+    )
+    indptr = torch.tensor(
+        [0, 3, 5, 5, 9, 10, 10, 14, 15, 18, 18, 18, 18],
+        dtype=torch.int32,
+    )
+
+    published = workspace.publish_owned_counts(indptr)
+
+    assert published.data_ptr() == counts.data_ptr()
+    assert published.tolist() == [3, 2, 0, 4, 1, 0, 4, 1, 3, 0, 0, 0]
+
+
 def test_glm_graph_bucket_launches_each_layer_once_and_advances_one_step():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
@@ -774,12 +929,12 @@ def test_glm_graph_layer_spec_validates_fp8_physical_cache():
     )
 
     args = GlmAgenticLayerInputs(
-        kv_cache=torch.empty(1, 16, 576, dtype=torch.float8_e4m3fn),
+        kv_cache=torch.empty(16, 1, 576, dtype=torch.float8_e4m3fn),
         pe_cache=None,
         indices=torch.empty(1, dtype=torch.int32),
         cos=torch.empty(1),
         sin=torch.empty(1),
-        index_cache=torch.empty(1, 16, 144, dtype=torch.uint8),
+        index_cache=torch.empty(1, 16, 144, dtype=torch.float8_e4m3fn),
         kv_cache_scale=torch.empty(1, dtype=torch.float32),
     )
     spec = GlmAgenticLayerSpec(
@@ -790,6 +945,22 @@ def test_glm_graph_layer_spec_validates_fp8_physical_cache():
     )
 
     assert spec.validate_cache_inputs() == 16
+    flat = GlmAgenticLayerSpec(
+        object(),
+        GlmAgenticLayerInputs(
+            args.kv_cache.view(16, 576),
+            None,
+            args.indices,
+            args.cos,
+            args.sin,
+            index_cache=args.index_cache,
+            kv_cache_scale=args.kv_cache_scale,
+        ),
+        with_indexer=True,
+        kv_cache_layout=KvCacheLayout.ATOM_FP8,
+    )
+    with pytest.raises(ValueError, match="token-major"):
+        flat.validate_cache_inputs()
     missing_scale = GlmAgenticLayerSpec(
         object(),
         GlmAgenticLayerInputs(
@@ -839,6 +1010,26 @@ def test_glm_indexshare_device_publication_uses_index_cache_pointer():
 
     assert "r_index_cache = _rsrc(index_cache)" in publication
     assert "r_index_cache = _rsrc(indices)" not in publication
+
+
+def test_glm_index_cache_device_uses_block16_preshuffle_addressing():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1] / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    publication = source[source.index("# Index keys use LayerNorm") :]
+    publication = publication[: publication.index('stamp("cache", t, 4)')]
+    scoring = source[source.index("def score_key(tile):") :]
+    scoring = scoring[: scoring.index("if use_new:")]
+
+    for section in (publication, scoring):
+        assert "* 2304" in section
+        assert "* 256" in section
+        assert "% 16" in section
+        assert "+ 2048" in section
+    assert "slot * 144" not in publication
+    assert "physical_key * 144" not in scoring
 
 
 def test_glm_indexshare_split_acquires_before_compact_metadata_load():
@@ -958,12 +1149,47 @@ def test_glm_indexshare_workspace_is_bounded_at_one_million_context():
         4,
         2048,
         with_indexer=True,
-        index_max_seq=1_000_000,
+        index_max_seq=1 << 20,
         model_config=config,
     )
 
     assert million["_bytes"] == small["_bytes"]
     assert "index_scores" not in million
+
+
+def test_glm_index_scan_uses_runtime_context_not_physical_capacity():
+    from atom.model_ops.monokernel.glm.layout import index_scan_tiles
+
+    cap = 1 << 20
+    assert [index_scan_tiles(bound, cap) for bound in (0, 1, 63, 64, 65, 2048)] == [
+        0,
+        1,
+        1,
+        1,
+        2,
+        32,
+    ]
+    assert index_scan_tiles(cap, cap) == 16_384
+    with pytest.raises(ValueError, match="exceeds"):
+        index_scan_tiles(cap + 1, cap)
+    with pytest.raises(ValueError, match="unaligned"):
+        index_scan_tiles(64, cap - 1)
+
+
+def test_glm_index_device_radix_passes_use_runtime_scan_tiles():
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parents[1] / "atom/model_ops/monokernel/glm/kernel.py"
+    ).read_text()
+    selection = source[source.index("# ====================== 4b.") :]
+    selection = selection[: selection.index('stamp("index_select", s, 4)')]
+
+    assert "N_INDEX_SPLIT" not in selection
+    assert selection.count("for tile in range(") == 3
+    assert selection.count("// INDEX_KEYS_PER_TASK") >= 3
+    assert "context_bound <= index_max_seq" in selection
+    assert "mapped_key < cache_slots" in selection
 
 
 def test_glm_indexshare_mtp_visibility_padding_and_zero_owned_rows():
@@ -1031,9 +1257,14 @@ def test_glm_indexshare_plan_requires_full_before_three_shared():
     assert plan.source_layers == (0, 0, 0, 0, 4)
     with pytest.raises(ValueError, match="precede"):
         GlmIndexSharePlan.from_runtime_pattern(("S", "F"))
+    external = GlmIndexSharePlan.from_runtime_pattern(
+        ("S", "S", "S", "F", "S"),
+        allow_external_prefix=True,
+    )
+    assert external.source_layers == (-1, -1, -1, 3, 3)
 
 
-def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
+def test_glm_indexshare_external_prefix_switches_to_canonical_at_first_full():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.glm.abi import GlmAgenticShape
     from atom.model_ops.monokernel.glm.graph import (
@@ -1097,8 +1328,20 @@ def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
             x_out.copy_(h)
             return x_out
 
-    args = GlmAgenticLayerInputs(*(torch.empty(1) for _ in range(5)))
-    modes = (GlmIndexShareMode.FULL,) + (GlmIndexShareMode.SHARED,) * 3
+    external_indices = torch.tensor(
+        [7, 8, 9, 10] * 4, dtype=torch.int32
+    )
+    args = GlmAgenticLayerInputs(
+        torch.empty(1),
+        torch.empty(1),
+        external_indices,
+        torch.empty(1),
+        torch.empty(1),
+    )
+    modes = (GlmIndexShareMode.SHARED,) * 3 + (
+        GlmIndexShareMode.FULL,
+        GlmIndexShareMode.SHARED,
+    )
     layers = tuple(
         GlmAgenticLayer(
             slot,
@@ -1115,7 +1358,7 @@ def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
         torch.zeros(rows, shape.config.hidden, dtype=torch.bfloat16),
         positions=torch.arange(rows, dtype=torch.int64),
         slot_mapping=torch.arange(rows, dtype=torch.int64),
-        sparse_kv_indptr=torch.zeros(rows + 1, dtype=torch.int32),
+        sparse_kv_indptr=torch.tensor([0, 1, 2, 2, 2], dtype=torch.int32),
         batch_ids=torch.tensor([0, 0, -1, -1], dtype=torch.int32),
         owned_counts=torch.tensor([1, 1, 0, 0], dtype=torch.int32),
         block_tables=torch.zeros(1, 1, dtype=torch.int32),
@@ -1123,10 +1366,11 @@ def test_glm_indexshare_full_then_three_shared_reuses_exact_publication():
     )
 
     assert [item[0] for item in observed] == list(modes)
-    assert len({item[1] for item in observed}) == 1
-    assert len({item[2] for item in observed}) == 1
-    assert all(item[3][:5].tolist() == [29, 3, 71, 0, 0] for item in observed)
-    assert all(item[4][:3].tolist() == [0, 3, 5] for item in observed)
+    assert all(item[1] == external_indices.data_ptr() for item in observed[:3])
+    assert len({item[1] for item in observed[3:]}) == 1
+    assert observed[3][1] != external_indices.data_ptr()
+    assert all(item[3][:5].tolist() == [29, 3, 71, 0, 0] for item in observed[3:])
+    assert all(item[4][:3].tolist() == [0, 3, 5] for item in observed[3:])
 
 
 def test_glm_indexshare_attention_uses_counts_and_activity_before_splits():
@@ -1172,8 +1416,8 @@ def test_glm_full_to_shared_fp8_paged_attention_reference():
     )
     from atom.model_ops.monokernel.glm.index_share import stable_physical_topk
 
-    cache = torch.zeros(64, 576, dtype=torch.float8_e4m3fn)
-    cache[48, :512] = 4
+    cache = torch.zeros(64, 1, 576, dtype=torch.float8_e4m3fn)
+    cache[48, 0, :512] = 4
     index_scores = torch.zeros(17, dtype=torch.float32)
     index_scores[16], index_scores[0] = 2, 1
     selected, selected_count = stable_physical_topk(

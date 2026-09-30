@@ -588,6 +588,9 @@ class AttentionMetaData:
     cu_seqlen_ks: torch.Tensor | None = None
     cu_seqlen_ke: torch.Tensor | None = None
     sparse_kv_indptr: torch.Tensor | None = None
+    # Graph-stable DCP1 per-query counts for the GLM full-layer MonoKernel.
+    # Published from sparse_kv_indptr before model execution; padded rows are 0.
+    glm_agentic_owned_counts: torch.Tensor | None = None
     # Last-page lens for sparse (DSA) attention: all 1s, one per query token in
     # prefill/MTP-verify and per seq in decode. Separate from kv_last_page_lens
     # (the dense per-seq buffer) so the two never clobber each other.
@@ -636,6 +639,7 @@ class AttentionMetaData:
         cu_seqlen_ks: torch.Tensor | None = None,
         cu_seqlen_ke: torch.Tensor | None = None,
         sparse_kv_indptr: torch.Tensor | None = None,
+        glm_agentic_owned_counts: torch.Tensor | None = None,
         sparse_kv_last_page_lens: torch.Tensor | None = None,
         dcp_local_context_lens: torch.Tensor | None = None,
         work_meta_data: torch.Tensor | None = None,
@@ -676,6 +680,7 @@ class AttentionMetaData:
         self.cu_seqlen_ks = cu_seqlen_ks
         self.cu_seqlen_ke = cu_seqlen_ke
         self.sparse_kv_indptr = sparse_kv_indptr
+        self.glm_agentic_owned_counts = glm_agentic_owned_counts
         self.sparse_kv_last_page_lens = sparse_kv_last_page_lens
         self.dcp_local_context_lens = dcp_local_context_lens
         self.work_meta_data = work_meta_data

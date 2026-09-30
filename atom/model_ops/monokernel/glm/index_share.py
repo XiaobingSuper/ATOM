@@ -29,6 +29,8 @@ class GlmIndexSharePlan:
     def from_runtime_pattern(
         cls,
         pattern: tuple[str, ...] | list[str],
+        *,
+        allow_external_prefix: bool = False,
     ) -> "GlmIndexSharePlan":
         modes = tuple(
             GlmIndexShareMode.FULL if value.upper() == "F" else
@@ -41,9 +43,9 @@ class GlmIndexSharePlan:
         for layer, mode in enumerate(modes):
             if mode is GlmIndexShareMode.FULL:
                 latest_full = layer
-            elif latest_full is None:
+            elif latest_full is None and not allow_external_prefix:
                 raise ValueError("shared IndexShare layers cannot precede a full layer")
-            source.append(latest_full)
+            source.append(-1 if latest_full is None else latest_full)
         return cls(modes, tuple(source))
 
 

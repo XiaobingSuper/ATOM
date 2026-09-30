@@ -7,6 +7,7 @@ from __future__ import annotations
 
 MODES = ("off", "auto", "mono", "staged")
 SAMPLES = (4, 8)
+GLM52_AGENTIC_ROWS = (5, 6, 10, 12, 20, 24, 40, 48, 60, 72, 80, 96, 100)
 
 
 class MonoUnsupported(Exception):
@@ -86,6 +87,24 @@ def select_backend(
             and cache_layout == "atom"
         ):
             return "staged_moe"
+        return None
+    if model == "glm52" and segment == "agentic_layer":
+        if (
+            mode in ("auto", "mono")
+            and native
+            and decode
+            and samples in GLM52_AGENTIC_ROWS
+            and tp_size == 4
+            and kv_cache_dtype == "fp8"
+            and mtp
+            and not dpa
+            and not dcp
+            and not plugin
+            and has_moe
+            and not external_indexer
+            and cache_layout == "atom_fp8"
+        ):
+            return "agentic_full"
         return None
     if (
         mode == "off"

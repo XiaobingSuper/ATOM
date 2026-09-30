@@ -86,6 +86,8 @@ class GlmAgenticGraphBucket:
     ) -> None:
         if not layers:
             raise ValueError("a GLM graph bucket requires at least one layer")
+        if workspace.peer_buffer is None:
+            raise ValueError("graph bucket requires initialized symmetric storage")
         slots = [layer.slot for layer in layers]
         if len(set(slots)) != len(slots):
             raise ValueError("GLM graph-bucket layer slots must be distinct")
@@ -145,7 +147,8 @@ class GlmAgenticGraphBucket:
                 tuple(
                     "F" if mode is GlmIndexShareMode.FULL else "S"
                     for mode in explicit_modes
-                )
+                ),
+                allow_external_prefix=True,
             )
             workspace.ensure_index_share(topk)
         if kernel_factory is None:
@@ -165,7 +168,7 @@ class GlmAgenticGraphBucket:
         layers = []
         try:
             for slot, spec in enumerate(specs):
-                spec.validate_cache_inputs()
+                cache_slots = spec.validate_cache_inputs()
                 artifacts = artifact_factory(
                     spec.weights,
                     npes=npes,
@@ -185,6 +188,7 @@ class GlmAgenticGraphBucket:
                         with_indexer=spec.with_indexer,
                         index_share=spec.index_share_mode is not None,
                         index_max_seq=spec.index_max_seq,
+                        cache_slots=cache_slots,
                         attention_weight=spec.attention_weight,
                         kv_cache_layout=spec.kv_cache_layout,
                         uv_scale_block_m=spec.uv_scale_block_m,
@@ -259,6 +263,17 @@ class GlmAgenticGraphBucket:
             raise ValueError(
                 "block_tables must be contiguous int32 [batch_capacity, blocks]"
             )
+        logical_caps = [
+            kernel.index_max_seq
+            for layer in self.layers
+            for kernel in layer.kernels.values()
+            if hasattr(kernel, "index_max_seq")
+        ]
+        if logical_caps and block_tables.shape[1] * 16 < max(logical_caps):
+            raise ValueError(
+                f"block_tables cover {block_tables.shape[1] * 16} tokens, "
+                f"below logical context cap {max(logical_caps)}"
+            )
         if (
             context_lens.dtype is not torch.int32
             or context_lens.ndim != 1
@@ -276,10 +291,15 @@ class GlmAgenticGraphBucket:
         selected_counts = self.workspace.selected_counts
         selected_indptr = self.workspace.selected_indptr
         kernel_rows = min(shape.common.tile_rows, rows)
+        canonical_indices = False
         for layer_index, layer in enumerate(self.layers):
             output = buffers[layer_index % 2]
             args = layer.inputs
             index_share = layer.index_share_mode is not None
+            leading_shared = (
+                layer.index_share_mode is GlmIndexShareMode.SHARED
+                and not canonical_indices
+            )
             state = layer.kernels[kernel_rows].forward(
                 state,
                 positions,
@@ -287,7 +307,7 @@ class GlmAgenticGraphBucket:
                 args.pe_cache,
                 (
                     selected_slots.reshape(-1)
-                    if index_share and selected_slots is not None
+                    if index_share and not leading_shared and selected_slots is not None
                     else args.indices
                 ),
                 args.cos,
@@ -300,12 +320,14 @@ class GlmAgenticGraphBucket:
                 slot_mapping=slot_mapping,
                 sparse_kv_indptr=(
                     selected_indptr
-                    if index_share and selected_indptr is not None
+                    if index_share and not leading_shared and selected_indptr is not None
                     else sparse_kv_indptr
                 ),
                 selected_counts=(
                     selected_counts
-                    if index_share and selected_counts is not None
+                    if index_share and not leading_shared and selected_counts is not None
+                    else owned_counts
+                    if leading_shared
                     else None
                 ),
                 batch_ids=runtime.batch_ids,
@@ -314,6 +336,8 @@ class GlmAgenticGraphBucket:
                 block_tables=block_tables,
                 context_lens=context_lens,
             )
+            if layer.index_share_mode is GlmIndexShareMode.FULL:
+                canonical_indices = True
         self.workspace.advance_step()
         return state
 

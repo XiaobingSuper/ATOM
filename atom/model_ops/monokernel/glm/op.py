@@ -188,6 +188,7 @@ class Glm5MonoKernel:
         with_indexer: bool = False,
         index_share: bool = False,
         index_max_seq: int = 4096,
+        cache_slots: int | None = None,
         attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
         kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
         uv_scale_block_m: int = 128,
@@ -206,6 +207,7 @@ class Glm5MonoKernel:
         self.with_indexer = with_indexer
         self.index_share = index_share or with_indexer
         self.index_max_seq = index_max_seq
+        self.cache_slots = index_max_seq if cache_slots is None else cache_slots
         self.attention_weight = AttentionWeight(attention_weight)
         self.kv_cache_layout = as_kv_cache_layout(kv_cache_layout)
         self.agentic_row_contract = agentic_row_contract
@@ -331,6 +333,7 @@ class Glm5MonoKernel:
             with_indexer=with_indexer,
             index_share=self.index_share,
             index_max_seq=index_max_seq,
+            cache_slots=self.cache_slots,
             expert_mxfp4=self.expert_mxfp4,
             attention_weight=self.attention_weight,
             kv_cache_layout=self.kv_cache_layout,
@@ -358,12 +361,17 @@ class Glm5MonoKernel:
         if self.kv_cache_layout is KvCacheLayout.ATOM_FP8:
             if kv_cache_scale is None:
                 raise ValueError("ATOM FP8 KV cache requires one FP32 scalar descale")
-            return validate_fp8_paged_cache(
+            slots = validate_fp8_paged_cache(
                 kv_cache,
                 kv_cache_scale,
                 index_cache,
                 with_indexer=self.with_indexer,
             )
+            if slots != self.cache_slots:
+                raise ValueError(
+                    f"FP8 cache exposes {slots} slots, expected {self.cache_slots}"
+                )
+            return slots
         if self.kv_cache_layout is not KvCacheLayout.ATOM:
             return kv_cache.shape[0]
         if (

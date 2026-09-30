@@ -532,6 +532,44 @@ def test_glm_agentic_selects_moe_stage_for_flattened_rows(rows, mtp, dcp):
     assert select_backend("glm52", "auto", **common, plugin=True) is None
 
 
+@pytest.mark.parametrize(
+    "rows",
+    (5, 6, 10, 12, 20, 24, 40, 48, 60, 72, 80, 96, 100),
+)
+def test_glm_tp4_agentic_full_dispatch_is_exact(rows):
+    common = dict(
+        samples=rows,
+        tp_size=4,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        dpa=False,
+        dcp=False,
+        plugin=False,
+        external_indexer=False,
+        cache_layout="atom_fp8",
+        segment="agentic_layer",
+    )
+    assert select_backend("glm52", "auto", **common) == "agentic_full"
+    assert select_backend("glm52", "mono", **common) == "agentic_full"
+    assert select_backend("glm52", "staged", **common) is None
+    assert select_backend("glm52", "auto", **(common | {"dcp": True})) is None
+    assert select_backend("glm52", "auto", **(common | {"tp_size": 8})) is None
+    assert select_backend("glm52", "auto", **(common | {"plugin": True})) is None
+
+
+def test_glm_agentic_full_rejects_non_recipe_rows():
+    common = dict(
+        tp_size=4,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        external_indexer=False,
+        cache_layout="atom_fp8",
+        segment="agentic_layer",
+    )
+    for rows in (8, 36, 49, 50):
+        assert select_backend("glm52", "auto", samples=rows, **common) is None
+
+
 def test_glm_tp4_staged_moe_workspace_tracks_flattened_rows():
     from atom.model_ops.monokernel.glm.staged_moe import workspace_shapes
 
@@ -702,7 +740,8 @@ def test_glm_kernel_builder_accepts_tp4_fp8_paged_index_cache():
         4,
         topk=2048,
         with_indexer=True,
-        index_max_seq=4096,
+        index_max_seq=1 << 20,
+        cache_slots=48,
         kv_cache_layout=KvCacheLayout.ATOM_FP8,
         agentic_row_contract=True,
         model_config=config,
@@ -909,10 +948,11 @@ def test_glm_host_validates_fp8_and_preserves_bf16_cache_abi():
     kernel = object.__new__(Glm5MonoKernel)
     kernel.W = SimpleNamespace(config=glm5_shard_config(4))
     kernel.with_indexer = True
+    kernel.cache_slots = 32
     kernel.kv_cache_layout = KvCacheLayout.ATOM_FP8
-    main = torch.empty(2, 16, 576, dtype=torch.float8_e4m3fn)
+    main = torch.empty(32, 1, 576, dtype=torch.float8_e4m3fn)
     scale = torch.empty(1, dtype=torch.float32)
-    index = torch.empty(2, 16, 144, dtype=torch.uint8)
+    index = torch.empty(2, 16, 144, dtype=torch.float8_e4m3fn)
 
     assert kernel._validate_cache_storage(main, None, index, scale) == 32
     with pytest.raises(ValueError, match="descale"):
@@ -1137,6 +1177,43 @@ def test_glm_full_layer_weight_mapping_uses_tp4_geometry(monkeypatch):
     assert weights.physical_experts == 257
     assert calls["q_b_proj"][0] == 16 * (config.nope_dim + config.pe_dim)
     assert calls["o_proj"][1] == 16 * config.v_dim
+
+
+def test_glm_block128_weight_contract_rejects_fnuz():
+    import torch
+
+    from atom.model_ops.monokernel.dispatch import MonoUnsupported
+    from atom.model_ops.monokernel.weights import linear_fp8_block128
+
+    scale = torch.ones(1, 1, dtype=torch.float32)
+    good = SimpleNamespace(
+        quant_type=SimpleNamespace(name="per_1x128"),
+        weight=torch.zeros(128, 128, dtype=torch.float8_e4m3fn),
+        weight_scale=scale,
+    )
+    weight, descale = linear_fp8_block128(
+        good,
+        name="probe",
+        logical_rows=128,
+        logical_cols=128,
+    )
+    assert weight.dtype is torch.float8_e4m3fn
+    assert descale.data_ptr() == scale.data_ptr()
+
+    fnuz = getattr(torch, "float8_e4m3fnuz", None)
+    if fnuz is not None:
+        bad = SimpleNamespace(
+            quant_type=SimpleNamespace(name="per_1x128"),
+            weight=torch.zeros(128, 128, dtype=fnuz),
+            weight_scale=scale,
+        )
+        with pytest.raises(MonoUnsupported, match="E4M3FN"):
+            linear_fp8_block128(
+                bad,
+                name="probe",
+                logical_rows=128,
+                logical_cols=128,
+            )
 
 
 def test_glm_flat_atom_cache_requires_page_one():
@@ -1372,6 +1449,165 @@ def test_glm_recipe_per_token_fp8_attention_mapping():
     assert torch.equal(w_uv.view(2, 6, 64), by_head[:, 2:])
 
 
+def test_glm_agentic_mapping_requantizes_real_ptpc_wrappers(monkeypatch):
+    import torch
+
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    from atom.model_ops.monokernel.config import LayerConfig
+    from atom.model_ops.monokernel.weights import LayerWeights
+
+    config = LayerConfig(
+        name="ptpc-test",
+        hidden=128,
+        q_lora=128,
+        kv_lora=128,
+        pe_dim=64,
+        nope_dim=192,
+        v_dim=128,
+        n_experts=256,
+        top_k=8,
+        inter=128,
+        route_scale=2.5,
+        local_heads=2,
+    )
+
+    def ptpc(rows, cols):
+        return _preshuffled_per_token_fp8_linear(
+            torch.linspace(-2, 2, rows * cols, dtype=torch.bfloat16).view(
+                rows, cols
+            )
+        )[0]
+
+    attention = SimpleNamespace(
+        fused_qkv_a_proj=ptpc(config.qkv_a_rows, config.hidden),
+        q_b_proj=ptpc(
+            config.local_heads * (config.nope_dim + config.pe_dim),
+            config.q_lora,
+        ),
+        o_proj=ptpc(config.hidden, config.local_heads * config.v_dim),
+        kv_b_proj=ptpc(
+            config.local_heads * (config.nope_dim + config.v_dim),
+            config.kv_lora,
+        ),
+        indexer=None,
+        skip_topk=True,
+    )
+    base = LayerWeights(
+        config.local_heads,
+        {},
+        config,
+        rank=0,
+        npes=4,
+        physical_experts=257,
+    )
+    monkeypatch.setattr(module, "glm5_shard_config", lambda _npes: config)
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: base)
+
+    mapped = module._agentic_layer_weights(
+        SimpleNamespace(self_attn=attention),
+        rank=0,
+        npes=4,
+    )
+
+    for name in ("qkv_a", "q_b", "o", "uk", "uv"):
+        assert mapped.t[f"w_{name}"].dtype is torch.float8_e4m3fn
+        assert mapped.t[f"s_{name}"].dtype is torch.float32
+    assert mapped.t["s_uk"].shape[1] == 3
+    assert mapped.physical_experts == 257
+
+
+def test_glm_agentic_logical_context_cap_is_strict_and_aligned():
+    import json
+    from pathlib import Path
+
+    module = _glm_mono_module()
+    config_path = Path(
+        "/shared/data/amd_int/models/GLM-5.2-MXFP4/config.json"
+    )
+    checkpoint = (
+        json.loads(config_path.read_text())
+        if config_path.exists()
+        else {"max_position_embeddings": 1 << 20}
+    )
+    atom_config = SimpleNamespace(
+        max_model_len=checkpoint["max_position_embeddings"],
+        hf_config=SimpleNamespace(max_model_len=64),
+    )
+
+    assert checkpoint["max_position_embeddings"] == 1 << 20
+    assert module._agentic_index_max_seq(atom_config) == 1 << 20
+    with pytest.raises(module.MonoUnsupported, match="align"):
+        module._agentic_index_max_seq(
+            SimpleNamespace(max_model_len=(1 << 20) - 1)
+        )
+    with pytest.raises(module.MonoUnsupported, match="exceeds"):
+        module._agentic_index_max_seq(
+            SimpleNamespace(max_model_len=(1 << 20) + 64)
+        )
+    with pytest.raises(module.MonoUnsupported, match="positive"):
+        module._agentic_index_max_seq(SimpleNamespace(max_model_len=0))
+
+
+def test_glm_agentic_specs_decouple_logical_cap_from_physical_slots():
+    import torch
+
+    module = _glm_mono_module()
+    shared = torch.zeros(1, dtype=torch.int32)
+    impl = SimpleNamespace(
+        sparse_kv_indices_buffer=shared,
+        _k_scale_device=torch.ones(1, dtype=torch.float32),
+    )
+
+    def attention(indexer=None):
+        return SimpleNamespace(
+            mla_attn=SimpleNamespace(impl=impl),
+            indexer=indexer,
+            rotary_emb=SimpleNamespace(
+                cos_cache=torch.empty(0),
+                sin_cache=torch.empty(0),
+            ),
+        )
+
+    layers = [
+        SimpleNamespace(self_attn=attention()) for _ in range(3)
+    ]
+    layers.append(
+        SimpleNamespace(
+            layer_idx=3,
+            self_attn=attention(
+                SimpleNamespace(sparse_kv_indices_buffer=shared)
+            ),
+        )
+    )
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._lm = SimpleNamespace(model=SimpleNamespace(layers=layers))
+    runner._atom_config = SimpleNamespace(
+        max_model_len=64,
+        hf_config=SimpleNamespace(max_model_len=64),
+    )
+    runner._agentic_modes = (SimpleNamespace(value="full"),)
+    runner._agentic_weights = {3: object()}
+    fwd = SimpleNamespace(
+        kv_cache_data={
+            "layer_3": SimpleNamespace(
+                k_cache=torch.empty(48, 1, 576, dtype=torch.float8_e4m3fn),
+                index_cache=torch.empty(
+                    3, 16, 144, dtype=torch.float8_e4m3fn
+                ),
+            )
+        }
+    )
+
+    specs, index_max_seq = runner._agentic_specs(fwd)
+
+    assert index_max_seq == 64
+    assert specs[0].index_max_seq == 64
+    assert specs[0].validate_cache_inputs() == 48
+
+
 def test_glm_default_off_does_not_inspect_runtime_config():
     runner = _glm_mono_module().Glm52MonoDecode(None, object(), "off")
     assert runner._enabled is False
@@ -1437,6 +1673,361 @@ def test_glm_graph_warmup_dispatch_counts_padded_rows(monkeypatch):
         dtype=torch.int32,
     )[::2]
     assert not runner.supports(*args)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "batch_capacity", "ladder"),
+    (
+        *((6, batch, (1, 2, 4, 8, 12, 16)) for batch in (1, 2, 4, 8, 12, 16)),
+        *((5, batch, (1, 2, 4, 8, 12, 16, 20)) for batch in (1, 2, 4, 8, 12, 16, 20)),
+    ),
+)
+def test_glm_agentic_auto_is_all_or_nothing(
+    monkeypatch, query_len, batch_capacity, ladder
+):
+    import torch
+
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._enabled = True
+    runner._mode = "auto"
+    runner._agentic_modes = (object(),)
+    runner._agentic_ready = False
+    samples = batch_capacity * query_len
+    published_counts = torch.ones(samples, dtype=torch.int32)
+    bucket = SimpleNamespace(
+            workspace=SimpleNamespace(
+                publish_owned_counts=lambda _indptr: published_counts
+            )
+        )
+    runner._agentic_buckets = {
+        (batch, query_len): bucket for batch in ladder
+    }
+    runner._staged_enabled = False
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
+        capture_sizes=list(ladder),
+    )
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(aux_hidden_state_layers=[])
+    )
+    context = SimpleNamespace(
+        running_bs=batch_capacity,
+        is_prefill=False,
+        forward_mode=SimpleNamespace(max_seqlen_q=query_len),
+    )
+    metadata = SimpleNamespace(
+        max_seqlen_q=query_len,
+        batch_id_per_q_token=torch.tensor(
+            [
+                batch
+                for batch in range(batch_capacity)
+                for _ in range(query_len)
+            ],
+            dtype=torch.int32,
+        ),
+        block_tables=torch.zeros(batch_capacity, 1, dtype=torch.int32),
+        context_lens=torch.ones(batch_capacity, dtype=torch.int32),
+        sparse_kv_indptr=torch.arange(samples + 1, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=context,
+            attn_metadata=metadata,
+            ubatch_slices=None,
+        ),
+    )
+    ready = False
+
+    def prepare(_fwd, _query_len):
+        runner._agentic_ready = ready
+        return ready
+
+    runner._prepare_agentic = prepare
+    args = (
+        torch.arange(samples),
+        torch.arange(samples, dtype=torch.int64),
+        None,
+        None,
+    )
+    assert not runner.supports(*args)
+    ready = True
+    assert runner.supports(*args)
+    assert metadata.glm_agentic_owned_counts is published_counts
+    context.forward_mode.max_seqlen_q = query_len - 1
+    assert not runner.supports(*args)
+
+
+@pytest.mark.parametrize(
+    ("query_len", "ladder", "fail_batch"),
+    (
+        (6, (1, 2, 4, 8, 12, 16), None),
+        (5, (1, 2, 4, 8, 12, 16, 20), None),
+        (6, (1, 2, 4, 8, 12, 16), 4),
+    ),
+)
+def test_glm_agentic_actual_prepare_is_local_first_and_routes_forward(
+    monkeypatch, query_len, ladder, fail_batch
+):
+    import torch
+
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda state, *_args, **_kwargs: state
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    import atom.model_ops.monokernel.glm.graph as graph_module
+    import atom.model_ops.monokernel.glm.op as op_module
+    import atom.model_ops.monokernel.glm.workspace as workspace_module
+
+    events = []
+    workspaces = {}
+
+    class Workspace:
+        def __init__(self, shape):
+            self.shape = shape
+            self.workspace = self
+
+        def ensure_index_share(self, _topk):
+            events.append(("index", self.shape.common.batch_capacity))
+
+        def initialize_collective(self, **_kwargs):
+            assert len(workspaces) == len(ladder)
+            events.append(("symmetric", self.shape.common.batch_capacity))
+
+        def publish_owned_counts(self, indptr):
+            return indptr[1:] - indptr[:-1]
+
+        def close(self):
+            events.append(("close-workspace", self.shape.common.batch_capacity))
+
+    class Bucket:
+        def __init__(self, workspace):
+            self.workspace = workspace
+
+        def __call__(self, state, **_kwargs):
+            return state
+
+        def close(self):
+            self.workspace.close()
+
+    def allocate_local(shape, **_kwargs):
+        batch = shape.common.batch_capacity
+        events.append(("local", batch))
+        workspaces[batch] = Workspace(shape)
+        return workspaces[batch]
+
+    def build(workspace, _specs, **_kwargs):
+        batch_capacity = workspace.shape.common.batch_capacity
+        events.append(("build", batch_capacity))
+        if batch_capacity == fail_batch:
+            raise RuntimeError("rank-local kernel build failed")
+        return Bucket(workspace)
+
+    monkeypatch.setattr(
+        workspace_module.GlmAgenticWorkspace,
+        "allocate_local",
+        staticmethod(allocate_local),
+    )
+    monkeypatch.setattr(
+        graph_module.GlmAgenticGraphBucket,
+        "build",
+        staticmethod(build),
+    )
+    monkeypatch.setattr(
+        op_module.Glm5PackedArtifacts,
+        "pack",
+        staticmethod(lambda *_args, **_kwargs: object()),
+    )
+    monkeypatch.setattr(module, "_agentic_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_world_size", lambda: 1)
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+    monkeypatch.setattr(module, "rmsnorm2d_fwd_", lambda state, *_args: state)
+
+    class Dense:
+        mlp = SimpleNamespace(reduce_results=True)
+
+        def __call__(self, _positions, hidden, residual):
+            return hidden, residual
+
+    target = SimpleNamespace(layer_idx=3)
+    model = SimpleNamespace(
+        layers=[Dense(), Dense(), Dense(), target],
+        aux_hidden_state_layers=[],
+        norm=SimpleNamespace(weight=torch.ones(module.GLM5_CONFIG.hidden), eps=1e-6),
+    )
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._lm = SimpleNamespace(model=model)
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=4,
+        kv_cache_dtype="fp8",
+        capture_sizes=list(ladder),
+        max_model_len=64,
+        hf_config=SimpleNamespace(index_topk=2048, max_model_len=64),
+    )
+    runner._mode = "auto"
+    runner._enabled = True
+    runner._staged_enabled = False
+    runner._agentic_modes = (SimpleNamespace(value="full"),)
+    runner._agentic_weights = {}
+    runner._agentic_artifacts = {}
+    runner._agentic_buckets = {}
+    runner._agentic_ready_q = set()
+    runner._agentic_ready = False
+    runner._agentic_refused = False
+    runner._stats = module.MonoRouteStats("prepare-route")
+    runner._agentic_specs = lambda _fwd: ((object(),), 64)
+
+    batch = ladder[-1]
+    rows = batch * query_len
+    metadata = SimpleNamespace(
+        max_seqlen_q=query_len,
+        batch_id_per_q_token=torch.arange(rows, dtype=torch.int32) // query_len,
+        block_tables=torch.zeros(batch, 1, dtype=torch.int32),
+        context_lens=torch.ones(batch, dtype=torch.int32),
+        sparse_kv_indptr=torch.arange(rows + 1, dtype=torch.int32),
+        slot_mapping=torch.arange(rows, dtype=torch.int64),
+    )
+    context = SimpleNamespace(
+        running_bs=batch,
+        is_prefill=False,
+        forward_mode=SimpleNamespace(max_seqlen_q=query_len),
+    )
+    fwd = SimpleNamespace(
+        context=context,
+        attn_metadata=metadata,
+        ubatch_slices=None,
+    )
+    monkeypatch.setattr(module, "get_forward_context", lambda: fwd)
+    hidden = torch.zeros(rows, module.GLM5_CONFIG.hidden, dtype=torch.bfloat16)
+    input_ids = torch.zeros(rows, dtype=torch.int64)
+    positions = torch.arange(rows, dtype=torch.int64)
+
+    supported = runner.supports(input_ids, positions, None, hidden)
+    if fail_batch is not None:
+        assert not supported
+        assert sorted(batch for event, batch in events if event == "close-workspace") == list(
+            ladder
+        )
+        assert runner._agentic_buckets == {}
+        assert runner._agentic_refused
+        return
+
+    assert supported
+    output = runner.forward(input_ids, positions, hidden)
+
+    assert tuple(runner._agentic_buckets) == tuple((b, query_len) for b in ladder)
+    first_symmetric = next(i for i, event in enumerate(events) if event[0] == "symmetric")
+    assert all(event[0] in ("local", "index") for event in events[:first_symmetric])
+    assert torch.equal(output, hidden)
+    assert runner.route_stats()["hits"][f"agentic_full:s{rows}"] == 1
+    assert runner.route_stats()["fallbacks"] == {}
+
+
+def test_glm_agentic_cleanup_closes_every_bucket_in_reverse_order(monkeypatch):
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda *_args, **_kwargs: None
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    runner = object.__new__(module.Glm52MonoDecode)
+    closed = []
+
+    class Bucket:
+        def __init__(self, key):
+            self.key = key
+
+        def close(self):
+            closed.append(self.key)
+
+    runner._agentic_buckets = {
+        key: Bucket(key) for key in module.GLM52_AGENTIC_BUCKETS
+    }
+    runner._agentic_ready = True
+
+    runner._close_agentic_buckets()
+
+    assert closed == sorted(module.GLM52_AGENTIC_BUCKETS, reverse=True)
+    assert not runner._agentic_buckets
+    assert not runner._agentic_ready
+
+
+def test_glm_agentic_resolves_dense_prefix_tp_partial_before_residual(monkeypatch):
+    import torch
+
+    layernorm = types.ModuleType("atom.model_ops.layernorm")
+    layernorm.rmsnorm2d_fwd_ = lambda state, *_args: state
+    monkeypatch.setitem(sys.modules, "atom.model_ops.layernorm", layernorm)
+    module = _glm_mono_module()
+    observed = {}
+
+    class Dense:
+        def __init__(self, final=False):
+            self.final = final
+            self.mlp = SimpleNamespace(
+                down_proj=SimpleNamespace(reduce_results=not final)
+            )
+
+        def __call__(self, _positions, hidden, residual):
+            if self.final:
+                return torch.full_like(hidden, 2), torch.full_like(hidden, 10)
+            return hidden, residual
+
+    class Bucket:
+        def __call__(self, state, **_kwargs):
+            observed["state"] = state.clone()
+            return state
+
+    runner = object.__new__(module.Glm52MonoDecode)
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=[Dense(), Dense(), Dense(final=True)],
+            norm=SimpleNamespace(weight=torch.ones(4), eps=1e-6),
+        )
+    )
+    runner._agentic_buckets = {(1, 5): Bucket()}
+    runner._stats = module.MonoRouteStats("dense-prefix")
+    metadata = SimpleNamespace(
+        max_seqlen_q=5,
+        slot_mapping=torch.arange(5, dtype=torch.int64),
+        sparse_kv_indptr=torch.arange(6, dtype=torch.int32),
+        batch_id_per_q_token=torch.zeros(5, dtype=torch.int32),
+        glm_agentic_owned_counts=torch.ones(5, dtype=torch.int32),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        context_lens=torch.ones(1, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        module,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            context=SimpleNamespace(running_bs=1, forward_mode=None),
+            attn_metadata=metadata,
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "tensor_model_parallel_all_reduce",
+        lambda partial: partial * 4,
+    )
+    monkeypatch.setattr(module, "rmsnorm2d_fwd_", lambda state, *_args: state)
+
+    output = runner._forward_agentic(
+        torch.zeros(5, dtype=torch.int64),
+        torch.arange(5, dtype=torch.int64),
+        torch.zeros(5, 4),
+    )
+
+    assert torch.equal(observed["state"], torch.full((5, 4), 18.0))
+    assert torch.equal(output, observed["state"])
 
 
 def test_shared_linear_weight_unshuffle_round_trip():

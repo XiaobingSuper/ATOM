@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import socket
-from types import MappingProxyType
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
@@ -108,7 +108,13 @@ def _packed_zero_weights(device):
     return weights, artifacts
 
 
-def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
+def _tp4_worker(
+    rank: int,
+    device_offset: int,
+    port: int,
+    batch_capacity: int,
+    query_len: int,
+) -> None:
     import torch
     import torch.distributed as dist
 
@@ -117,11 +123,11 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
     from atom.model_ops.monokernel.glm.graph import (
         GlmAgenticGraphBucket,
         GlmAgenticLayer,
-        GlmAgenticLayerInputs,
     )
     from atom.model_ops.monokernel.glm.index_share import GlmIndexShareMode
     from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
-    from atom.model_ops.monokernel.glm.workspace import GlmAgenticWorkspace
+    from atom.model_ops.monokernel.telemetry import MonoRouteStats
+    import atom.models.glm52_mono as glm_adapter
 
     device = torch.device("cuda", device_offset + rank)
     torch.cuda.set_device(device)
@@ -135,76 +141,369 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
     try:
         weights, artifacts = _packed_zero_weights(device)
         shape = GlmAgenticShape.for_graph(
-            batch_capacity=20,
-            query_len=5,
+            batch_capacity=batch_capacity,
+            query_len=query_len,
             dcp_size=1,
             query_replication=False,
         )
-        workspace = GlmAgenticWorkspace.allocate(
-            shape,
-            rank=rank,
-            npes=4,
-            group=None,
-            sparse_attention_topk=2048,
-            with_indexer=True,
-            index_max_seq=64,
-        )
-        workspace.ensure_index_share(2048)
-        common = dict(
-            rank=rank,
-            npes=4,
-            group=None,
-            topk=2048,
-            launches_per_step=2,
-            index_max_seq=64,
-            kv_cache_layout=KvCacheLayout.ATOM_FP8,
-            agentic_row_contract=True,
-            row_capacity=100,
-            workspace=workspace,
-        )
-        full_artifacts = artifacts(True)
-        shared_artifacts = artifacts(False)
-        full = Glm5MonoKernel(
-            weights,
-            8,
-            with_indexer=True,
-            index_share=True,
-            packed_artifacts=full_artifacts,
-            **common,
-        )
-        shared = Glm5MonoKernel(
-            weights,
-            8,
-            with_indexer=False,
-            index_share=True,
-            packed_artifacts=shared_artifacts,
-            **common,
-        )
 
         gen = torch.Generator(device=device).manual_seed(917)
+        rows = shape.common.row_capacity
+        tail_row = rows - (rows % 8 or 8)
         hidden = torch.randn(
-            100, weights.config.hidden, generator=gen, device=device
+            rows, weights.config.hidden, generator=gen, device=device
         ).to(torch.bfloat16)
-        positions = torch.zeros(100, dtype=torch.int64, device=device)
+        positions = torch.zeros(rows, dtype=torch.int64, device=device)
         positions[:2] = torch.tensor([16, 17], dtype=torch.int64, device=device)
-        positions[96] = 16
+        positions[tail_row] = 16
         slot_mapping = torch.full(
-            (100,), -1, dtype=torch.int64, device=device
+            (rows,), -1, dtype=torch.int64, device=device
         )
         slot_mapping[:2] = torch.tensor([0, 1], dtype=torch.int64, device=device)
-        slot_mapping[96] = 16
-        batch_ids = torch.full((100,), -1, dtype=torch.int32, device=device)
+        slot_mapping[tail_row] = 16
+        batch_ids = torch.full((rows,), -1, dtype=torch.int32, device=device)
         batch_ids[:2] = 0
-        batch_ids[96] = 19
-        owned_counts = torch.zeros(100, dtype=torch.int32, device=device)
+        batch_ids[tail_row] = batch_capacity - 1
+        owned_counts = torch.zeros(rows, dtype=torch.int32, device=device)
         owned_counts[:2] = 1
-        owned_counts[96] = 1
-        block_tables = torch.zeros(20, 4, dtype=torch.int32, device=device)
+        owned_counts[tail_row] = 1
+        block_tables = torch.zeros(
+            batch_capacity, 4, dtype=torch.int32, device=device
+        )
         block_tables[0] = torch.tensor([3, 0, 2, 1], device=device)
-        block_tables[19] = torch.tensor([2, 1, 3, 0], device=device)
-        context_lens = torch.zeros(20, dtype=torch.int32, device=device)
+        block_tables[-1] = torch.tensor([2, 1, 3, 0], device=device)
+        context_lens = torch.zeros(
+            batch_capacity, dtype=torch.int32, device=device
+        )
         context_lens[0] = 19
-        context_lens[19] = 17
+        context_lens[-1] = 17
+        cache = torch.zeros(
+            64, 1, 576, dtype=torch.float8_e4m3fn, device=device
+        )
+        cache[0:2, 0, :512] = 7
+        for physical in range(32, 48):
+            cache[physical, 0, :512] = physical - 31
+        for physical in range(48, 64):
+            cache[physical, 0, :512] = physical - 47
+        cache_scale = torch.ones(1, dtype=torch.float32, device=device)
+        index_cache = torch.zeros(
+            4, 16, 144, dtype=torch.float8_e4m3fn, device=device
+        )
+        cos = torch.ones(64, 32, dtype=torch.float32, device=device)
+        sin = torch.zeros_like(cos)
+        external_indptr = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int32, device=device),
+                owned_counts.cumsum(0, dtype=torch.int32),
+            )
+        )
+
+        class DensePrefix:
+            mlp = SimpleNamespace(reduce_results=True)
+
+            def __call__(self, _positions, state, residual):
+                return state, residual
+
+        shared_sparse = torch.zeros(2048 * rows, dtype=torch.int32, device=device)
+
+        def sparse_attention(indexer):
+            impl = SimpleNamespace(
+                sparse_kv_indices_buffer=shared_sparse,
+                _k_scale_device=cache_scale,
+            )
+            return SimpleNamespace(
+                mla_attn=SimpleNamespace(impl=impl),
+                indexer=indexer,
+                rotary_emb=SimpleNamespace(cos_cache=cos, sin_cache=sin),
+            )
+
+        dense = [DensePrefix(), DensePrefix(), DensePrefix()]
+        dense[2].self_attn = sparse_attention(
+            SimpleNamespace(sparse_kv_indices_buffer=shared_sparse)
+        )
+        indexer_types = ["shared"] * 78
+        indexer_types[6] = "full"
+        target_layers = []
+        kv_cache_data = {}
+        for layer_idx in range(3, 78):
+            full_mode = indexer_types[layer_idx] == "full"
+            indexer = (
+                SimpleNamespace(sparse_kv_indices_buffer=shared_sparse)
+                if full_mode
+                else None
+            )
+            layer = SimpleNamespace(
+                layer_idx=layer_idx,
+                self_attn=sparse_attention(indexer),
+                mlp=SimpleNamespace(experts=object()),
+            )
+            target_layers.append(layer)
+            kv_cache_data[f"layer_{layer_idx}"] = SimpleNamespace(
+                k_cache=torch.zeros(
+                    64, 1, 576, dtype=torch.float8_e4m3fn, device=device
+                ),
+                index_cache=(
+                    torch.zeros(
+                        4,
+                        16,
+                        144,
+                        dtype=torch.float8_e4m3fn,
+                        device=device,
+                    )
+                    if full_mode
+                    else None
+                ),
+            )
+        # Keep the observability cache on the FULL layer used by the device gate.
+        kv_cache_data["layer_6"].k_cache = cache
+        kv_cache_data["layer_6"].index_cache = index_cache
+        for layer_idx in (3, 4, 5, 7):
+            kv_cache_data[f"layer_{layer_idx}"].k_cache = cache
+
+        hf_config = SimpleNamespace(
+            index_topk=2048,
+            indexer_types=indexer_types,
+            max_model_len=64,
+        )
+        runner = object.__new__(glm_adapter.Glm52MonoDecode)
+        runner._lm = SimpleNamespace(
+            model=SimpleNamespace(
+                layers=dense + target_layers,
+                aux_hidden_state_layers=[],
+                norm=SimpleNamespace(
+                    weight=torch.ones(
+                        weights.config.hidden,
+                        dtype=torch.bfloat16,
+                        device=device,
+                    ),
+                    eps=1e-6,
+                ),
+            ),
+            config=hf_config,
+        )
+        runner._agentic_modes = glm_adapter._agentic_index_modes(
+            runner._lm, hf_config
+        )
+        runner._agentic_buckets = {}
+        runner._agentic_weights = {}
+        runner._agentic_artifacts = {}
+        runner._agentic_ready = False
+        runner._agentic_ready_q = set()
+        runner._agentic_refused = False
+        runner._staged_enabled = False
+        runner._enabled = True
+        runner._mode = "mono"
+        capture_sizes = (
+            [1, 2, 4, 8, 12, 16]
+            if query_len == 6
+            else [1, 2, 4, 8, 12, 16, 20]
+        )
+        runner._atom_config = SimpleNamespace(
+            tensor_parallel_size=4,
+            kv_cache_dtype="fp8",
+            capture_sizes=capture_sizes,
+            max_model_len=64,
+            hf_config=hf_config,
+        )
+        runner._stats = MonoRouteStats("glm52-device")
+        metadata = SimpleNamespace(
+            max_seqlen_q=query_len,
+            sparse_kv_indptr=external_indptr,
+            glm_agentic_owned_counts=owned_counts,
+            slot_mapping=slot_mapping,
+            batch_id_per_q_token=batch_ids,
+            block_tables=block_tables,
+            context_lens=context_lens,
+        )
+        glm_adapter.get_forward_context = lambda: SimpleNamespace(
+            context=SimpleNamespace(
+                running_bs=batch_capacity,
+                is_prefill=False,
+                forward_mode=SimpleNamespace(max_seqlen_q=query_len),
+            ),
+            attn_metadata=metadata,
+            ubatch_slices=None,
+            kv_cache_data=kv_cache_data,
+        )
+        glm_adapter.rmsnorm2d_fwd_ = lambda state, *_args: state
+        input_ids = torch.zeros(rows, dtype=torch.int64, device=device)
+
+        from atom.model_ops.monokernel.config import MAX_LAYERS_PER_STEP
+        from atom.model_ops.monokernel.glm.op import Glm5PackedArtifacts
+        from atom.model_ops.monokernel.weights import LayerWeights
+
+        mapping_calls = []
+        real_mapping_calls = []
+        artifact_calls = []
+        build_calls = []
+
+        def ptpc(rows, cols):
+            return SimpleNamespace(
+                input_size=cols,
+                output_size=rows,
+                quant_type=SimpleNamespace(name="per_Token"),
+                params_dtype=torch.float8_e4m3fn,
+                weight=torch.zeros(
+                    rows, cols, dtype=torch.float8_e4m3fn, device=device
+                ),
+                weight_scale=torch.ones(
+                    rows, 1, dtype=torch.float32, device=device
+                ),
+                is_output_padded=False,
+            )
+
+        cfg = weights.config
+        probe_indexer = SimpleNamespace(
+            wq_b=ptpc(32 * 128, cfg.q_lora),
+            use_wk_weights_proj_fusion=True,
+            wk_weights_proj=SimpleNamespace(
+                weight=torch.zeros(
+                    128 + 32,
+                    cfg.hidden,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+            ),
+            k_norm=SimpleNamespace(
+                weight=torch.ones(128, dtype=torch.float32, device=device),
+                bias=torch.zeros(128, dtype=torch.float32, device=device),
+            ),
+        )
+        probe_attention = SimpleNamespace(
+            fused_qkv_a_proj=ptpc(cfg.qkv_a_rows, cfg.hidden),
+            q_b_proj=ptpc(
+                cfg.local_heads * (cfg.nope_dim + cfg.pe_dim), cfg.q_lora
+            ),
+            o_proj=ptpc(cfg.hidden, cfg.local_heads * cfg.v_dim),
+            kv_b_proj=ptpc(
+                cfg.local_heads * (cfg.nope_dim + cfg.v_dim), cfg.kv_lora
+            ),
+            indexer=probe_indexer,
+            skip_topk=False,
+        )
+        original_base_mapper = glm_adapter._layer_weights
+        glm_adapter._layer_weights = lambda *_args: weights
+        mapped_template = glm_adapter._agentic_layer_weights(
+            SimpleNamespace(self_attn=probe_attention),
+            rank,
+            4,
+        )
+        glm_adapter._layer_weights = original_base_mapper
+        real_mapping_calls.append("ptpc")
+        del probe_attention, probe_indexer
+
+        def map_layer(layer, mapped_rank, mapped_npes):
+            assert (mapped_rank, mapped_npes) == (rank, 4)
+            mapping_calls.append(layer.layer_idx)
+            return LayerWeights(
+                mapped_template.heads,
+                mapped_template.t,
+                mapped_template.config,
+                rank,
+                4,
+                mxfp4_weight_layout=mapped_template.mxfp4_weight_layout,
+                mxfp4_scale_layout=mapped_template.mxfp4_scale_layout,
+                physical_experts=mapped_template.physical_experts,
+            )
+
+        def pack_layer(mapped, *, with_indexer, **_kwargs):
+            artifact_calls.append((id(mapped), with_indexer))
+            base = artifacts(with_indexer)
+            return Glm5PackedArtifacts(
+                weights=mapped,
+                tensors=base.tensors,
+                npes=base.npes,
+                attention_weight=base.attention_weight,
+                with_indexer=base.with_indexer,
+                expert_mxfp4=base.expert_mxfp4,
+            )
+
+        class PreparedBucket:
+            def __init__(self, prepared_workspace):
+                self.workspace = prepared_workspace
+
+            def close(self):
+                self.workspace.close()
+
+        def build_bucket(
+            prepared_workspace,
+            specs,
+            *,
+            artifact_factory,
+            **_kwargs,
+        ):
+            nonlocal full, shared
+            prepared_shape = prepared_workspace.shape.common
+            key = (prepared_shape.batch_capacity, prepared_shape.query_len)
+            build_calls.append((key, len(specs)))
+            assert len(specs) == 75
+            assert [spec.index_share_mode.value for spec in specs[:5]] == [
+                "shared",
+                "shared",
+                "shared",
+                "full",
+                "shared",
+            ]
+            if key != (batch_capacity, query_len):
+                return PreparedBucket(prepared_workspace)
+            layers = []
+            for slot, spec in enumerate(specs[:5]):
+                packed = artifact_factory(spec.weights)
+                kernel = Glm5MonoKernel(
+                    spec.weights,
+                    8,
+                    rank=rank,
+                    npes=4,
+                    group=None,
+                    topk=2048,
+                    launches_per_step=MAX_LAYERS_PER_STEP,
+                    with_indexer=spec.with_indexer,
+                    index_share=True,
+                    index_max_seq=64,
+                    kv_cache_layout=KvCacheLayout.ATOM_FP8,
+                    agentic_row_contract=True,
+                    row_capacity=prepared_shape.row_capacity,
+                    workspace=prepared_workspace,
+                    packed_artifacts=packed,
+                )
+                if spec.index_share_mode is GlmIndexShareMode.FULL:
+                    full = kernel
+                if slot == 4:
+                    shared = kernel
+                layers.append(
+                    GlmAgenticLayer(
+                        slot,
+                        {8: kernel},
+                        spec.inputs,
+                        packed,
+                        index_share_mode=spec.index_share_mode,
+                    )
+                )
+            return GlmAgenticGraphBucket(prepared_workspace, tuple(layers))
+
+        glm_adapter._agentic_layer_weights = map_layer
+        glm_adapter.get_tensor_model_parallel_rank = lambda: rank
+        glm_adapter.get_tensor_model_parallel_world_size = lambda: 4
+        glm_adapter.get_tp_group = lambda: SimpleNamespace(cpu_group=None)
+        Glm5PackedArtifacts.pack = staticmethod(pack_layer)
+        GlmAgenticGraphBucket.build = staticmethod(build_bucket)
+
+        def production_launch():
+            assert runner.supports(input_ids, positions, None, hidden)
+            return runner.forward(input_ids, positions, hidden)
+
+        assert runner.supports(input_ids, positions, None, hidden)
+        assert real_mapping_calls == ["ptpc"]
+        assert mapping_calls == list(range(3, 78))
+        assert len(artifact_calls) == 75
+        assert build_calls == [
+            ((capacity, query_len), 75) for capacity in capture_sizes
+        ]
+        assert set(runner._agentic_buckets) == {
+            (capacity, query_len) for capacity in capture_sizes
+        }
+        bucket = runner._agentic_buckets[batch_capacity, query_len]
+        workspace = bucket.workspace
         selected = workspace.selected_slots
         counts = workspace.selected_counts
         indptr = workspace.selected_indptr
@@ -213,70 +512,15 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
         selected.fill_(-1)
         counts.fill_(-1)
         indptr.fill_(-1)
-        cache = torch.zeros(
-            64, 576, dtype=torch.float8_e4m3fn, device=device
-        )
-        cache[0:2, :512] = 7
-        for physical in range(32, 48):
-            cache[physical, :512] = physical - 31
-        for physical in range(48, 64):
-            cache[physical, :512] = physical - 47
-        cache_scale = torch.ones(1, dtype=torch.float32, device=device)
-        index_cache = torch.zeros(64, 144, dtype=torch.uint8, device=device)
-        cos = torch.ones(64, 32, dtype=torch.float32, device=device)
-        sin = torch.zeros_like(cos)
-        full_inputs = GlmAgenticLayerInputs(
-            cache,
-            None,
-            selected,
-            cos,
-            sin,
-            index_cache=index_cache,
-            kv_cache_scale=cache_scale,
-        )
-        shared_inputs = GlmAgenticLayerInputs(
-            cache,
-            None,
-            selected,
-            cos,
-            sin,
-            kv_cache_scale=cache_scale,
-        )
-        bucket = GlmAgenticGraphBucket(
-            workspace,
-            (
-                GlmAgenticLayer(
-                    0,
-                    {8: full},
-                    full_inputs,
-                    full_artifacts,
-                    index_share_mode=GlmIndexShareMode.FULL,
-                ),
-                GlmAgenticLayer(
-                    1,
-                    {8: shared},
-                    shared_inputs,
-                    shared_artifacts,
-                    index_share_mode=GlmIndexShareMode.SHARED,
-                ),
-            ),
+        metadata.glm_agentic_owned_counts = workspace.publish_owned_counts(
+            external_indptr
         )
 
-        launch = dict(
-            hidden_states=hidden,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            sparse_kv_indptr=indptr,
-            batch_ids=batch_ids,
-            owned_counts=owned_counts,
-            block_tables=block_tables,
-            context_lens=context_lens,
-        )
         # Start rank 0 late so faster ranks can enter SHARED while rank 0 may
         # still be consuming FULL's TP slot. There is no inter-layer host sync.
         if rank == 0:
             torch.cuda._sleep(5_000_000)
-        eager_out = bucket(**launch)
+        eager_out = production_launch()
         torch.cuda.synchronize(device)
         assert workspace.step.item() == 1
 
@@ -284,7 +528,7 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
         with torch.cuda.graph(graph):
             if rank == 0:
                 torch.cuda._sleep(5_000_000)
-            graph_out = bucket(**launch)
+            graph_out = production_launch()
         graph.replay()
         torch.cuda.synchronize(device)
         assert workspace.step.item() == 2
@@ -299,9 +543,9 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
             dtype=torch.int32,
             device=device,
         )
-        expected_counts = torch.zeros(100, dtype=torch.int32, device=device)
+        expected_counts = torch.zeros(rows, dtype=torch.int32, device=device)
         expected_counts[:2] = torch.tensor([17, 18], device=device)
-        expected_counts[96] = 17
+        expected_counts[tail_row] = 17
         expected_indptr = torch.cat(
             (
                 torch.zeros(1, dtype=torch.int32, device=device),
@@ -352,6 +596,13 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
                 device=device,
             ),
         )
+        stats = runner.route_stats()
+        assert stats["hits"][f"agentic_full:s{rows}"] == 2
+        assert stats["fallbacks"] == {}
+        for key in sorted(tuple(runner._agentic_buckets), reverse=True):
+            runner._agentic_buckets.pop(key).close()
+        assert runner._agentic_buckets == {}
+        bucket = full = shared = workspace = None
     finally:
         if bucket is not None:
             bucket.close()
@@ -365,7 +616,8 @@ def _tp4_worker(rank: int, device_offset: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def test_glm_tp4_full_to_shared_real_rocm_launch():
+@pytest.mark.parametrize(("batch_capacity", "query_len"), ((16, 6), (20, 5)))
+def test_glm_tp4_full_to_shared_real_rocm_launch(batch_capacity, query_len):
     torch = pytest.importorskip("torch")
     pytest.importorskip("flydsl")
     if not torch.cuda.is_available():
@@ -381,10 +633,23 @@ def test_glm_tp4_full_to_shared_real_rocm_launch():
 
     import torch.multiprocessing as mp
 
-    offset = 0
+    # Keep the two capacity-specialized process groups on disjoint devices when
+    # an 8-GPU node is available. ROCm can retain graph/JIT state after a spawned
+    # group exits; reusing those devices immediately made the second capacity
+    # hang despite both capacities passing in isolation.
+    offset = (
+        0
+        if query_len == 6 or torch.cuda.device_count() < 8
+        else torch.cuda.device_count() - 4
+    )
     mp.spawn(
         _tp4_worker,
-        args=(offset, _free_port()),
+        args=(
+            offset,
+            _free_port(),
+            batch_capacity,
+            query_len,
+        ),
         nprocs=4,
         join=True,
     )

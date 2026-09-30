@@ -49,10 +49,10 @@ class KVCacheTensor:
     k_scale: torch.Tensor = None
     v_scale: torch.Tensor = None
     # DSA sparse layers (GLM-5.2 / DeepSeek-V3.2): indexer key cache, block-major.
-    # Its per-block shape follows ``--index_cache_dtype``: the FP8 row is
-    # ``(num_blocks, block_size, aligned_index_dim)``, while FP4 is the packed
-    # E2M1 plane ``(num_blocks, k_tiles, 4, block_size, 16)`` that
-    # ``fp4_index_block_shapes`` fixes, paired with ``index_scale`` below.
+    # Its per-block shape follows ``--index_cache_dtype``. FP8 is
+    # ``[blocks, 16, 144]`` byte storage: eight [token=16, dim=16] preshuffled
+    # key tiles, then 16 embedded FP32 row scales and padding. FP4 is the packed
+    # E2M1 plane fixed by ``fp4_index_block_shapes``, paired with ``index_scale``.
     # Omitted for non-DSA layers.
     index_cache: torch.Tensor | None = None
     # The e8m0 scale plane paired with ``index_cache`` under

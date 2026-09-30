@@ -81,6 +81,7 @@ from atom.model_ops.monokernel.glm.layout import (
     INDEX_DIM,
     INDEX_HEADS,
     INDEX_KEYS_PER_TASK,
+    INDEX_MAX_LOGICAL_CONTEXT,
     INDEX_Q_ROWS,
     INDEX_RADIX_WORDS,
     INDEX_TILE,
@@ -160,6 +161,7 @@ def build_glm5_monokernel(
     with_indexer: bool = False,
     index_share: bool = False,
     index_max_seq: int = 4096,
+    cache_slots: int | None = None,
     expert_mxfp4: bool = False,
     attention_weight: AttentionWeight | str = AttentionWeight.FP8_BLOCK128,
     kv_cache_layout: KvCacheLayout | str = KvCacheLayout.SPLIT,
@@ -210,6 +212,7 @@ def build_glm5_monokernel(
         KvCacheLayout.ATOM_FP8,
     )
     use_fp8_paged_cache = cache_layout is KvCacheLayout.ATOM_FP8
+    cache_slots = index_max_seq if cache_slots is None else cache_slots
     use_index_share = index_share or with_indexer
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S)
@@ -224,7 +227,12 @@ def build_glm5_monokernel(
         and use_atom_kv_cache
     ), "persistent row tiling requires the Agentic S8 ATOM path"
     assert 1 <= launches_per_step <= LAYER_SLOTS
-    assert not with_indexer or (topk == 2048 and index_max_seq % INDEX_KEYS_PER_TASK == 0)
+    assert not with_indexer or (
+        topk == 2048
+        and 0 < index_max_seq <= INDEX_MAX_LOGICAL_CONTEXT
+        and index_max_seq % INDEX_KEYS_PER_TASK == 0
+        and cache_slots > 0
+    )
     assert not (attention_bf16 and with_indexer), "BF16 attention uses the external indexer"
     assert uv_scale_block_m in (64, 128)
     H = heads
@@ -1534,7 +1542,13 @@ def build_glm5_monokernel(
                                         False,
                                     )
                                 )
-                                byte_offset = slot * 144 + tid * 2
+                                dim = tid * 2
+                                byte_offset = (
+                                    (slot // 16) * 2304
+                                    + (dim // 16) * 256
+                                    + (slot % 16) * 16
+                                    + dim % 16
+                                )
                                 bo.buffer_store(
                                     fx.Int8(word),
                                     r_index_cache,
@@ -1549,7 +1563,9 @@ def build_glm5_monokernel(
                                 bo.buffer_store(
                                     descale,
                                     r_index_cache,
-                                    slot * 144 + INDEX_DIM,
+                                    (slot // 16) * 2304
+                                    + 2048
+                                    + (slot % 16) * 4,
                                     offset_is_bytes=True,
                                 )
                             gpu.barrier()
@@ -1732,7 +1748,6 @@ def build_glm5_monokernel(
             # ====================== 4b. fused sparse index score + exact top-2048
             if const_expr(with_indexer):
                 r_index_cache = _rsrc(index_cache)
-                N_INDEX_SPLIT = index_max_seq // INDEX_KEYS_PER_TASK
                 index_weights = xs + INDEX_LDS["index_weights"].start
 
                 def load_index_q8(head, k):
@@ -1744,8 +1759,12 @@ def build_glm5_monokernel(
                 for s in range(start("index_select"), S, G):
                     s = fx.Int32(s)
                     stamp("index_select", s, 0)
-                    bound = row_local_sparse_active(s).select(
-                        row_context_len(s),
+                    context_bound = row_context_len(s)
+                    bound = (
+                        row_local_sparse_active(s)
+                        & (context_bound <= index_max_seq)
+                    ).select(
+                        context_bound,
                         fx.Int32(0),
                     )
                     get(mb("index_ready"), s)
@@ -1782,17 +1801,29 @@ def build_glm5_monokernel(
                         head_group = wave % 2
                         key_pos = tile * INDEX_KEYS_PER_TASK + key_group * 16 + lane % 16
                         safe_key = fx.min(key_pos, fx.max(bound - 1, fx.Int32(0)))
-                        physical_key = logical_physical_slot(s, safe_key)
+                        mapped_key = logical_physical_slot(s, safe_key)
+                        physical_valid = (mapped_key >= 0) & (
+                            mapped_key < cache_slots
+                        )
+                        physical_key = physical_valid.select(
+                            mapped_key, fx.Int32(0)
+                        )
                         head = head_group * 16 + lane % 16
                         score_frag = fx.Vector.filled(4, 0.0, fx.Float32)
                         for k32 in range_constexpr(INDEX_DIM // 32):
                             k = k32 * 32 + (lane // 16) * 8
                             qv = load_index_q8(head, k)
                             if const_expr(use_fp8_paged_cache):
+                                key_byte_offset = (
+                                    (physical_key // 16) * 2304
+                                    + (k // 16) * 256
+                                    + (physical_key % 16) * 16
+                                    + k % 16
+                                )
                                 words = fx.Vector(
                                     bo.buffer_load(
                                         r_index_cache,
-                                        (physical_key * 144 + k) // 4,
+                                        key_byte_offset // 4,
                                         vec_width=2,
                                         dtype=T.i32,
                                     )
@@ -1800,7 +1831,12 @@ def build_glm5_monokernel(
                                 fp8 = _fp8_to_bf16x8(words[0], words[1])
                                 descale = ld_f32(
                                     r_index_cache,
-                                    (physical_key * 144 + INDEX_DIM) // 4,
+                                    (
+                                        (physical_key // 16) * 2304
+                                        + 2048
+                                        + (physical_key % 16) * 4
+                                    )
+                                    // 4,
                                 )
                                 kv = fx.Vector.from_elements(
                                     [
@@ -1876,6 +1912,7 @@ def build_glm5_monokernel(
                             (wave % 2 == 0)
                             & (lane < 16)
                             & (key_pos < bound)
+                            & physical_valid
                         )
                         return fx.Uint32(key), key_pos, valid
 
@@ -1902,11 +1939,15 @@ def build_glm5_monokernel(
                     prefix = fx.Uint32(0)
                     prefix_mask = fx.Uint32(0)
                     remain = fx.min(fx.Int32(topk), bound)
-                    for shift in (24, 16, 8, 0):
+                    for digit_pass in range_constexpr(4):
+                        shift = 24 - digit_pass * 8
                         if tid < 256:
                             lds_st(keys, tid, fx.Int32(0))
                         gpu.barrier()
-                        for tile in range(0, N_INDEX_SPLIT):
+                        for tile in range(
+                            (bound + INDEX_KEYS_PER_TASK - 1)
+                            // INDEX_KEYS_PER_TASK
+                        ):
                             key, _, valid = score_key(tile)
                             if valid & ((key & prefix_mask) == prefix):
                                 digit = fx.Int32(
@@ -1989,7 +2030,10 @@ def build_glm5_monokernel(
                         return before_wave + inclusive - count, total
 
                     out_gt = fx.Int32(0)
-                    for tile in range(0, N_INDEX_SPLIT):
+                    for tile in range(
+                        (bound + INDEX_KEYS_PER_TASK - 1)
+                        // INDEX_KEYS_PER_TASK
+                    ):
                         key, logical, valid = score_key(tile)
                         flag = valid & (key > threshold)
                         offset, tile_total = scan_flag(flag)
@@ -2002,7 +2046,10 @@ def build_glm5_monokernel(
 
                     need_eq = fx.min(fx.Int32(topk), bound) - out_gt
                     out_eq = fx.Int32(0)
-                    for tile in range(0, N_INDEX_SPLIT):
+                    for tile in range(
+                        (bound + INDEX_KEYS_PER_TASK - 1)
+                        // INDEX_KEYS_PER_TASK
+                    ):
                         key, logical, valid = score_key(tile)
                         flag = valid & (key == threshold)
                         offset, tile_total = scan_flag(flag)
