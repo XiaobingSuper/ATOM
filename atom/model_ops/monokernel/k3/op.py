@@ -67,6 +67,7 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
             packed_artifacts=packed_artifacts,
+            monokernel_only=True,
         )
         self.attention.configure_monokernel(layer_idx, fuse_moe=True)
 

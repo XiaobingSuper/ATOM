@@ -366,6 +366,7 @@ def test_kimi_monokernel_compile_cache_keys_layer_geometry():
             mtp=True,
             agentic_batch_size=2,
             state_dtype=torch.float16,
+            conv_state_layout=ConvStateLayout.TIME_MAJOR,
         ),
         build_kimi_k3_monokernel(
             4,
@@ -390,7 +391,6 @@ def test_kimi_agentic_host_builder_layout(batch_capacity, rows):
         build_kimi_k3_monokernel,
         monokernel_layout,
     )
-
     layout = monokernel_layout(rows, fuse_attn_res=True, fuse_moe=True, mtp=True)
 
     assert layout["_bytes"] > layout["mtp_norm_ready"]
@@ -434,6 +434,7 @@ def test_kimi_full_monokernel_accepts_fp16_agentic_construction(monkeypatch):
     assert captured["mtp"] is True
     assert captured["agentic_batch_size"] == 2
     assert captured["fuse_moe"] is True
+    assert captured["monokernel_only"] is True
 
 
 def test_scaled_mfma_uses_flydsl_v0341_operand_abi():
@@ -516,6 +517,12 @@ def test_kimi_conv_state_layout_contracts():
     ] == [7, 17, 27]
     assert conv_state_shape(ConvStateLayout.CHANNEL_MAJOR, 5, channels) == (5, 10, 3)
     assert conv_state_shape(ConvStateLayout.TIME_MAJOR, 5, channels) == (5, 3, 10)
+    assert conv_state_shape(
+        ConvStateLayout.TIME_MAJOR,
+        5,
+        channels,
+        state_length=10,
+    ) == (5, 10, 10)
 
 
 @pytest.mark.parametrize("mode", ("staged", "mono"))
@@ -2463,7 +2470,11 @@ def test_kimi_supports_agentic_q8_fp16_snapshots(monkeypatch, batch_capacity):
     context.kv_cache_data = {
         "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float16))
     }
-    monkeypatch.setattr(module, "_kda_state_pool_supported", lambda _cache: True)
+    monkeypatch.setattr(
+        module,
+        "_kda_state_pool_supported",
+        lambda _cache, **_kwargs: True,
+    )
     monkeypatch.setattr(module, "get_forward_context", lambda: context)
     prepared = []
     runner._prepare = (
@@ -2598,7 +2609,7 @@ def test_kimi_state_pool_contract_accepts_agentic_fp16_recurrence():
     cache = SimpleNamespace(
         k_cache=torch.zeros(
             2,
-            3,
+            10,
             3 * config.local_heads * config.v_dim,
             dtype=torch.bfloat16,
         ),
@@ -2611,11 +2622,11 @@ def test_kimi_state_pool_contract_accepts_agentic_fp16_recurrence():
         ),
     )
 
-    assert module._kda_state_pool_supported(cache)
+    assert module._kda_state_pool_supported(cache, conv_state_length=10)
     cache.v_cache = cache.v_cache.to(torch.float16)
-    assert module._kda_state_pool_supported(cache)
+    assert module._kda_state_pool_supported(cache, conv_state_length=10)
     cache.v_cache = cache.v_cache.to(torch.bfloat16)
-    assert not module._kda_state_pool_supported(cache)
+    assert not module._kda_state_pool_supported(cache, conv_state_length=10)
     cache.v_cache = torch.zeros(
         2,
         config.local_heads,
@@ -2625,11 +2636,11 @@ def test_kimi_state_pool_contract_accepts_agentic_fp16_recurrence():
     )
     cache.k_cache = torch.zeros(
         2,
-        4,
+        3,
         3 * config.local_heads * config.v_dim,
         dtype=torch.bfloat16,
     )
-    assert not module._kda_state_pool_supported(cache)
+    assert not module._kda_state_pool_supported(cache, conv_state_length=10)
 
 
 def test_kimi_state_dtype_skips_mla_cache_without_v_tensor():
@@ -2674,7 +2685,11 @@ def test_kimi_supports_requires_atomic_eager_prepare(monkeypatch):
     context.kv_cache_data = {
         "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float32))
     }
-    monkeypatch.setattr(module, "_kda_state_pool_supported", lambda _cache: True)
+    monkeypatch.setattr(
+        module,
+        "_kda_state_pool_supported",
+        lambda _cache, **_kwargs: True,
+    )
     monkeypatch.setattr(module, "get_forward_context", lambda: context)
     calls = []
     runner._prepare = lambda rows, dtype: calls.append((rows, dtype)) or False

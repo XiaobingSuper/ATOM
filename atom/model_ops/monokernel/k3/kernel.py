@@ -223,10 +223,11 @@ def build_kimi_k3_monokernel(
             or not mtp
             or samples != agentic_batch_size * 8
             or state_dtype is not torch.float16
+            or conv_state_layout is not ConvStateLayout.TIME_MAJOR
         ):
             raise ValueError(
                 "Kimi Agentic MonoKernel requires B in {1,2,4,8}, "
-                "q=8, MTP, and FP16 recurrent state"
+                "q=8, MTP, FP16 recurrent state, and time-major conv state"
             )
     elif samples not in {1, 2, 4, 8}:
         raise ValueError(
@@ -251,6 +252,8 @@ def build_kimi_k3_monokernel(
     state_slot_bytes = (
         _HEADS * _HEAD_DIM * _HEAD_DIM * (2 if state_fp16 else 4)
     )
+    conv_state_length = 10 if agentic_batch_size else _CONV_STATE_LENGTH
+    conv_slot_bytes = _CONV_CHANNELS * conv_state_length * 2
     latent_projection_waves = 3 if samples <= 4 else 4
     shared_projection_waves = 3 if samples <= 4 else 6
     mtp_splits = 4 if mtp else _MTP_SPLITS
@@ -1841,56 +1844,116 @@ def build_kimi_k3_monokernel(
 
         def prepare_kda_conv(sample, head, conv_state_rsrc, conv_state_out_rsrc):
             def convolve(channel):
-                state_offsets = (
-                    conv_state_offset(
-                        conv_state_layout,
-                        channel,
-                        0,
-                        _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
-                    ),
-                    conv_state_offset(
-                        conv_state_layout,
-                        channel,
-                        1,
-                        _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
-                    ),
-                    conv_state_offset(
-                        conv_state_layout,
-                        channel,
-                        2,
-                        _CONV_CHANNELS,
-                        _CONV_STATE_LENGTH,
-                    ),
-                )
-                state0 = fx.BFloat16(
-                    bo.buffer_load(
-                        conv_state_rsrc,
-                        state_offsets[0],
-                        vec_width=1,
-                        dtype=T.bf16,
-                        cache_modifier=CM_DEV,
+                if const_expr(agentic_batch_size > 0):
+                    request = sample // 8
+                    token = sample % 8
+                    accepted = uniform(
+                        bo.buffer_load(
+                            accepted_rsrc,
+                            request,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
                     )
-                )
-                state1 = fx.BFloat16(
-                    bo.buffer_load(
-                        conv_state_rsrc,
-                        state_offsets[1],
-                        vec_width=1,
-                        dtype=T.bf16,
-                        cache_modifier=CM_DEV,
+
+                    def load_old(row):
+                        return fx.Float32(
+                            fx.BFloat16(
+                                bo.buffer_load(
+                                    conv_state_rsrc,
+                                    row * _CONV_CHANNELS + channel,
+                                    vec_width=1,
+                                    dtype=T.bf16,
+                                    cache_modifier=CM_DEV,
+                                )
+                            )
+                        )
+
+                    old_m1 = load_old(accepted - 1)
+                    old_0 = load_old(accepted)
+                    old_p1 = load_old(accepted + 1)
+                    request_start = request * 8
+                    draft_m3 = get_input(
+                        request_start + fx.max(token - 3, fx.Int32(0)),
+                        channel,
                     )
-                )
-                state2 = fx.BFloat16(
-                    bo.buffer_load(
-                        conv_state_rsrc,
-                        state_offsets[2],
-                        vec_width=1,
-                        dtype=T.bf16,
-                        cache_modifier=CM_DEV,
+                    draft_m2 = get_input(
+                        request_start + fx.max(token - 2, fx.Int32(0)),
+                        channel,
                     )
-                )
+                    draft_m1 = get_input(
+                        request_start + fx.max(token - 1, fx.Int32(0)),
+                        channel,
+                    )
+                    state0 = (token == 0).select(
+                        old_m1,
+                        (token == 1).select(
+                            old_0,
+                            (token == 2).select(old_p1, draft_m3),
+                        ),
+                    )
+                    state1 = (token == 0).select(
+                        old_0,
+                        (token == 1).select(old_p1, draft_m2),
+                    )
+                    state2 = (token == 0).select(old_p1, draft_m1)
+                else:
+                    state_offsets = (
+                        conv_state_offset(
+                            conv_state_layout,
+                            channel,
+                            0,
+                            _CONV_CHANNELS,
+                            _CONV_STATE_LENGTH,
+                        ),
+                        conv_state_offset(
+                            conv_state_layout,
+                            channel,
+                            1,
+                            _CONV_CHANNELS,
+                            _CONV_STATE_LENGTH,
+                        ),
+                        conv_state_offset(
+                            conv_state_layout,
+                            channel,
+                            2,
+                            _CONV_CHANNELS,
+                            _CONV_STATE_LENGTH,
+                        ),
+                    )
+                    state0 = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(
+                                conv_state_rsrc,
+                                state_offsets[0],
+                                vec_width=1,
+                                dtype=T.bf16,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                    )
+                    state1 = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(
+                                conv_state_rsrc,
+                                state_offsets[1],
+                                vec_width=1,
+                                dtype=T.bf16,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                    )
+                    state2 = fx.Float32(
+                        fx.BFloat16(
+                            bo.buffer_load(
+                                conv_state_rsrc,
+                                state_offsets[2],
+                                vec_width=1,
+                                dtype=T.bf16,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                    )
                 current = get_input(sample, channel)
                 weights = fx.Vector(
                     bo.buffer_load(
@@ -1901,19 +1964,54 @@ def build_kimi_k3_monokernel(
                     )
                 ).to(fx.Float32)
                 values = fx.Vector.from_elements(
-                    [fx.Float32(state0), fx.Float32(state1), fx.Float32(state2), current],
+                    [state0, state1, state2, current],
                     fx.Float32,
                 )
                 convolution = (values * weights).reduce(fx.ReductionOp.ADD)
                 activated = convolution * sigmoid_batch([convolution])[0]
-                bo.buffer_store(state1, conv_state_out_rsrc, state_offsets[0], cache_modifier=CM_DEV)
-                bo.buffer_store(state2, conv_state_out_rsrc, state_offsets[1], cache_modifier=CM_DEV)
-                bo.buffer_store(
-                    current.to(fx.BFloat16),
-                    conv_state_out_rsrc,
-                    state_offsets[2],
-                    cache_modifier=CM_DEV,
-                )
+                if const_expr(agentic_batch_size > 0):
+                    if token == 7:
+                        bo.buffer_store(
+                            old_0.to(fx.BFloat16),
+                            conv_state_out_rsrc,
+                            channel,
+                            cache_modifier=CM_DEV,
+                        )
+                        bo.buffer_store(
+                            old_p1.to(fx.BFloat16),
+                            conv_state_out_rsrc,
+                            _CONV_CHANNELS + channel,
+                            cache_modifier=CM_DEV,
+                        )
+                        for draft_token in range_constexpr(8):
+                            bo.buffer_store(
+                                get_input(
+                                    request_start + draft_token,
+                                    channel,
+                                ).to(fx.BFloat16),
+                                conv_state_out_rsrc,
+                                (draft_token + 2) * _CONV_CHANNELS + channel,
+                                cache_modifier=CM_DEV,
+                            )
+                else:
+                    bo.buffer_store(
+                        state1.to(fx.BFloat16),
+                        conv_state_out_rsrc,
+                        state_offsets[0],
+                        cache_modifier=CM_DEV,
+                    )
+                    bo.buffer_store(
+                        state2.to(fx.BFloat16),
+                        conv_state_out_rsrc,
+                        state_offsets[1],
+                        cache_modifier=CM_DEV,
+                    )
+                    bo.buffer_store(
+                        current.to(fx.BFloat16),
+                        conv_state_out_rsrc,
+                        state_offsets[2],
+                        cache_modifier=CM_DEV,
+                    )
                 return activated.to(fx.BFloat16)
 
             if tid < _HEAD_DIM:
@@ -1944,7 +2042,7 @@ def build_kimi_k3_monokernel(
             )
             state_out_rsrc = state_rsrc
             conv_state_rsrc = rsrc(
-                conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
+                conv_state + fx.Int64(input_slot) * fx.Int64(conv_slot_bytes)
             )
             conv_state_out_rsrc = conv_state_rsrc
 
@@ -2176,12 +2274,21 @@ def build_kimi_k3_monokernel(
                         )
 
                 if valid_state:
+                    conv_slot = input_slot
+                    if const_expr(agentic_batch_size > 0):
+                        conv_slot = uniform(
+                            bo.buffer_load(
+                                indices_rsrc,
+                                (sample // 8) * 8,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
                     conv_state_rsrc = rsrc(
-                        conv_state + fx.Int64(input_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
+                        conv_state
+                        + fx.Int64(conv_slot) * fx.Int64(conv_slot_bytes)
                     )
-                    conv_state_out_rsrc = rsrc(
-                        conv_state + fx.Int64(output_slot) * fx.Int64(_CONV_CHANNELS * _CONV_STATE_LENGTH * 2)
-                    )
+                    conv_state_out_rsrc = conv_state_rsrc
                     prepare_kda_conv(sample, head, conv_state_rsrc, conv_state_out_rsrc)
                     publish_mtp_component(0, shared_query)
                     publish_mtp_component(1, shared_key)

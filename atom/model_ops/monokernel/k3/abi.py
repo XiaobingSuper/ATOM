@@ -113,5 +113,32 @@ class KimiAgenticRuntime:
         columns[:, 1:] -= 1
         return self.snapshot_slots.gather(1, columns), self.snapshot_slots
 
+    def conv_window_plan(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return source rows for q=8 convolution reads and the next window.
+
+        Source rows 0..9 address the previous production cache window and
+        rows 10..17 address this forward's eight input rows.
+        """
+
+        device = self.num_accepted_tokens.device
+        accepted = self.num_accepted_tokens.to(torch.int64).view(-1, 1, 1)
+        token = torch.arange(8, dtype=torch.int64, device=device).view(1, 8, 1)
+        history = torch.arange(3, dtype=torch.int64, device=device).view(1, 1, 3)
+        logical = accepted - 1 + token + history
+        first_draft = accepted + 2
+        reads = torch.where(
+            logical < first_draft,
+            logical,
+            10 + logical - first_draft,
+        )
+        committed = accepted.view(-1, 1) + torch.arange(
+            2,
+            dtype=torch.int64,
+            device=device,
+        )
+        draft = 10 + torch.arange(8, dtype=torch.int64, device=device)
+        final = torch.cat((committed, draft.expand(committed.shape[0], 8)), dim=1)
+        return reads, final
+
 
 __all__ = ["KimiAgenticRuntime", "KimiAgenticShape"]

@@ -1583,7 +1583,80 @@ def test_kimi_agentic_runtime_selects_mixed_rollback_snapshots():
     assert outputs.data_ptr() == snapshots.data_ptr()
 
 
-def test_kimi_agentic_transition_slots_roll_back_conv_per_request():
+def test_kimi_agentic_conv_window_plan_matches_independent_mixed_reference():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticRuntime,
+        KimiAgenticShape,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=4,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    accepted = torch.tensor((1, 3, 6, 8), dtype=torch.int32)
+    runtime = KimiAgenticRuntime.bind(
+        shape,
+        torch.arange(32, dtype=torch.int32).view(4, 8),
+        accepted,
+    )
+
+    reads, final = runtime.conv_window_plan()
+    for request, count in enumerate(accepted.tolist()):
+        old = torch.arange(10, dtype=torch.int64) + request * 100
+        draft = torch.arange(8, dtype=torch.int64) + request * 1000
+        source = torch.cat((old, draft))
+        independent_reads = []
+        for token in range(8):
+            history = old[count - 1 : count + 2].tolist() + draft[:token].tolist()
+            independent_reads.append(history[-3:])
+        independent_final = torch.cat((old[count : count + 2], draft))
+
+        assert source[reads[request]].tolist() == independent_reads
+        assert torch.equal(source[final[request]], independent_final)
+
+
+def test_kimi_agentic_conv_window_plan_is_stable_back_to_back():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticRuntime,
+        KimiAgenticShape,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=1,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    snapshots = torch.arange(8, dtype=torch.int32).view(1, 8)
+    window = torch.arange(10, dtype=torch.int64)
+    for accepted, draft in (
+        (torch.tensor((4,), dtype=torch.int32), torch.arange(20, 28)),
+        (torch.tensor((2,), dtype=torch.int32), torch.arange(40, 48)),
+    ):
+        reads, final = KimiAgenticRuntime.bind(
+            shape,
+            snapshots,
+            accepted,
+        ).conv_window_plan()
+        source = torch.cat((window, draft))
+        expected = torch.cat(
+            (
+                window[accepted.item() : accepted.item() + 2],
+                draft,
+            )
+        )
+        assert torch.equal(source[final[0]], expected)
+        assert source[reads[0, 0]].tolist() == window[
+            accepted.item() - 1 : accepted.item() + 2
+        ].tolist()
+        window = source[final[0]]
+
+
+def test_kimi_agentic_transition_slots_roll_back_recurrence_per_request():
     torch = pytest.importorskip("torch")
     from atom.model_ops.monokernel.k3.abi import (
         KimiAgenticRuntime,

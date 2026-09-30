@@ -53,7 +53,7 @@ def _need(ok: bool, what: str) -> None:
         raise MonoUnsupported(what)
 
 
-def _kda_state_pool_supported(cache) -> bool:
+def _kda_state_pool_supported(cache, *, conv_state_length: int = 3) -> bool:
     """Validate the fixed native KDA state ABI before any device launch."""
 
     conv_state = getattr(cache, "k_cache", None)
@@ -64,7 +64,8 @@ def _kda_state_pool_supported(cache) -> bool:
     slots = conv_state.shape[0] if conv_state.ndim == 3 else 0
     return (
         slots > 0
-        and conv_state.shape == (slots, 3, 3 * cfg.local_heads * cfg.v_dim)
+        and conv_state.shape
+        == (slots, conv_state_length, 3 * cfg.local_heads * cfg.v_dim)
         and conv_state.dtype is torch.bfloat16
         and conv_state.is_contiguous()
         and recurrent_state.shape == (slots, cfg.local_heads, cfg.v_dim, cfg.v_dim)
@@ -462,7 +463,10 @@ class KimiMonoDecode:
                 cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
             except KeyError:
                 return self._fallback("state_cache", samples)
-            if not _kda_state_pool_supported(cache):
+            if not _kda_state_pool_supported(
+                cache,
+                conv_state_length=10 if agentic else 3,
+            ):
                 return self._fallback("state_layout", samples)
             if state_dtype is None:
                 state_dtype = cache.v_cache.dtype

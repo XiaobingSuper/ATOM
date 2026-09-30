@@ -121,10 +121,11 @@ class KimiK3KdaAttention:
             or agentic_batch_size not in (1, 2, 4, 8)
             or samples != agentic_batch_size * 8
             or state_dtype is not torch.float16
+            or conv_state_layout is not ConvStateLayout.TIME_MAJOR
         ):
             raise ValueError(
                 "Kimi Agentic KDA requires B in {1,2,4,8}, q=8, "
-                "MTP, and FP16 recurrent state"
+                "MTP, FP16 recurrent state, and time-major conv state"
             )
         if not 1 <= launches_per_step <= MAX_LAYERS_PER_STEP:
             raise ValueError(f"launches_per_step must be in [1, {MAX_LAYERS_PER_STEP}], " f"got {launches_per_step}")
@@ -448,6 +449,7 @@ class KimiK3KdaAttention:
             self.conv_state_layout,
             conv_state.shape[0] if conv_state.ndim == 3 else 0,
             3 * self.local_projection,
+            state_length=10 if self.agentic_batch_size else 3,
         )
         if (
             conv_state.shape != expected_conv_state

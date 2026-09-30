@@ -79,6 +79,7 @@ class _KimiK3MlaPath:
         state_dtype: torch.dtype = torch.float32,
         defer_collectives: bool = False,
         packed_artifacts: dict[str, object] | None = None,
+        monokernel_only: bool = False,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -111,6 +112,7 @@ class _KimiK3MlaPath:
         self.inline_pre_attn = fuse_attn_res and layer_idx == 0
         self.fuse_router = fuse_router
         self.fuse_shared_experts = fuse_shared_experts
+        self.monokernel_only = monokernel_only
         self.routed_hidden = config.routed_hidden
         self.shared_inter = config.shared_inter
         self.hidden_shard = config.hidden // npes
@@ -164,22 +166,24 @@ class _KimiK3MlaPath:
         self.pre_updated = torch.empty_like(self.pre_attn)
         self.moe_input = torch.empty_like(self.pre_attn)
         self.updated_prefix = torch.empty_like(self.pre_attn)
-        self.pre_attn_res = KimiK3AttnRes(
-            samples,
-            config.hidden,
-            self.previous_valid_blocks,
-            False,
-            self.block_write_idx if self.is_block_write_layer else -1,
-        )
-        self.post_attn_res = KimiK3AttnRes(
-            samples,
-            config.hidden,
-            self.previous_valid_blocks + int(self.is_block_write_layer),
-            not self.is_block_write_layer,
-            -1,
-            quantize_output=True,
-            source_override_idx=0 if self.inline_pre_attn else -1,
-        )
+        self.pre_attn_res = self.post_attn_res = None
+        if not monokernel_only:
+            self.pre_attn_res = KimiK3AttnRes(
+                samples,
+                config.hidden,
+                self.previous_valid_blocks,
+                False,
+                self.block_write_idx if self.is_block_write_layer else -1,
+            )
+            self.post_attn_res = KimiK3AttnRes(
+                samples,
+                config.hidden,
+                self.previous_valid_blocks + int(self.is_block_write_layer),
+                not self.is_block_write_layer,
+                -1,
+                quantize_output=True,
+                source_override_idx=0 if self.inline_pre_attn else -1,
+            )
 
         self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
         if packed_artifacts:
@@ -206,6 +210,7 @@ class _KimiK3MlaPath:
                 n=self.routed_hidden,
                 k=config.hidden,
                 rows=samples,
+                workspace_only=monokernel_only,
             )
             self.shared_projection = Mxfp8Linear.from_packed(
                 packed_artifacts["w_shared_ug"],
@@ -213,6 +218,7 @@ class _KimiK3MlaPath:
                 n=2 * self.shared_inter,
                 k=config.hidden,
                 rows=samples,
+                workspace_only=monokernel_only,
             )
             self.w_shared_dn = packed_artifacts["w_shared_dn"]
             self.s_shared_dn = packed_artifacts["s_shared_dn"]
@@ -236,11 +242,13 @@ class _KimiK3MlaPath:
                 latent_weight,
                 latent_scale,
                 samples,
+                workspace_only=monokernel_only,
             )
             self.shared_projection = Mxfp8Linear(
                 shared_weight,
                 shared_scale,
                 samples,
+                workspace_only=monokernel_only,
             )
             self.w_shared_dn = pack_mxfp8_weight(shared_down_weight)
             self.s_shared_dn = pack_mxfp8_scale(shared_down_scale)
@@ -270,18 +278,22 @@ class _KimiK3MlaPath:
         self.topk_ids_i64 = torch.empty(samples, config.top_k, dtype=torch.int64, device=device)
         self.topk_ids = torch.empty(samples, config.top_k, dtype=torch.int32, device=device)
         self.topk_weights = torch.empty(samples, config.top_k, dtype=torch.float32, device=device)
-        self.router_select = SigmoidTopkRouter(config.n_experts, config.top_k, samples)
-        self.router_projection = FusedRouterProjection(
-            config.hidden,
-            config.n_experts,
-            config.top_k,
-            samples,
-            samples * self.routed_hidden,
-            self.routed_hidden,
-            2 * self.shared_inter,
-            config.situ_beta,
-            config.situ_linear_beta,
-        )
+        self.router_select = self.router_projection = None
+        if not monokernel_only:
+            self.router_select = SigmoidTopkRouter(
+                config.n_experts, config.top_k, samples
+            )
+            self.router_projection = FusedRouterProjection(
+                config.hidden,
+                config.n_experts,
+                config.top_k,
+                samples,
+                samples * self.routed_hidden,
+                self.routed_hidden,
+                2 * self.shared_inter,
+                config.situ_beta,
+                config.situ_linear_beta,
+            )
         self.router_score_mailbox = torch.zeros(
             samples * config.n_experts * 2,
             dtype=torch.int32,
@@ -338,7 +350,11 @@ class _KimiK3MlaPath:
         }
 
     def _build_fused_tail(self):
-        if self.symmetric_allreduce is None or not self.fuse_shared_experts:
+        if (
+            self.monokernel_only
+            or self.symmetric_allreduce is None
+            or not self.fuse_shared_experts
+        ):
             return None
         return FusedKimiK3Tail(
             self.S,
