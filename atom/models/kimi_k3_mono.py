@@ -1241,14 +1241,45 @@ class KimiMonoDecode:
 
         self._capture_full_route_decision = None
 
+    def _prepare_full_plan_once(self) -> bool:
+        """Latch one TP-uniform full-plan decision for this lifecycle."""
+
+        decision = self._capture_full_route_decision
+        if decision is not None:
+            return decision
+        local_success = self._full_plan.prepare()
+        local_error = (
+            None
+            if local_success
+            else MonoUnsupported("rank-local full-plan prepare failed")
+        )
+        tp = get_tp_group()
+        npes = get_tensor_model_parallel_world_size()
+        try:
+            tp_uniform_local_validation(
+                local_error,
+                group=tp.cpu_group,
+                world_size=npes,
+                context="Kimi-K3 full-plan prepare failed",
+            )
+        except MonoUnsupported as error:
+            self._full_plan.close()
+            decision = False
+            logger.warning(
+                "Kimi-K3 full-plan fallback for lifecycle: %s",
+                error,
+            )
+        else:
+            decision = True
+        self._capture_full_route_decision = decision
+        return decision
+
     def prepare_for_capture(self) -> bool:
         """Build the complete DSpark plan before any graph capture begins."""
 
         if not self._full_route_eligible():
             return True
-        if self._capture_full_route_decision is None:
-            self._capture_full_route_decision = self._full_plan.prepare()
-        return self._capture_full_route_decision
+        return self._prepare_full_plan_once()
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
         samples = input_ids.numel()
@@ -1444,11 +1475,7 @@ class KimiMonoDecode:
                 )
                 if decision is False:
                     return self._fallback("capture_prepare", samples)
-                prepared = (
-                    decision
-                    if decision is not None
-                    else full_plan.prepare()
-                )
+                prepared = self._prepare_full_plan_once()
             else:
                 prepared = (
                     self._prepare(

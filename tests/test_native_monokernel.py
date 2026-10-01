@@ -3701,12 +3701,24 @@ def test_kimi_full_route_rejects_non_q8_and_incomplete_topology():
     assert runner.memory_reserve_bytes() == 0
 
 
-def test_kimi_capture_prepare_failure_latches_until_new_lifecycle():
+def test_kimi_capture_prepare_failure_latches_until_new_lifecycle(
+    monkeypatch,
+):
+    module = _kimi_mono_module()
     runner = _kimi_memory_reserve_runner("auto", "dspark")
     results = iter((False, True))
     calls = []
     runner._full_plan = SimpleNamespace(
-        prepare=lambda: calls.append("prepare") or next(results)
+        prepare=lambda: calls.append("prepare") or next(results),
+        close=lambda: None,
+    )
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
     )
 
     runner.begin_capture_lifecycle()
@@ -3716,7 +3728,125 @@ def test_kimi_capture_prepare_failure_latches_until_new_lifecycle():
 
     runner.begin_capture_lifecycle()
     assert runner.prepare_for_capture()
+    assert runner.prepare_for_capture()
     assert calls == ["prepare", "prepare"]
+
+
+def test_kimi_eager_prepare_failure_is_attempted_once(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    layer = SimpleNamespace(
+        layer_idx=1,
+        is_linear_attn=True,
+        block_sparse_moe=object(),
+    )
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=[layer], start_layer=0, end_layer=1)
+    )
+    runner._capture_full_route_decision = None
+    attempts = []
+    allocations = []
+    rows = 8
+    context = _kimi_agentic_context(1, torch.ones(1, dtype=torch.int32))
+    context.kv_cache_data = {
+        "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float16))
+    }
+
+    class Plan:
+        ready = False
+
+        def prepare(self):
+            attempts.append(1)
+            allocations.append(object())
+            return False
+
+        def close(self):
+            allocations.clear()
+
+    runner._full_plan = Plan()
+    monkeypatch.setattr(
+        runner,
+        "_full_route_eligible",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        module,
+        "_kda_state_pool_supported",
+        lambda _cache, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    args = (
+        torch.arange(rows),
+        torch.arange(rows, dtype=torch.int64),
+        None,
+        torch.zeros(
+            rows,
+            module.KIMI_K3_CONFIG.hidden,
+            dtype=torch.bfloat16,
+        ),
+    )
+    assert not runner.supports(*args)
+    assert not runner.supports(*args)
+    assert attempts == [1]
+    assert allocations == []
+
+
+def test_kimi_eager_prepare_decision_is_tp_uniform(monkeypatch):
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._capture_full_route_decision = None
+    closes = []
+    validations = []
+    runner._full_plan = SimpleNamespace(
+        ready=True,
+        prepare=lambda: True,
+        close=lambda: closes.append(1),
+    )
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 8
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group="tp"),
+    )
+
+    def reject_remote_failure(error, **kwargs):
+        validations.append((error, kwargs))
+        raise module.MonoUnsupported("rank 6 failed")
+
+    monkeypatch.setattr(
+        module,
+        "tp_uniform_local_validation",
+        reject_remote_failure,
+    )
+
+    assert not runner._prepare_full_plan_once()
+    assert not runner._prepare_full_plan_once()
+    assert len(validations) == 1
+    assert validations[0][0] is None
+    assert validations[0][1]["group"] == "tp"
+    assert validations[0][1]["world_size"] == 8
+    assert closes == [1]
 
 
 @pytest.mark.parametrize("samples", (4, 8))
