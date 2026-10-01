@@ -458,6 +458,8 @@ def build_kimi_k3_monokernel(
         mla_context_lens: Int64,
         mla_block_tables: Int64,
         mla_block_table_stride: Int32,
+        mla_block_size: Int32,
+        mla_block_ratio: Int32,
         mla_cache: Int64,
         mla_cache_scale: Int64,
         mla_rope_cos: Int64,
@@ -2267,8 +2269,8 @@ def build_kimi_k3_monokernel(
                 value_acc = fx.Float32(0.0)
                 logical = fx.Int32(0)
                 while logical < visible:
-                    logical_block = logical // 16
-                    block_offset = logical % 16
+                    logical_block = logical // mla_block_size
+                    block_offset = logical % mla_block_size
                     physical_block = uniform(
                         bo.buffer_load(
                             rsrc(mla_block_tables),
@@ -2278,7 +2280,7 @@ def build_kimi_k3_monokernel(
                             dtype=T.i32,
                         )
                     )
-                    physical_slot = physical_block * 16 + block_offset
+                    physical_slot = physical_block * mla_block_ratio + block_offset
                     fresh_row = fx.Int32(-1)
                     fresh_scan = fx.Int32(0)
                     while fresh_scan < fx.Int32(samples):
@@ -4450,6 +4452,8 @@ def build_kimi_k3_monokernel(
         mla_context_lens: Int64,
         mla_block_tables: Int64,
         mla_block_table_stride: Int32,
+        mla_block_size: Int32,
+        mla_block_ratio: Int32,
         mla_cache: Int64,
         mla_cache_scale: Int64,
         mla_rope_cos: Int64,
@@ -4522,6 +4526,8 @@ def build_kimi_k3_monokernel(
             mla_context_lens,
             mla_block_tables,
             mla_block_table_stride,
+            mla_block_size,
+            mla_block_ratio,
             mla_cache,
             mla_cache_scale,
             mla_rope_cos,

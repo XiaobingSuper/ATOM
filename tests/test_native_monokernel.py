@@ -782,24 +782,19 @@ def test_kimi_model_routes_mla_only_in_explicit_mode():
     assert "ReplaySSM" not in source
 
 
-def test_kimi_dense_mla_metadata_publishes_graph_stable_padded_query_map():
+def test_kimi_native_dense_mla_metadata_publishes_decode_and_capture_query_map():
     source = (
         Path(__file__).parents[1]
         / "atom"
-        / "plugin"
-        / "vllm"
-        / "attention"
-        / "metadata.py"
+        / "model_ops"
+        / "attentions"
+        / "aiter_mla.py"
     ).read_text()
 
-    dense = source[
-        source.index("class AiterMlaMetadataBuilderForVllm") :
-        source.index("class AiterMlaSparseMetadataBuilder")
-    ]
-    assert "self.batch_id_per_q_token_buffer = torch.full(" in dense
-    assert "batch_ids.fill_(-1)" in dense
-    assert "batch_id_per_q_token=batch_id_per_q_token" in dense
-    assert "slot_mapping = common_attn_metadata.slot_mapping\n" in dense
+    assert source.count("if max_seqlen_q > 1:") >= 1
+    assert source.count("if max_q_len > 1:") >= 2
+    assert "pad_to=running_tokens" in source
+    assert "pad_to=scheduled_tokens" in source
 
 
 def test_kimi_mla_cache_descale_binds_strict_impl_device_scalar():
@@ -2558,14 +2553,25 @@ def test_kimi_failed_prepare_preserves_existing_shared_reductions():
     assert runner._reductions == {(4, "staged"): existing}
 
 
-def test_kimi_memory_reserve_tracks_all_native_graph_buckets():
+def test_kimi_memory_reserve_tracks_kda_and_all_mla_graph_buckets():
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
-    runner._layer_specs = lambda _samples: [object(), object(), object()]
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(kv_cache_dtype="fp8")
+    layers = [
+        SimpleNamespace(is_linear_attn=True, block_sparse_moe=object()),
+        SimpleNamespace(is_linear_attn=True, block_sparse_moe=object()),
+        SimpleNamespace(is_linear_attn=False, block_sparse_moe=object()),
+        SimpleNamespace(is_linear_attn=False, block_sparse_moe=object()),
+    ]
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, start_layer=0, end_layer=4)
+    )
 
-    assert runner.memory_reserve_bytes() == 3 * (
-        (256 << 20) + 6 * (32 << 20)
+    assert runner.memory_reserve_bytes() == (
+        4 * (256 << 20)
+        + (2 * 6 + 2 * 3) * (32 << 20)
     )
 
 
@@ -2733,6 +2739,81 @@ def test_kimi_supports_agentic_q8_fp16_snapshots(monkeypatch, batch_capacity):
         torch.zeros(rows, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
     )
     assert prepared == [(rows, torch.float16, batch_capacity)]
+
+
+def test_kimi_native_dense_q8_metadata_reaches_atomic_prepare(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    rows = 8
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    scale = torch.ones(1, dtype=torch.float32)
+    layers = [
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=2,
+            is_linear_attn=False,
+            block_sparse_moe=object(),
+            self_attn=SimpleNamespace(
+                attn=SimpleNamespace(
+                    impl=SimpleNamespace(_k_scale_device=scale)
+                )
+            ),
+        ),
+    ]
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, start_layer=0, end_layer=2)
+    )
+    context = _kimi_agentic_context(1)
+    context.attn_metadata.slot_mapping = torch.arange(rows, dtype=torch.int64)
+    context.attn_metadata.batch_id_per_q_token = torch.zeros(
+        rows, dtype=torch.int32
+    )
+    context.attn_metadata.context_lens = torch.tensor([8], dtype=torch.int32)
+    context.attn_metadata.block_tables = torch.tensor([[0]], dtype=torch.int32)
+    context.attn_metadata.block_size = 128
+    context.attn_metadata.block_ratio = 128
+    context.kv_cache_data = {
+        "layer_1": SimpleNamespace(v_cache=torch.empty(1, dtype=torch.float16)),
+        "layer_2": SimpleNamespace(
+            k_cache=torch.empty(
+                128, 1, 576, dtype=torch.float8_e4m3fn
+            )
+        ),
+    }
+    monkeypatch.setattr(
+        module,
+        "_kda_state_pool_supported",
+        lambda _cache, **_kwargs: True,
+    )
+    monkeypatch.setattr(module, "get_forward_context", lambda: context)
+    prepared = []
+    runner._prepare = (
+        lambda samples, dtype, agentic_batch_size=0: prepared.append(
+            (samples, dtype, agentic_batch_size)
+        )
+        or True
+    )
+
+    assert runner.supports(
+        torch.arange(rows),
+        torch.arange(rows, dtype=torch.int64),
+        None,
+        torch.zeros(rows, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16),
+    )
+    assert prepared == [(rows, torch.float16, 1)]
 
 
 @pytest.mark.parametrize(

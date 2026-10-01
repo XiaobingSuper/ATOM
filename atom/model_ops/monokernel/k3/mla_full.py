@@ -304,6 +304,8 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
             runtime.context_lens.data_ptr(),
             runtime.block_tables.data_ptr(),
             runtime.block_tables.stride(0),
+            runtime.block_size,
+            runtime.block_ratio,
             main_cache.data_ptr(),
             main_scale.data_ptr(),
             rope_cos.data_ptr(),

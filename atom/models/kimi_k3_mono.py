@@ -42,7 +42,8 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-_NATIVE_BUCKETS = 6  # ordinary S4/S8 plus Agentic B1/B2/B4/B8 q=8
+_KDA_NATIVE_BUCKETS = 6  # ordinary S4/S8 plus Agentic B1/B2/B4/B8 q=8
+_MLA_NATIVE_BUCKETS = 3  # Agentic B1/B2/B4 q=8
 # Immutable projections/MoE weights are shared by S4/S8. Each bucket retains
 # only graph-stable activation/scratch workspaces.
 _PACKED_RESERVE_PER_LAYER = 256 << 20
@@ -452,12 +453,28 @@ class KimiMonoDecode:
 
         if not self._enabled:
             return 0
+        model = self._lm.model
+        layers = [
+            layer
+            for layer in model.layers[model.start_layer : model.end_layer]
+            if hasattr(layer, "block_sparse_moe")
+        ]
+        kda_layers = sum(
+            bool(getattr(layer, "is_linear_attn", False)) for layer in layers
+        )
+        mla_layers = (
+            len(layers) - kda_layers
+            if self._mode == "mono"
+            and self._atom_config.kv_cache_dtype == "fp8"
+            else 0
+        )
         return (
-            len(self._layer_specs(4))
-            * (
-                _PACKED_RESERVE_PER_LAYER
-                + _NATIVE_BUCKETS * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
+            (kda_layers + mla_layers) * _PACKED_RESERVE_PER_LAYER
+            + (
+                kda_layers * _KDA_NATIVE_BUCKETS
+                + mla_layers * _MLA_NATIVE_BUCKETS
             )
+            * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
         )
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
@@ -612,6 +629,8 @@ class KimiMonoDecode:
                     attention_metadata.batch_id_per_q_token[:samples],
                     attention_metadata.context_lens,
                     attention_metadata.block_tables,
+                    block_size=attention_metadata.block_size,
+                    block_ratio=attention_metadata.block_ratio,
                 )
                 del mla_runtime
                 for layer in mla_layers:
@@ -952,6 +971,8 @@ class KimiMonoDecode:
                     attention_metadata.batch_id_per_q_token[:samples],
                     attention_metadata.context_lens,
                     attention_metadata.block_tables,
+                    block_size=attention_metadata.block_size,
+                    block_ratio=attention_metadata.block_ratio,
                 )
                 attn = layer.self_attn
                 scale = _mla_cache_descale(layer, cache.k_cache)

@@ -235,8 +235,6 @@ class AiterMlaMetadataForVllm:
     num_actual_tokens: int  # Number of tokens excluding padding.
     query_start_loc: torch.Tensor
     slot_mapping: torch.Tensor
-    # Persistent flat query-row -> request map. CUDA-graph padding is -1.
-    batch_id_per_q_token: torch.Tensor
 
     # New for MLA (compared to FlashAttention)
     # For handling prefill decode split
@@ -1290,16 +1288,6 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             max_num_pages, dtype=torch.int32, device=device
         )
         self.qo_indptr = torch.zeros(max_num_reqs + 1, dtype=torch.int32, device=device)
-        # Kimi's full-layer q=8 path consumes the dense builder directly. Keep
-        # this allocation stable across capture/replay instead of relying on the
-        # sparse MLA builder's similarly named buffer.
-        max_num_batched_tokens = self.vllm_config.scheduler_config.max_num_batched_tokens
-        self.batch_id_per_q_token_buffer = torch.full(
-            (max_num_batched_tokens,),
-            -1,
-            dtype=torch.int32,
-            device=device,
-        )
 
         # reorder_batch_threshold is the widest query split_decodes_and_prefills
         # can route to _build_decode, so it is what these work descriptors have to
@@ -1407,40 +1395,6 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             self.fold_kv_last_page_len = torch.ones(
                 max_fold_bs, dtype=torch.int32, device=device
             )
-
-    def _publish_batch_id_per_q_token(
-        self,
-        query_start_loc: torch.Tensor,
-        *,
-        num_reqs: int,
-        num_tokens: int,
-        graph_rows: int,
-    ) -> torch.Tensor:
-        """Publish a graph-stable dense query map with an explicit pad sentinel."""
-
-        if graph_rows > self.batch_id_per_q_token_buffer.numel():
-            raise ValueError(
-                f"dense MLA graph width {graph_rows} exceeds token metadata "
-                f"capacity {self.batch_id_per_q_token_buffer.numel()}"
-            )
-        batch_ids = self.batch_id_per_q_token_buffer[:graph_rows]
-        batch_ids.fill_(-1)
-        query_lens = query_start_loc[1 : num_reqs + 1] - query_start_loc[:num_reqs]
-        live_batch_ids = torch.repeat_interleave(
-            torch.arange(
-                num_reqs,
-                dtype=torch.int32,
-                device=query_start_loc.device,
-            ),
-            query_lens,
-        )
-        if live_batch_ids.numel() != num_tokens:
-            raise ValueError(
-                f"dense MLA query map has {live_batch_ids.numel()} live rows, "
-                f"expected {num_tokens}"
-            )
-        batch_ids[:num_tokens].copy_(live_batch_ids)
-        return batch_ids
 
     # TODO: support mtp and sparse
     def _set_mla_persistent_worker_buffers(
@@ -1744,21 +1698,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         # it blocks on all previous kernels.
         device = self.device
         block_table_tensor = common_attn_metadata.block_table_tensor
-        # Preserve the CUDA-graph row width for the full-layer adapter. The
-        # ordinary MLA attention layer already slices this to num_actual_tokens
-        # before cache publication.
-        slot_mapping = common_attn_metadata.slot_mapping
+        # vLLM pads the slot mapping to the CUDA Graph bucket while counting
+        # query rows unpadded, and leaves the trim to its consumers. The MLA
+        # cache-store kernels take their token count from this tensor, so an
+        # untrimmed one makes them walk past the queries they were given.
+        slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
 
         query_start_loc = common_attn_metadata.query_start_loc
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens = common_attn_metadata.seq_lens
-        graph_rows = slot_mapping.numel()
-        batch_id_per_q_token = self._publish_batch_id_per_q_token(
-            query_start_loc,
-            num_reqs=num_reqs,
-            num_tokens=num_tokens,
-            graph_rows=graph_rows,
-        )
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
         if self.dcp_world_size > 1 and dcp_local_seq_lens is None:
             # DSpark's draft step builds its own attention metadata inside
@@ -2062,7 +2010,6 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
             num_actual_tokens=num_tokens,
             query_start_loc=query_start_loc,
             slot_mapping=slot_mapping,
-            batch_id_per_q_token=batch_id_per_q_token,
             head_dim=self.model_config.get_head_size(),
             # MLA metadata chunk prefill specific
             num_decodes=num_decodes,

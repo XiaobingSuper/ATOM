@@ -2702,6 +2702,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            block_size=self.model_runner.block_size,
+            block_ratio=self.block_ratio,
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
@@ -2719,6 +2721,14 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_metadata, k, v)
 
+        if max_seqlen_q > 1:
+            # Dense Kimi q8 consumes this directly in the model adapter. The
+            # shared publication buffer is graph-stable and marks the padded
+            # request tail with -1.
+            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
+                pad_to=running_tokens,
+            )
         if is_sparse_mtp:
             attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : running_tokens + 1
@@ -2726,11 +2736,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:running_tokens]
-            # Rectangular step: `max_seqlen_q` tokens per scheduled sequence.
-            attn_metadata.batch_id_per_q_token = self.publish_batch_ids(
-                np.full(scheduled_bs, max_seqlen_q, dtype=np.int32),
-                pad_to=running_tokens,
-            )
         elif self.is_sparse:
             # Non-MTP sparse decode (single token per seq): the sparse KV is
             # packed at page_size=1, so last_page_len is 1 for every seq. Expose
@@ -3016,6 +3021,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             kv_last_page_lens=var["kv_last_page_lens"].gpu[:bs],
             sparse_kv_indptr=sparse_kv_indptr,
             dcp_local_context_lens=dcp_local_context_lens,
+            block_size=self.model_runner.block_size,
+            block_ratio=self.block_ratio,
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
@@ -3028,6 +3035,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         if ctx_mla_ps_sparse is not None:
             for k, v in ctx_mla_ps_sparse.items():
                 setattr(attn_matadata, k, v)
+        if max_q_len > 1:
+            attn_matadata.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(bs, max_q_len, dtype=np.int32),
+                pad_to=scheduled_tokens,
+            )
         if is_sparse_mtp:
             attn_matadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : scheduled_tokens + 1
@@ -3038,9 +3050,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:scheduled_tokens]
-            attn_matadata.batch_id_per_q_token = self.publish_batch_ids(
-                np.full(bs, max_q_len, dtype=np.int32)
-            )
         elif self.is_sparse:
             # Non-MTP sparse decode capture: all-1s per-token last-page lens,
             # matching prepare_decode so _forward_decode reads the sparse buffer.
@@ -3106,6 +3115,8 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 if self.is_sparse
                 else None
             ),
+            block_size=self.model_runner.block_size,
+            block_ratio=self.block_ratio,
             work_meta_data=var[f"{p}work_meta_data"],
             work_info_set=var[f"{p}work_info_set"],
             work_indptr=var[f"{p}work_indptr"],
@@ -3113,6 +3124,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             reduce_final_map=var[f"{p}reduce_final_map"],
             reduce_partial_map=var[f"{p}reduce_partial_map"],
         )
+        if max_q_len > 1:
+            attn.batch_id_per_q_token = self.publish_batch_ids(
+                np.full(running_bs, max_q_len, dtype=np.int32),
+                pad_to=running_bs * max_q_len,
+            )
         attn.dtype_q = self.dtype_q
         # Per-ubatch round-robin CP global kv_indptr (None when non-DCP). Consumed
         # by _forward_decode when dcp>1 and max_q_len>1 (MTP).

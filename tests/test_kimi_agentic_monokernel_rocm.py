@@ -414,6 +414,7 @@ def _check_fp32_handoff(op, batch, expected, pairwise):
 def _check_moe_and_tp_output(op, rows, output):
     import torch
     import torch.distributed as dist
+    from types import SimpleNamespace
 
     if hasattr(op, "monokernel_scratch"):
         from atom.model_ops.monokernel.k3.mla_full_kernel import mla_full_layout
@@ -491,12 +492,206 @@ def _check_mla_attention_reference(
         batch_ids=batch_ids,
         context_lens=context_lens,
         block_tables=block_tables,
+        block_size=128,
+        block_ratio=128,
         fresh_slots=slot_mapping,
         fresh_values=fresh,
         softmax_scale=192**-0.5,
     )
     actual = fp32("mla_dense_acc", rows * heads * 512).view(rows, heads, 512)
     torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+def _full_mla_staged_oracle(
+    op,
+    weights,
+    *,
+    prefix,
+    blocks,
+    cache,
+    scale,
+    positions,
+    batch_ids,
+    context_lens,
+    block_tables,
+    slot_mapping,
+    rank,
+    reduce_group,
+):
+    """Independent PyTorch MLA frontend plus staged router/MoE/TP tail."""
+
+    import torch
+    import torch.distributed as dist
+    from types import SimpleNamespace
+
+    from atom.model_ops.monokernel.k3.mla_cache import (
+        dense_fp8_paged_mla_reference,
+    )
+    from atom.model_ops.monokernel.k3.staged import _KimiK3MlaPath
+
+    class ReferenceTail(_KimiK3MlaPath):
+        def __init__(self, arena, *args, **kwargs):
+            self._arena = arena
+            super().__init__(*args, **kwargs)
+
+        def _build_attention(self, *_args, **_kwargs):
+            return self._arena
+
+    t = weights.t
+    ref_blocks = blocks.clone()
+
+    def bf16_mm(value, weight):
+        return (value.float() @ weight.float().t()).to(torch.bfloat16)
+
+    def rms(value, gain):
+        normalized = value.float() * torch.rsqrt(
+            value.float().square().mean(-1, keepdim=True) + 1.0e-6
+        )
+        return (normalized * gain.float()).to(torch.bfloat16)
+
+    def attn_res(prefix_value, delta, norm_gain, mix_weight, output_gain, count):
+        updated = (
+            prefix_value
+            if delta is None
+            else (prefix_value.float() + delta.float()).to(torch.bfloat16)
+        )
+        sources = torch.cat((ref_blocks[:, :count], updated[:, None]), dim=1)
+        normalized = sources.float() * torch.rsqrt(
+            sources.float().square().mean(-1, keepdim=True) + 1.0e-6
+        )
+        logits = (
+            normalized * norm_gain.float() * mix_weight.float()
+        ).sum(-1)
+        mixed = (
+            torch.softmax(logits, dim=-1)[..., None] * sources.float()
+        ).sum(1).to(torch.bfloat16)
+        return rms(mixed, output_gain), updated
+
+    pre_attn, _ = attn_res(
+        prefix,
+        None,
+        t["g_self_res"],
+        t["w_self_res"],
+        t["g_in"],
+        op.previous_valid_blocks,
+    )
+
+    qkv = bf16_mm(pre_attn, t["w_qkv_a"])[
+        :, : op.config.q_lora + op.config.kv_lora + op.config.pe_dim
+    ]
+    q_raw = qkv[:, : op.config.q_lora]
+    kv_raw = qkv[:, op.config.q_lora :]
+
+    q_norm = rms(q_raw, t["g_q"])
+    kv_norm = rms(kv_raw[:, : op.config.kv_lora], t["g_kv"])
+    key_pe = kv_raw[:, op.config.kv_lora :]
+    q = bf16_mm(q_norm, t["w_q_b"]).view(
+        prefix.shape[0],
+        op.config.local_heads,
+        op.config.nope_dim + op.config.pe_dim,
+    )
+    # The gate uses identity RoPE (cos=1, sin=0), so key_pe and q[...,128:]
+    # are already the rotated values.
+    fresh = (
+        torch.cat((kv_norm, key_pe), dim=-1)
+        .to(torch.bfloat16)
+        .reshape(prefix.shape[0], 576)
+        .contiguous()
+    )
+    uk = t["w_uk"].view(
+        op.config.local_heads,
+        op.config.kv_lora,
+        op.config.nope_dim,
+    )
+    q_latent = torch.einsum(
+        "rhd,hkd->rhk",
+        q[..., : op.config.nope_dim].float(),
+        uk.float(),
+    ).to(torch.bfloat16)
+    query = torch.cat((q_latent, q[..., op.config.nope_dim :]), dim=-1)
+    dense, _ = dense_fp8_paged_mla_reference(
+        query=query.contiguous(),
+        main_cache=cache,
+        main_scale=scale,
+        positions=positions,
+        batch_ids=batch_ids,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        block_size=128,
+        block_ratio=128,
+        fresh_slots=slot_mapping.reshape(-1).to(torch.int64).contiguous(),
+        fresh_values=fresh,
+        softmax_scale=192**-0.5,
+    )
+    uv = t["w_uv"].view(
+        op.config.local_heads,
+        op.config.v_dim,
+        op.config.kv_lora,
+    )
+    attended = torch.einsum(
+        "rhk,hvk->rhv",
+        dense,
+        uv.float(),
+    )
+    gate = bf16_mm(pre_attn, t["w_gate"]).view_as(attended)
+    attended.mul_(torch.sigmoid(gate.float()))
+    local_attention = bf16_mm(
+        attended.to(torch.bfloat16).flatten(1),
+        t["w_o"],
+    )
+    peer_attention = [
+        torch.empty_like(local_attention) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(peer_attention, local_attention, group=reduce_group)
+    attention_delta = torch.zeros_like(local_attention, dtype=torch.float32)
+    for peer in peer_attention:
+        attention_delta.add_(peer.float())
+    attention_delta = attention_delta.to(torch.bfloat16)
+
+    post_prefix = attention_delta if op.is_block_write_layer else prefix
+    post_delta = None if op.is_block_write_layer else attention_delta
+    moe_input, residual = attn_res(
+        post_prefix,
+        post_delta,
+        t["g_mlp_res"],
+        t["w_mlp_res"],
+        t["g_post"],
+        op.previous_valid_blocks + int(op.is_block_write_layer),
+    )
+    output = torch.empty_like(prefix)
+    for start in range(0, prefix.shape[0], 8):
+        arena = SimpleNamespace(
+            step=torch.zeros(1, dtype=torch.int32, device=prefix.device),
+            packed_artifacts=lambda: {},
+            close=lambda: None,
+        )
+        reference = ReferenceTail(
+            arena,
+            weights,
+            8,
+            layer_idx=op.layer_idx,
+            rank=rank,
+            npes=8,
+            group=None,
+            reduce_group=reduce_group,
+            fuse_attn_res=False,
+            fuse_router=True,
+            fuse_shared_experts=True,
+            packed_artifacts=op.packed_artifacts(),
+        )
+        reference.t = dict(reference.t)
+        reference.t["bias"] = reference.t["bias"].to(torch.bfloat16)
+        chunk = slice(start, start + 8)
+        reference.latent_projection.quantize_input(moe_input[chunk])
+        reference._moe(
+            moe_input[chunk],
+            op.layer_idx,
+            residual[chunk],
+            output[chunk],
+        )
+        reference.symmetric_allreduce.close()
+    output[batch_ids < 0] = 0
+    return output
 
 
 def _slot_table(batch, slots, shift, device):
@@ -769,14 +964,17 @@ def _tp8_worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
-def _exercise_mla_batch(op, batch, device) -> None:
+def _exercise_mla_batch(op, batch, device, weights) -> None:
+    import numpy as np
     import torch
     import torch.distributed as dist
     from types import SimpleNamespace
 
     from atom.models.kimi_k3_mono import KimiMonoDecode
+    from atom.model_ops.attentions.aiter_mla import AiterMLAMetadataBuilder
     from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
     from atom.model_ops.monokernel.telemetry import MonoRouteStats
+    from atom.utils import CpuGpuBuffer
     from atom.utils.forward_context import get_forward_context
 
     rows = batch * 8
@@ -797,12 +995,21 @@ def _exercise_mla_batch(op, batch, device) -> None:
     )
     # Eight fresh rows straddle two logical blocks. Older rows are already
     # resident in a separately permuted physical cache.
-    positions = torch.arange(13, 21, dtype=torch.int64, device=device).repeat(batch)
-    batch_ids = torch.arange(
-        batch,
-        dtype=torch.int32,
-        device=device,
-    ).repeat_interleave(8)
+    positions = torch.arange(125, 133, dtype=torch.int64, device=device).repeat(batch)
+    metadata_builder = object.__new__(AiterMLAMetadataBuilder)
+    metadata_builder.model_runner = SimpleNamespace(
+        forward_vars={
+            "batch_id_per_q_token": CpuGpuBuffer(
+                rows,
+                dtype=torch.int32,
+                device=device,
+            )
+        }
+    )
+    batch_ids = metadata_builder.publish_batch_ids(
+        np.full(batch, 8, dtype=np.int32),
+        pad_to=rows,
+    )
     physical_blocks = torch.arange(
         2 * batch - 1,
         -1,
@@ -811,20 +1018,20 @@ def _exercise_mla_batch(op, batch, device) -> None:
         device=device,
     )
     block_tables = physical_blocks.view(batch, 2).contiguous()
-    logical_blocks = positions.view(batch, 8).div(16, rounding_mode="floor")
-    offsets = positions.view(batch, 8).remainder(16)
+    logical_blocks = positions.view(batch, 8).div(128, rounding_mode="floor")
+    offsets = positions.view(batch, 8).remainder(128)
     slot_mapping = (
-        block_tables.gather(1, logical_blocks.to(torch.int64)).to(torch.int64) * 16
+        block_tables.gather(1, logical_blocks.to(torch.int64)).to(torch.int64) * 128
         + offsets
     ).reshape(-1).contiguous()
     context_lens = torch.full(
         (batch,),
-        21,
+        133,
         dtype=torch.int32,
         device=device,
     )
     cache = torch.zeros(
-        2 * batch * 16,
+        2 * batch * 128,
         1,
         576,
         dtype=torch.float8_e4m3fn,
@@ -832,9 +1039,9 @@ def _exercise_mla_batch(op, batch, device) -> None:
     )
     cache_rows = cache.view(-1, 576)
     for request in range(batch):
-        for logical_position in range(13):
-            logical_block, offset = divmod(logical_position, 16)
-            physical = int(block_tables[request, logical_block]) * 16 + offset
+        for logical_position in range(125):
+            logical_block, offset = divmod(logical_position, 128)
+            physical = int(block_tables[request, logical_block]) * 128 + offset
             values = (
                 torch.arange(576, device=device, dtype=torch.float32)
                 .remainder(31)
@@ -843,7 +1050,7 @@ def _exercise_mla_batch(op, batch, device) -> None:
             )
             cache_rows[physical].copy_(values.to(torch.float8_e4m3fn))
     scale = torch.tensor([0.015625], dtype=torch.float32, device=device)
-    rope_cos = torch.ones(32, 1, 1, 32, device=device)
+    rope_cos = torch.ones(256, 1, 1, 32, device=device)
     rope_sin = torch.zeros_like(rope_cos)
     output = torch.empty_like(prefix)
 
@@ -851,7 +1058,8 @@ def _exercise_mla_batch(op, batch, device) -> None:
         block_write_idx = 0
 
         @staticmethod
-        def forward(hidden_states, *_args, **_kwargs):
+        def forward(hidden_states, block_residual, *_args, **_kwargs):
+            block_residual[:, 0].copy_(hidden_states)
             return hidden_states
 
     kda_layer = SimpleNamespace(
@@ -914,6 +1122,8 @@ def _exercise_mla_batch(op, batch, device) -> None:
         batch_id_per_q_token=batch_ids,
         context_lens=context_lens,
         block_tables=block_tables,
+        block_size=128,
+        block_ratio=128,
     )
     conv = torch.zeros(
         rows,
@@ -948,9 +1158,26 @@ def _exercise_mla_batch(op, batch, device) -> None:
     # All keys are already populated, but this still exercises the production
     # atomic prepare path used by supports().
     assert adapter._prepare(rows, torch.float16, batch)
+    blocks[:, 0].copy_(prefix)
+    expected_output = _full_mla_staged_oracle(
+        op,
+        weights,
+        prefix=prefix,
+        blocks=blocks,
+        cache=cache,
+        scale=scale,
+        positions=positions,
+        batch_ids=batch_ids,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        slot_mapping=slot_mapping,
+        rank=dist.get_rank(),
+        reduce_group=dist.group.WORLD,
+    )
     output.copy_(adapter.forward(input_ids, positions, prefix))
     torch.cuda.synchronize(device)
     assert torch.isfinite(output).all() and output.abs().max() > 0
+    torch.testing.assert_close(output, expected_output, atol=8e-2, rtol=8e-2)
     _check_mla_attention_reference(
         op,
         cache=cache,
@@ -971,7 +1198,28 @@ def _exercise_mla_batch(op, batch, device) -> None:
 
     padded_cache_before = None
     for replay in range(3):
+        expected_eager = _full_mla_staged_oracle(
+            op,
+            weights,
+            prefix=prefix,
+            blocks=blocks,
+            cache=cache,
+            scale=scale,
+            positions=positions,
+            batch_ids=batch_ids,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            slot_mapping=slot_mapping,
+            rank=dist.get_rank(),
+            reduce_group=dist.group.WORLD,
+        )
         eager_output = adapter.forward(input_ids, positions, prefix).clone()
+        torch.testing.assert_close(
+            eager_output,
+            expected_eager,
+            atol=8e-2,
+            rtol=8e-2,
+        )
         output.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize(device)
@@ -1005,10 +1253,10 @@ def _exercise_mla_batch(op, batch, device) -> None:
             batch_ids[-8:].fill_(batch - 1)
             slot_mapping[-8:].copy_(
                 block_tables[-1].gather(
-                    0, positions[-8:].div(16, rounding_mode="floor")
+                    0, positions[-8:].div(128, rounding_mode="floor")
                 ).to(torch.int64)
-                * 16
-                + positions[-8:].remainder(16)
+                * 128
+                + positions[-8:].remainder(128)
             )
 
 
@@ -1033,7 +1281,7 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
             op = KimiK3MlaMonoKernel(
                 weights,
                 batch * 8,
-                layer_idx=0,
+                layer_idx=1,
                 rank=rank,
                 npes=8,
                 group=None,
@@ -1042,7 +1290,7 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
                 packed_artifacts=packed,
             )
             packed = op.packed_artifacts()
-            _exercise_mla_batch(op, batch, device)
+            _exercise_mla_batch(op, batch, device, weights)
             op.close()
             dist.barrier()
     finally:

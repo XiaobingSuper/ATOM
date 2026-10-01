@@ -1563,6 +1563,8 @@ def test_kimi_mla_q8_runtime_binds_graph_stable_dense_metadata(batch_capacity):
         batch_ids,
         context_lens,
         blocks,
+        block_size=128,
+        block_ratio=128,
     )
 
     assert runtime.positions.data_ptr() == positions.data_ptr()
@@ -1600,14 +1602,15 @@ def test_kimi_mla_dense_visibility_uses_arbitrary_physical_blocks():
         torch.arange(16, dtype=torch.int32) // 8,
         torch.tensor([15, 24], dtype=torch.int32),
         block_tables,
+        block_size=128,
+        block_ratio=128,
     )
 
     assert runtime.visible_physical_slots(0) == [
-        *range(11 * 16, 11 * 16 + 8),
+        *range(11 * 128, 11 * 128 + 8),
     ]
     assert runtime.visible_physical_slots(8) == [
-        *range(7 * 16, 7 * 16 + 16),
-        19 * 16,
+        *range(7 * 128, 7 * 128 + 17),
     ]
 
 
@@ -1632,6 +1635,8 @@ def test_kimi_mla_padding_rows_do_not_write_or_attend():
         batch_ids,
         torch.tensor([3], dtype=torch.int32),
         torch.tensor([[5]], dtype=torch.int32),
+        block_size=128,
+        block_ratio=128,
     )
 
     assert runtime.cache_writers().tolist() == [True, True, True, False, False, False, False, False]
@@ -1685,8 +1690,8 @@ def test_kimi_mla_fp8_dense_reference_consumes_fresh_same_launch_rows():
         dense_fp8_paged_mla_reference,
     )
 
-    cache = torch.zeros(32, 1, 576, dtype=torch.float8_e4m3fn)
-    cache[16, 0, :512] = 4
+    cache = torch.zeros(256, 1, 576, dtype=torch.float8_e4m3fn)
+    cache[128:256, 0, :512] = 4
     query = torch.zeros(2, 1, 576, dtype=torch.bfloat16)
     fresh = torch.zeros(1, 576, dtype=torch.bfloat16)
     fresh[0, :512] = 2
@@ -1695,16 +1700,23 @@ def test_kimi_mla_fp8_dense_reference_consumes_fresh_same_launch_rows():
         query=query,
         main_cache=cache,
         main_scale=torch.ones(1, dtype=torch.float32),
-        positions=torch.tensor([16, 17], dtype=torch.int64),
+        positions=torch.tensor([128, 129], dtype=torch.int64),
         batch_ids=torch.tensor([0, -1], dtype=torch.int32),
-        context_lens=torch.tensor([17], dtype=torch.int32),
-        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
-        fresh_slots=torch.tensor([16], dtype=torch.int64),
+        context_lens=torch.tensor([129], dtype=torch.int32),
+        block_tables=torch.tensor([[1, 0]], dtype=torch.int32),
+        block_size=128,
+        block_ratio=128,
+        fresh_slots=torch.tensor([0], dtype=torch.int64),
         fresh_values=fresh,
         softmax_scale=1.0,
     )
 
-    assert torch.equal(output[0], torch.full_like(output[0], 2.0 / 17.0))
+    torch.testing.assert_close(
+        output[0],
+        torch.full_like(output[0], (128.0 * 4.0 + 2.0) / 129.0),
+        atol=1e-6,
+        rtol=1e-6,
+    )
     assert torch.equal(output[1], torch.zeros_like(output[1]))
     assert torch.isfinite(lse[0]).all()
     assert torch.isneginf(lse[1]).all()

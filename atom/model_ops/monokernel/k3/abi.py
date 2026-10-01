@@ -156,6 +156,8 @@ class KimiMlaAgenticRuntime:
     batch_ids: torch.Tensor
     context_lens: torch.Tensor
     block_tables: torch.Tensor
+    block_size: int
+    block_ratio: int
 
     @classmethod
     def bind(
@@ -166,6 +168,9 @@ class KimiMlaAgenticRuntime:
         batch_ids: torch.Tensor,
         context_lens: torch.Tensor,
         block_tables: torch.Tensor,
+        *,
+        block_size: int,
+        block_ratio: int,
     ) -> "KimiMlaAgenticRuntime":
         batch = shape.common.batch_capacity
         rows = shape.common.row_capacity
@@ -212,6 +217,11 @@ class KimiMlaAgenticRuntime:
         )
         if any(value.device != positions.device for value in tensors[1:]):
             raise ValueError("Kimi MLA metadata must use one device")
+        if block_size != 128 or block_ratio != 128:
+            raise ValueError(
+                "Kimi MLA MonoKernel requires scheduler block_size=128 "
+                "and token-page block_ratio=128"
+            )
         return cls(
             shape,
             positions,
@@ -219,6 +229,8 @@ class KimiMlaAgenticRuntime:
             batch_ids,
             context_lens,
             block_tables,
+            block_size,
+            block_ratio,
         )
 
     def cache_writers(self) -> torch.Tensor:
@@ -250,6 +262,8 @@ class KimiMlaAgenticRuntime:
                 self.block_tables,
                 batch_id=batch_id,
                 position=logical,
+                block_size=self.block_size,
+                block_ratio=self.block_ratio,
             )
             for logical in range(visible)
         ]

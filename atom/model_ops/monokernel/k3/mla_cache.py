@@ -9,22 +9,29 @@ import torch
 
 from atom.model_ops.monokernel.config import FP8_MAX
 
-PHYSICAL_BLOCK_SIZE = 16
 PHYSICAL_PAGE_SIZE = 1
 MLA_CACHE_ROW = 576
 MLA_VALUE_ROW = 512
 
 
-def physical_cache_slot(block: int, offset: int) -> int:
-    """Flatten one block-16/page-1 cache location to a physical slot."""
+def physical_cache_slot(
+    block: int,
+    offset: int,
+    *,
+    block_size: int,
+    block_ratio: int,
+) -> int:
+    """Flatten one scheduler block into the token-page physical cache."""
 
     if block < 0:
         raise ValueError(f"block must be non-negative, got {block}")
-    if not 0 <= offset < PHYSICAL_BLOCK_SIZE:
+    if block_size <= 0 or block_ratio <= 0 or block_size != block_ratio:
+        raise ValueError("Kimi MLA requires one physical cache row per token")
+    if not 0 <= offset < block_size:
         raise ValueError(
-            f"offset must be in [0, {PHYSICAL_BLOCK_SIZE}), got {offset}"
+            f"offset must be in [0, {block_size}), got {offset}"
         )
-    return block * PHYSICAL_BLOCK_SIZE + offset
+    return block * block_ratio + offset
 
 
 def logical_to_physical_slot(
@@ -32,6 +39,8 @@ def logical_to_physical_slot(
     *,
     batch_id: int,
     position: int,
+    block_size: int,
+    block_ratio: int,
 ) -> int:
     """Map one request-local logical token to its physical cache slot."""
 
@@ -45,12 +54,14 @@ def logical_to_physical_slot(
         raise ValueError(f"batch_id {batch_id} is outside the block table")
     if position < 0:
         raise ValueError(f"position must be non-negative, got {position}")
-    logical_block, offset = divmod(position, PHYSICAL_BLOCK_SIZE)
+    logical_block, offset = divmod(position, block_size)
     if logical_block >= block_tables.shape[1]:
         raise ValueError(f"position {position} exceeds the block-table capacity")
     return physical_cache_slot(
         int(block_tables[batch_id, logical_block]),
         offset,
+        block_size=block_size,
+        block_ratio=block_ratio,
     )
 
 
@@ -143,6 +154,8 @@ def dense_fp8_paged_mla_reference(
     batch_ids: torch.Tensor,
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
+    block_size: int,
+    block_ratio: int,
     fresh_slots: torch.Tensor | None = None,
     fresh_values: torch.Tensor | None = None,
     softmax_scale: float,
@@ -220,6 +233,8 @@ def dense_fp8_paged_mla_reference(
                 block_tables,
                 batch_id=batch_id,
                 position=logical,
+                block_size=block_size,
+                block_ratio=block_ratio,
             )
             for logical in range(visible)
         ]
@@ -249,7 +264,6 @@ def dense_fp8_paged_mla_reference(
 __all__ = [
     "MLA_CACHE_ROW",
     "MLA_VALUE_ROW",
-    "PHYSICAL_BLOCK_SIZE",
     "dense_fp8_paged_mla_reference",
     "logical_to_physical_slot",
     "physical_cache_slot",
