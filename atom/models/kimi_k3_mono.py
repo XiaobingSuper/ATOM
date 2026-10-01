@@ -33,6 +33,7 @@ from atom.model_ops.monokernel.dispatch import (
     select_backend,
     tp_uniform_local_validation,
 )
+from atom.model_ops.monokernel.layout import symmetric_allreduce_nbytes
 from atom.model_ops.monokernel.telemetry import MonoRouteStats
 from atom.model_ops.monokernel.weights import (
     LayerWeights,
@@ -40,6 +41,7 @@ from atom.model_ops.monokernel.weights import (
     linear_bf16,
 )
 from atom.plugin.prepare import is_plugin_mode
+from atom.utils import envs
 from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
@@ -83,11 +85,23 @@ _FULL_DENSE_PACKED_BYTES = (
     + _HIDDEN * (33792 // 8) * 2
 )
 _FULL_WORKSPACE_PER_LAYER_BUCKET = 8 << 20
-_FULL_SHARED_BYTES = (
+_FULL_SHARED_ARENA_BYTES = (
     8_969_472
     + max(KIMI_MLA_AGENTIC_ROWS) * 8 * _HIDDEN * 2
     + 4
 )
+_FULL_COLLECTIVE_BYTES = sum(
+    symmetric_allreduce_nbytes((rows * _HIDDEN,), 8)
+    + symmetric_allreduce_nbytes(
+        (
+            rows * KIMI_K3_CONFIG.routed_hidden,
+            rows * _HIDDEN,
+        ),
+        8,
+    )
+    for rows in KIMI_MLA_AGENTIC_ROWS
+)
+_FULL_SHARED_BYTES = _FULL_SHARED_ARENA_BYTES + _FULL_COLLECTIVE_BYTES
 
 
 def _need(ok: bool, what: str) -> None:
@@ -553,6 +567,16 @@ class KimiFullModelPlan:
         if hasattr(op, "step"):
             op.step = epoch
 
+    @staticmethod
+    def _track_collectives(tracked: dict[int, object], op) -> None:
+        attention = getattr(op, "attention", None)
+        for resource in (
+            getattr(attention, "symmetric_allreduce", None),
+            getattr(op, "symmetric_allreduce", None),
+        ):
+            if resource is not None:
+                tracked[id(resource)] = resource
+
     def commit(
         self,
         candidates,
@@ -597,6 +621,7 @@ class KimiFullModelPlan:
             getattr(runner, "_packed_artifacts", {})
         )
         reductions = {}
+        tracked_collectives: dict[int, object] = {}
         max_arena = block_residual = model_epoch = None
         from atom.model_ops.monokernel.k3.kernel import (
             monokernel_scratch_nbytes,
@@ -749,6 +774,15 @@ class KimiFullModelPlan:
                         ValueError,
                     ) as caught:
                         error = caught
+                    finally:
+                        self._track_collectives(
+                            tracked_collectives,
+                            owned.op,
+                        )
+                        if initialized is not None:
+                            for resource in initialized:
+                                if resource is not None:
+                                    tracked_collectives[id(resource)] = resource
                     tp_uniform_local_validation(
                         error,
                         group=tp.cpu_group,
@@ -781,13 +815,8 @@ class KimiFullModelPlan:
             RuntimeError,
             ValueError,
         ) as error:
-            closed = set()
-            for attention, moe in reversed(tuple(reductions.values())):
-                for resource in (moe, attention):
-                    if resource is None or id(resource) in closed:
-                        continue
-                    resource.close()
-                    closed.add(id(resource))
+            for resource in reversed(tuple(tracked_collectives.values())):
+                resource.close()
             logger.warning(
                 "Kimi-K3 full-plan fallback before launch: %s",
                 error,
@@ -846,6 +875,7 @@ class KimiMonoDecode:
         self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
         self._refused: set[tuple[int, int, str, torch.dtype, int]] = set()
         self._full_plan = KimiFullModelPlan(self)
+        self._capture_full_route_decision: bool | None = None
         self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
         if not self._enabled:
@@ -904,19 +934,18 @@ class KimiMonoDecode:
         }:
             return 0
         model = self._lm.model
+        speculative = getattr(self._atom_config, "speculative_config", None)
+        dspark = getattr(speculative, "method", None) == "dspark"
+        full_dspark = self._full_route_eligible()
+        if self._mode in {"auto", "mono"} and dspark and not full_dspark:
+            return 0
+        if self._mode == "auto" and not full_dspark:
+            return 0
         dcp = getattr(
             self._atom_config,
             "decode_context_parallel_size",
             1,
         ) > 1
-        speculative = getattr(self._atom_config, "speculative_config", None)
-        full_dspark = (
-            self._mode in {"auto", "mono"}
-            and getattr(speculative, "method", None) == "dspark"
-            and not dcp
-        )
-        if self._mode == "auto" and not full_dspark:
-            return 0
         layers = tuple(
             model.layers[model.start_layer : model.end_layer]
         )
@@ -980,27 +1009,98 @@ class KimiMonoDecode:
             + workspace_buckets * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
         )
 
-    def prepare_for_capture(self) -> bool:
-        """Build the complete DSpark plan before any graph capture begins."""
-
-        if not self._enabled or self._mode not in {"auto", "mono"}:
-            return True
+    def _full_route_eligible(
+        self,
+        *,
+        samples: int | None = None,
+        query_len: int = 8,
+        replay_ssm: bool = False,
+    ) -> bool:
         speculative = getattr(
             self._atom_config,
             "speculative_config",
             None,
         )
         if (
-            getattr(speculative, "method", None) != "dspark"
+            not self._enabled
+            or self._mode not in {"auto", "mono"}
+            or self._atom_config.tensor_parallel_size != 8
             or getattr(
                 self._atom_config,
                 "decode_context_parallel_size",
                 1,
             )
-            > 1
+            != 1
+            or self._atom_config.kv_cache_dtype != "fp8"
+            or getattr(
+                speculative,
+                "method",
+                None,
+            )
+            != "dspark"
+            or int(
+                getattr(speculative, "num_speculative_tokens", 7)
+                or 0
+            )
+            != 7
+            or envs.ATOM_ENABLE_REPLAYSSM is True
+            or replay_ssm
         ):
+            return False
+        if samples is not None and (
+            samples not in KIMI_MLA_AGENTIC_ROWS or query_len != 8
+        ):
+            return False
+        model = getattr(getattr(self, "_lm", None), "model", None)
+        if model is None:
+            return False
+        layers = tuple(model.layers[model.start_layer : model.end_layer])
+        expected_layers = getattr(
+            getattr(self._lm, "config", None),
+            "num_hidden_layers",
+            model.end_layer,
+        )
+        if (
+            not layers
+            or model.start_layer != 0
+            or model.end_layer != expected_layers
+            or len(layers) != expected_layers
+            or any(
+                layer.layer_idx != index
+                for index, layer in enumerate(layers)
+            )
+        ):
+            return False
+        try:
+            return all(
+                (
+                    layer.layer_idx == 0
+                    and KimiFullModelPlan._backend(layer) == "dense_full"
+                )
+                or (
+                    layer.layer_idx > 0
+                    and hasattr(layer, "block_sparse_moe")
+                    and KimiFullModelPlan._backend(layer)
+                    in {"mono", "mla_full"}
+                )
+                for layer in layers
+            )
+        except MonoUnsupported:
+            return False
+
+    def begin_capture_lifecycle(self) -> None:
+        """Reset the capture-wide all-or-baseline decision."""
+
+        self._capture_full_route_decision = None
+
+    def prepare_for_capture(self) -> bool:
+        """Build the complete DSpark plan before any graph capture begins."""
+
+        if not self._full_route_eligible():
             return True
-        return self._full_plan.prepare()
+        if self._capture_full_route_decision is None:
+            self._capture_full_route_decision = self._full_plan.prepare()
+        return self._capture_full_route_decision
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
         samples = input_ids.numel()
@@ -1029,6 +1129,17 @@ class KimiMonoDecode:
         speculative = getattr(self._atom_config, "speculative_config", None)
         if agentic and getattr(speculative, "method", None) != "dspark":
             return self._fallback("spec_method", samples)
+        full_route = agentic and self._full_route_eligible(
+            samples=samples,
+            query_len=query_len,
+            replay_ssm=replay_ssm,
+        )
+        if (
+            agentic
+            and self._mode in {"auto", "mono"}
+            and not full_route
+        ):
+            return self._fallback("full_route", samples)
         backend = select_backend(
             "kimi_k3",
             self._mode,
@@ -1172,17 +1283,24 @@ class KimiMonoDecode:
         prepared = False
         if state_dtype is not None:
             full_plan = getattr(self, "_full_plan", None)
-            if (
-                agentic
-                and self._mode in {"auto", "mono"}
-                and full_plan is not None
-            ):
+            if full_route and full_plan is not None:
                 if (
                     torch.cuda.is_current_stream_capturing()
                     and not full_plan.ready
                 ):
                     return self._fallback("capture_prepare", samples)
-                prepared = full_plan.prepare()
+                decision = getattr(
+                    self,
+                    "_capture_full_route_decision",
+                    None,
+                )
+                if decision is False:
+                    return self._fallback("capture_prepare", samples)
+                prepared = (
+                    decision
+                    if decision is not None
+                    else full_plan.prepare()
+                )
             else:
                 prepared = (
                     self._prepare(

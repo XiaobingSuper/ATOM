@@ -1306,6 +1306,7 @@ def _exercise_mla_batch(op, batch, device, weights) -> None:
     adapter._weights = {}
     adapter._packed_artifacts = {}
     adapter._reductions = {}
+    adapter._full_route_eligible = lambda **_kwargs: True
     key_kda = (0, rows, "mono", torch.float16, batch)
     key_mla = (1, rows, "mla_full", torch.float16, batch)
     adapter._ops = {
@@ -1486,6 +1487,9 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
         weights = _deterministic_mla_weights(device, rank)
         packed = None
         for batch in (1, 2, 4):
+            previous_w_o = (
+                None if packed is None else packed["w_o_packed"]
+            )
             op = KimiK3MlaMonoKernel(
                 weights,
                 batch * 8,
@@ -1497,6 +1501,8 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
                 defer_collectives=False,
                 packed_artifacts=packed,
             )
+            if previous_w_o is not None:
+                assert op.w_o_packed is previous_w_o
             packed = op.packed_artifacts()
             _exercise_mla_batch(op, batch, device, weights)
             op.close()

@@ -945,6 +945,75 @@ def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
     assert plan.packed_artifacts == {}
 
 
+def test_kimi_full_model_plan_closes_partial_collectives_once(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=0, is_linear_attn=True),
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+    ]
+    runner = SimpleNamespace(
+        _lm=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=layers, start_layer=0, end_layer=2
+            )
+        )
+    )
+    resources = []
+
+    class Resource:
+        def __init__(self):
+            self.closed = 0
+            resources.append(self)
+
+        def close(self):
+            self.closed += 1
+
+    class Owned:
+        def __init__(self, layer, *_args, **_kwargs):
+            self.layer = layer
+            self.op = SimpleNamespace(
+                monokernel_scratch=torch.empty(1, dtype=torch.uint8),
+                block_write_idx=0,
+                attention=SimpleNamespace(symmetric_allreduce=None),
+                symmetric_allreduce=None,
+                packed_artifacts=lambda: {},
+                release_packed_sources=lambda: None,
+            )
+
+        def initialize_collectives(self, attention=None, moe=None):
+            self.op.attention.symmetric_allreduce = attention or Resource()
+            if self.layer.layer_idx == 0:
+                raise RuntimeError("injected MoE collective failure")
+            self.op.symmetric_allreduce = moe or Resource()
+            return (
+                self.op.attention.symmetric_allreduce,
+                self.op.symmetric_allreduce,
+            )
+
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    plan = module.KimiFullModelPlan(runner)
+    assert not plan.prepare()
+    assert resources
+    assert all(resource.closed == 1 for resource in resources)
+
+
 def test_kimi_full_model_forward_routes_every_layer_without_fallback(
     monkeypatch,
 ):
@@ -2916,7 +2985,10 @@ def _kimi_memory_reserve_runner(mode, spec_method):
         tensor_parallel_size=8,
         decode_context_parallel_size=1,
         kv_cache_dtype="fp8",
-        speculative_config=SimpleNamespace(method=spec_method),
+        speculative_config=SimpleNamespace(
+            method=spec_method,
+            num_speculative_tokens=7,
+        ),
     )
     layers = [
         SimpleNamespace(
@@ -3060,6 +3132,52 @@ def test_kimi_full_plan_reserve_uses_shared_arena_not_phantom_per_layer():
     assert expected < phantom // 2
 
 
+def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
+    from atom.model_ops.monokernel.layout import (
+        symmetric_allreduce_nbytes,
+    )
+
+    module = _kimi_mono_module()
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+    packed = (
+        module._FULL_DENSE_PACKED_BYTES
+        + module._FULL_KDA_PACKED_BYTES
+        + 2 * module._FULL_MLA_PACKED_BYTES
+    )
+    workspaces = 4 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+    mailboxes = sum(
+        symmetric_allreduce_nbytes(
+            (rows * module.KIMI_K3_CONFIG.hidden,),
+            8,
+        )
+        + symmetric_allreduce_nbytes(
+            (
+                rows * module.KIMI_K3_CONFIG.routed_hidden,
+                rows * module.KIMI_K3_CONFIG.hidden,
+            ),
+            8,
+        )
+        for rows in module.KIMI_MLA_AGENTIC_ROWS
+    )
+
+    assert runner.memory_reserve_bytes() == (
+        packed
+        + workspaces
+        + module._FULL_SHARED_ARENA_BYTES
+        + mailboxes
+    )
+
+
+def test_kimi_mla_output_projection_is_a_shared_packed_artifact():
+    from atom.model_ops.monokernel.k3.mla_full import (
+        KimiK3MlaMonoKernel,
+    )
+
+    source = inspect.getsource(KimiK3MlaMonoKernel)
+    assert 'packed_artifacts.get("w_o_packed")' in source
+    assert '"w_o_packed": self.w_o_packed' in source
+
+
 def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():
     source = (
         Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
@@ -3102,6 +3220,64 @@ def test_kimi_constructor_defers_agentic_gates_to_each_forward(monkeypatch, over
     runner = module.KimiMonoDecode(None, config, "auto")
 
     assert runner._enabled is True
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"kv_cache_dtype": "bf16"},
+        {"decode_context_parallel_size": 2},
+        {"speculative_config": SimpleNamespace(method="eagle")},
+    ),
+)
+def test_kimi_full_route_unsupported_config_reserves_and_builds_nothing(
+    override,
+):
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+    for name, value in override.items():
+        setattr(runner._atom_config, name, value)
+    calls = []
+    runner._full_plan = SimpleNamespace(
+        prepare=lambda: calls.append("prepare") or True
+    )
+
+    assert runner.memory_reserve_bytes() == 0
+    runner.begin_capture_lifecycle()
+    assert runner.prepare_for_capture()
+    assert calls == []
+
+
+def test_kimi_full_route_rejects_non_q8_and_incomplete_topology():
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+
+    assert not runner._full_route_eligible(
+        samples=8,
+        query_len=4,
+        replay_ssm=False,
+    )
+    runner._atom_config.speculative_config.num_speculative_tokens = 3
+    assert runner.memory_reserve_bytes() == 0
+    runner._atom_config.speculative_config.num_speculative_tokens = 7
+    runner._lm.config = SimpleNamespace(num_hidden_layers=5)
+    assert runner.memory_reserve_bytes() == 0
+
+
+def test_kimi_capture_prepare_failure_latches_until_new_lifecycle():
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+    results = iter((False, True))
+    calls = []
+    runner._full_plan = SimpleNamespace(
+        prepare=lambda: calls.append("prepare") or next(results)
+    )
+
+    runner.begin_capture_lifecycle()
+    assert not runner.prepare_for_capture()
+    assert not runner.prepare_for_capture()
+    assert calls == ["prepare"]
+
+    runner.begin_capture_lifecycle()
+    assert runner.prepare_for_capture()
+    assert calls == ["prepare", "prepare"]
 
 
 @pytest.mark.parametrize("samples", (4, 8))
@@ -3209,6 +3385,11 @@ def test_kimi_supports_agentic_q8_fp16_snapshots(monkeypatch, batch_capacity):
         "_kda_state_pool_supported",
         lambda _cache, **_kwargs: True,
     )
+    monkeypatch.setattr(
+        runner,
+        "_full_route_eligible",
+        lambda **_kwargs: True,
+    )
     monkeypatch.setattr(module, "get_forward_context", lambda: context)
     prepared = []
     runner._prepare = (
@@ -3283,6 +3464,11 @@ def test_kimi_native_dense_q8_metadata_reaches_atomic_prepare(monkeypatch):
         module,
         "_kda_state_pool_supported",
         lambda _cache, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        runner,
+        "_full_route_eligible",
+        lambda **_kwargs: True,
     )
     monkeypatch.setattr(module, "get_forward_context", lambda: context)
     prepared = []
@@ -3706,9 +3892,11 @@ def test_prepare_model_monokernels_for_capture_is_deduplicated_and_complete():
 
     calls = []
     first = SimpleNamespace(
+        begin_capture_lifecycle=lambda: calls.append("begin-first"),
         prepare_for_capture=lambda: calls.append("first") or True
     )
     second = SimpleNamespace(
+        begin_capture_lifecycle=lambda: calls.append("begin-second"),
         prepare_for_capture=lambda: calls.append("second") or False
     )
     modules = [
@@ -3718,7 +3906,12 @@ def test_prepare_model_monokernels_for_capture_is_deduplicated_and_complete():
     model = SimpleNamespace(modules=lambda: modules)
 
     assert not prepare_model_monokernels_for_capture(model)
-    assert calls == ["first", "second"]
+    assert calls == [
+        "begin-first",
+        "first",
+        "begin-second",
+        "second",
+    ]
 
 
 def test_close_model_monokernels_retries_failed_close():

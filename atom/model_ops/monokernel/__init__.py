@@ -55,6 +55,9 @@ def prepare_model_monokernels_for_capture(model) -> bool:
 
     prepared = True
     for owned in _owned_model_monokernels(model):
+        begin = getattr(owned, "begin_capture_lifecycle", None)
+        if callable(begin):
+            begin()
         prepare = getattr(owned, "prepare_for_capture", None)
         if callable(prepare):
             prepared = bool(prepare()) and prepared

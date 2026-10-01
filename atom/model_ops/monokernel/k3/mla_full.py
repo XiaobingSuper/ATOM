@@ -142,6 +142,7 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
     ) -> None:
         if samples not in (8, 16, 32):
             raise ValueError("Kimi full MLA supports q8 B1/B2/B4 only")
+        packed_artifacts = packed_artifacts or {}
         super().__init__(
             weights,
             samples,
@@ -178,7 +179,9 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
                 "missing Kimi full-MLA weights: " + ", ".join(missing)
             )
         self.step = self.attention.step
-        self.w_o_packed = pack_bf16(self.t["w_o"])
+        self.w_o_packed = packed_artifacts.get("w_o_packed")
+        if self.w_o_packed is None:
+            self.w_o_packed = pack_bf16(self.t["w_o"])
         self.moe_packed = {
             "w_r": self.w_router,
             "w_latent_down": self.w_latent_down,
@@ -215,6 +218,12 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
             ),
             atom_expert_layout=True,
         )
+
+    def packed_artifacts(self) -> dict[str, object]:
+        return {
+            **super().packed_artifacts(),
+            "w_o_packed": self.w_o_packed,
+        }
 
     def forward(
         self,
