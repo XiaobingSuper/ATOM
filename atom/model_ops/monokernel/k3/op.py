@@ -119,10 +119,8 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             moe_symmetric=self.symmetric_allreduce.peer_buffer.local_address,
             moe_peers=self.symmetric_allreduce.peer_buffer.addresses,
             layer=epoch_layer,
-            advance=False,
+            advance=advance,
         )
-        if advance:
-            self.advance_step()
         return target
 
 

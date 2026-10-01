@@ -100,6 +100,7 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
         state_dtype: torch.dtype,
         defer_collectives: bool,
         packed_artifacts,
+        monokernel_only: bool,
     ) -> _MlaAttentionArena:
         del (
             reduce_group,
@@ -111,6 +112,7 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
             conv_state_layout,
             state_dtype,
             packed_artifacts,
+            monokernel_only,
         )
         return _MlaAttentionArena(
             samples,
@@ -315,10 +317,9 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
             self.t["w_gate"].data_ptr(),
             self.rank,
             epoch_layer,
+            int(advance),
             stream=torch.cuda.current_stream(),
         )
-        if advance:
-            self.step.add_(1)
         return target
 
     def release_packed_sources(self) -> None:

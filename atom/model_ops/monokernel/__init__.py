@@ -50,6 +50,17 @@ def model_monokernel_memory_reserve(model) -> int:
     return total
 
 
+def prepare_model_monokernels_for_capture(model) -> bool:
+    """Prepare every enabled lazy native plan before CUDA graph capture."""
+
+    prepared = True
+    for owned in _owned_model_monokernels(model):
+        prepare = getattr(owned, "prepare_for_capture", None)
+        if callable(prepare):
+            prepared = bool(prepare()) and prepared
+    return prepared
+
+
 def close_model_monokernels(model) -> None:
     """Close each model-owned native runner once before distributed teardown."""
 
@@ -62,4 +73,8 @@ def close_model_monokernels(model) -> None:
         _mark_model_monokernel_closed(owned)
 
 
-__all__ = ["close_model_monokernels", "model_monokernel_memory_reserve"]
+__all__ = [
+    "close_model_monokernels",
+    "model_monokernel_memory_reserve",
+    "prepare_model_monokernels_for_capture",
+]

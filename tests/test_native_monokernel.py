@@ -651,8 +651,8 @@ def test_model_specific_backend_selection():
     assert select_backend("kimi_k3", "auto", **common, has_moe=False) is None
 
 
-@pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
-def test_kimi_full_agentic_dispatch_is_explicit_mono_only(batch_capacity):
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4))
+def test_kimi_full_agentic_dispatch_enables_auto_and_mono(batch_capacity):
     common = dict(
         samples=batch_capacity * 8,
         query_len=8,
@@ -662,7 +662,7 @@ def test_kimi_full_agentic_dispatch_is_explicit_mono_only(batch_capacity):
     )
 
     assert select_backend("kimi_k3", "mono", **common) == "mono"
-    assert select_backend("kimi_k3", "auto", **common) is None
+    assert select_backend("kimi_k3", "auto", **common) == "mono"
     assert select_backend("kimi_k3", "mono", **common, dcp=True) is None
     assert (
         select_backend("kimi_k3", "mono", **common, replay_ssm=True) is None
@@ -687,7 +687,7 @@ def test_kimi_mla_full_dispatch_is_index_free_fp8_mono_only(rows):
     )
 
     assert select_backend("kimi_k3", "mono", **common) == "mla_full"
-    assert select_backend("kimi_k3", "auto", **common) is None
+    assert select_backend("kimi_k3", "auto", **common) == "mla_full"
     assert select_backend("kimi_k3", "staged", **common) is None
 
 
@@ -772,7 +772,357 @@ def test_kimi_mla_full_host_reuses_kda_moe_arena_and_epoch():
     assert "index_cache" not in source
 
 
-def test_kimi_model_routes_mla_only_in_explicit_mode():
+def test_kimi_layer0_dense_full_kernel_is_one_launch():
+    from atom.model_ops.monokernel.k3.dense_full import (
+        KimiK3DenseMonoKernel,
+    )
+
+    source = inspect.getsource(KimiK3DenseMonoKernel)
+    kernel_source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "k3"
+        / "kernel.py"
+    ).read_text()
+    assert "dense_ffn=True" in source
+    assert "w_dense_ug" in source
+    assert "w_dense_dn" in source
+    assert kernel_source.count("@flyc.kernel") == 1
+    assert kernel_source.count(").launch(grid=") == 1
+
+
+def test_kimi_full_model_plan_requires_every_layer_and_bucket():
+    module = _kimi_mono_module()
+    assert hasattr(module, "KimiFullModelPlan")
+
+    source = inspect.getsource(module.KimiFullModelPlan)
+    assert "KIMI_MLA_AGENTIC_ROWS" in source
+    assert "model_epoch" in source
+    assert "max_arena" in source
+    assert "commit" in source
+    assert "close" in source
+
+
+def test_kimi_full_model_plan_prepares_all_layers_and_buckets_atomically(
+    monkeypatch,
+):
+    import torch
+
+    module = _kimi_mono_module()
+    layers = []
+    for index in range(93):
+        fields = {
+            "layer_idx": index,
+            "is_linear_attn": index == 0
+            or (index != 92 and index % 4 != 3),
+        }
+        if index:
+            fields["block_sparse_moe"] = object()
+        layers.append(SimpleNamespace(**fields))
+    runner = SimpleNamespace(
+        _lm=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=layers,
+                start_layer=0,
+                end_layer=len(layers),
+            )
+        )
+    )
+    resources = []
+
+    class Resource:
+        def __init__(self):
+            self.closed = 0
+            resources.append(self)
+
+        def close(self):
+            self.closed += 1
+
+    class FakeOp:
+        def __init__(self, layer, _weights, rows, backend, **_kwargs):
+            self.layer = layer
+            self.backend = backend
+            self.monokernel_scratch = torch.empty(
+                rows + layer.layer_idx + 1, dtype=torch.uint8
+            )
+            self.step = torch.full((1,), -1, dtype=torch.int32)
+            self.block_write_idx = layer.layer_idx // 12
+
+        def packed_artifacts(self):
+            return {"layer": self.layer.layer_idx}
+
+        def release_packed_sources(self):
+            pass
+
+        def initialize_collectives(self, attention=None, moe=None):
+            return attention or Resource(), moe or Resource()
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.op = FakeOp(*args, **kwargs)
+
+        def initialize_collectives(self, *shared):
+            return self.op.initialize_collectives(*shared)
+
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    plan = module.KimiFullModelPlan(runner)
+    assert plan.prepare()
+    assert len(plan.ops) == 93 * 3
+    assert len(plan.packed_artifacts) == 93
+    assert all(
+        owned.op.monokernel_scratch is plan.max_arena
+        and owned.op.step is plan.model_epoch
+        for owned in plan.ops.values()
+    )
+    assert plan.block_residual.shape[:2] == (32, 8)
+
+    plan.close()
+    assert resources
+    assert all(resource.closed == 1 for resource in resources)
+    assert not plan.ready
+
+
+def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=0, is_linear_attn=True),
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+    ]
+    runner = SimpleNamespace(
+        _lm=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=layers, start_layer=0, end_layer=2
+            )
+        )
+    )
+
+    class Owned:
+        def __init__(self, layer, *_args, **_kwargs):
+            if layer.layer_idx == 1:
+                raise ValueError("injected construction failure")
+            self.op = SimpleNamespace(
+                monokernel_scratch=torch.empty(1, dtype=torch.uint8),
+                block_write_idx=0,
+                packed_artifacts=lambda: {},
+                release_packed_sources=lambda: None,
+            )
+
+    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    plan = module.KimiFullModelPlan(runner)
+    assert not plan.prepare()
+    assert not plan.ready
+    assert plan.ops == {}
+    assert plan.packed_artifacts == {}
+
+
+def test_kimi_full_model_forward_routes_every_layer_without_fallback(
+    monkeypatch,
+):
+    import torch
+
+    module = _kimi_mono_module()
+    rows = 8
+    layers = []
+    for index in range(93):
+        fields = {
+            "layer_idx": index,
+            "is_linear_attn": index == 0
+            or (index != 92 and index % 4 != 3),
+            "_forward_hooks": {},
+        }
+        if index:
+            fields["block_sparse_moe"] = object()
+        if not fields["is_linear_attn"]:
+            fields["self_attn"] = SimpleNamespace()
+        layers.append(SimpleNamespace(**fields))
+    model = SimpleNamespace(
+        layers=layers,
+        start_layer=0,
+        end_layer=len(layers),
+        output_attn_res=lambda hidden, *_args: (hidden, None),
+    )
+    calls = []
+
+    class FakeOp:
+        def __init__(self, layer):
+            self.layer = layer
+            self.block_write_idx = layer.layer_idx // 12
+
+        def forward(self, hidden, _blocks, *_args, **kwargs):
+            calls.append(
+                (
+                    self.layer.layer_idx,
+                    kwargs["advance"],
+                    kwargs.get("epoch_layer"),
+                )
+            )
+            return hidden + 1
+
+    ops = {layer.layer_idx: SimpleNamespace(op=FakeOp(layer)) for layer in layers}
+    full_plan = SimpleNamespace(
+        block_residual=torch.empty(
+            rows, 8, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16
+        ),
+        lookup=lambda layer, *_args: ops[layer.layer_idx],
+    )
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._lm = SimpleNamespace(model=model)
+    runner._op = lambda *_args: pytest.fail("full route used baseline")
+    monkeypatch.setattr(
+        module.KimiMlaAgenticRuntime,
+        "bind",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        module.AgenticDecodeShape,
+        "from_forward_mode",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        module,
+        "KimiAgenticShape",
+        lambda **_kwargs: object(),
+    )
+    monkeypatch.setattr(module, "_mla_cache_descale", lambda *_args: object())
+    fwd = SimpleNamespace(
+        context=SimpleNamespace(ubatch_token_offset=0),
+        attn_metadata=SimpleNamespace(
+            slot_mapping=torch.zeros(rows, dtype=torch.int64),
+            batch_id_per_q_token=torch.zeros(rows, dtype=torch.int32),
+            context_lens=torch.ones(1, dtype=torch.int32),
+            block_tables=torch.zeros(1, 1, dtype=torch.int32),
+            block_size=128,
+            block_ratio=128,
+        ),
+        kv_cache_data={
+            f"layer_{layer.layer_idx}": SimpleNamespace(
+                k_cache=torch.empty(1),
+                v_cache=torch.empty(1),
+            )
+            for layer in layers
+        },
+    )
+    metadata = SimpleNamespace(
+        spec_state_indices_tensor=torch.zeros(1, 8, dtype=torch.int32),
+        num_accepted_tokens=torch.full((1,), 8, dtype=torch.int32),
+    )
+    hidden = torch.zeros(
+        rows, module.KIMI_K3_CONFIG.hidden, dtype=torch.bfloat16
+    )
+
+    result = runner._forward_layers(
+        hidden,
+        torch.arange(rows),
+        fwd,
+        metadata,
+        torch.float16,
+        1,
+        full_plan,
+    )
+
+    assert torch.equal(result, hidden + 93)
+    assert [layer for layer, *_ in calls] == list(range(93))
+    assert [advance for _, advance, _ in calls].count(True) == 1
+    assert calls[-1] == (92, True, 92)
+
+
+def test_kimi_auto_and_mono_share_atomic_full_plan():
+    source = (
+        Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
+    ).read_text()
+
+    assert "self._full_plan" in source
+    assert "full_plan.ready" in source
+    assert "layer fallback" not in source
+    assert source.index("full_plan.forward(") < source.index("record_hit(")
+
+
+def test_kimi_full_route_publishes_decoder_aux_hidden_protocol():
+    import torch
+
+    from atom.models.kimi_k3_mono import KimiMonoDecode
+
+    captured = []
+
+    class Layer:
+        _forward_hooks = {
+            1: lambda module, inputs, output: captured.append(output)
+        }
+
+    hidden = torch.randn(2, 4)
+    positions = torch.arange(2)
+    result = KimiMonoDecode._publish_layer_output(
+        Layer(), positions, hidden, hidden
+    )
+
+    assert result is hidden
+    assert len(captured) == 1
+    assert captured[0][0] is hidden
+    assert captured[0][1:] == (None, None, None)
+
+
+def test_kimi_full_route_writes_dspark_aux_buffer_without_copy_hook():
+    import torch
+
+    from atom.models.kimi_k3_mono import KimiMonoDecode
+
+    calls = []
+    buffer = torch.empty(32, 4)
+
+    def hook(_module, _inputs, _output):
+        calls.append("copy")
+
+    hook._atom_native_output_buffer = buffer
+    layer = SimpleNamespace(_forward_hooks={1: hook})
+    fwd = SimpleNamespace(
+        context=SimpleNamespace(ubatch_token_offset=3)
+    )
+    target = KimiMonoDecode._native_output_target(layer, fwd, 8)
+    assert target.data_ptr() == buffer[3:].data_ptr()
+    assert target.shape == (8, 4)
+
+    hidden = torch.randn(8, 4)
+    result = KimiMonoDecode._publish_layer_output(
+        layer,
+        torch.arange(8),
+        hidden,
+        hidden,
+    )
+    assert result is hidden
+    assert calls == []
+
+
+def test_kimi_model_routes_mla_only_in_full_model_modes():
     source = (
         Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
     ).read_text()
@@ -782,7 +1132,7 @@ def test_kimi_model_routes_mla_only_in_explicit_mode():
     assert "external_indexer=False" in source
     assert "rotary_emb.cos_cache" not in source
     assert "rotary_emb.sin_cache" not in source
-    assert "mode != \"mono\"" in source
+    assert 'self._mode in {"auto", "mono"}' in source
     assert "ReplaySSM" not in source
 
 
@@ -2572,7 +2922,6 @@ def _kimi_memory_reserve_runner(mode, spec_method):
         SimpleNamespace(
             layer_idx=0,
             is_linear_attn=True,
-            block_sparse_moe=object(),
         ),
         SimpleNamespace(
             layer_idx=1,
@@ -2600,21 +2949,25 @@ def _kimi_memory_reserve_runner(mode, spec_method):
     ("mode", "spec_method", "expected"),
     (
         ("off", "dspark", 0),
-        ("auto", "dspark", 0),
+        (
+            "auto",
+            "dspark",
+            "full",
+        ),
         (
             "staged",
             "dspark",
-            2 * (256 << 20) + (2 * 2) * (32 << 20),
+            (256 << 20) + 2 * (32 << 20),
         ),
         (
             "mono",
             "eagle",
-            2 * (256 << 20) + (2 * 2) * (32 << 20),
+            (256 << 20) + 2 * (32 << 20),
         ),
         (
             "mono",
             "dspark",
-            4 * (256 << 20) + (2 * 5 + 2 * 3) * (32 << 20),
+            "full+ordinary",
         ),
     ),
 )
@@ -2624,6 +2977,17 @@ def test_kimi_memory_reserve_matches_selectable_graph_buckets(
     expected,
 ):
     runner = _kimi_memory_reserve_runner(mode, spec_method)
+    if expected in {"full", "full+ordinary"}:
+        module = _kimi_mono_module()
+        expected = (
+            module._FULL_DENSE_PACKED_BYTES
+            + module._FULL_KDA_PACKED_BYTES
+            + 2 * module._FULL_MLA_PACKED_BYTES
+            + 4 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+            + module._FULL_SHARED_BYTES
+        )
+        if mode == "mono":
+            expected += 2 * module._WORKSPACE_RESERVE_PER_LAYER_BUCKET
 
     assert runner.memory_reserve_bytes() == expected
 
@@ -2635,7 +2999,7 @@ def test_kimi_staged_reserve_prevents_kv_oom_budget_overcommit():
     model = SimpleNamespace(
         modules=lambda: [SimpleNamespace(_mono=staged)]
     )
-    staged_reserve = 2 * (256 << 20) + (2 * 2) * (32 << 20)
+    staged_reserve = (256 << 20) + 2 * (32 << 20)
     available_before_reserve = staged_reserve - 1
 
     assert model_monokernel_memory_reserve(model) == staged_reserve
@@ -2648,6 +3012,52 @@ def test_kimi_staged_reserve_prevents_kv_oom_budget_overcommit():
     )
     size_at = source.index("plan_pools(specs, available_for_kv", reserve_at)
     assert reserve_at < size_at
+
+
+def test_kimi_full_plan_reserve_uses_shared_arena_not_phantom_per_layer():
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._enabled = True
+    runner._mode = "auto"
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=1,
+        kv_cache_dtype="fp8",
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    layers = []
+    for index in range(93):
+        fields = {
+            "layer_idx": index,
+            "is_linear_attn": index == 0
+            or (index != 92 and index % 4 != 3),
+        }
+        if index:
+            fields["block_sparse_moe"] = object()
+        layers.append(SimpleNamespace(**fields))
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(
+            layers=layers,
+            start_layer=0,
+            end_layer=93,
+        )
+    )
+    kda_layers = sum(
+        layer.is_linear_attn and hasattr(layer, "block_sparse_moe")
+        for layer in layers
+    )
+    mla_layers = 92 - kda_layers
+    expected = (
+        module._FULL_DENSE_PACKED_BYTES
+        + kda_layers * module._FULL_KDA_PACKED_BYTES
+        + mla_layers * module._FULL_MLA_PACKED_BYTES
+        + 93 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+        + module._FULL_SHARED_BYTES
+    )
+
+    assert runner.memory_reserve_bytes() == expected
+    phantom = 93 * (256 << 20) + 93 * 3 * (32 << 20)
+    assert expected < phantom // 2
 
 
 def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():
@@ -2764,7 +3174,7 @@ def test_kimi_supports_rejects_multi_token_decode(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4))
 def test_kimi_supports_agentic_q8_fp16_snapshots(monkeypatch, batch_capacity):
     import torch
 
@@ -2895,7 +3305,6 @@ def test_kimi_native_dense_q8_metadata_reaches_atomic_prepare(monkeypatch):
 @pytest.mark.parametrize(
     ("mode", "dcp_size", "replay_ssm", "spec_method"),
     (
-        ("auto", 1, False, "dspark"),
         ("mono", 2, False, "dspark"),
         ("mono", 1, True, "dspark"),
         ("mono", 1, False, "mtp"),
@@ -3288,6 +3697,28 @@ def test_close_model_monokernels_is_deduplicated_and_idempotent():
     owned.memory_reserve_bytes = lambda: 123
     glm_owned.memory_reserve_bytes = lambda: 456
     assert model_monokernel_memory_reserve(model) == 579
+
+
+def test_prepare_model_monokernels_for_capture_is_deduplicated_and_complete():
+    from atom.model_ops.monokernel import (
+        prepare_model_monokernels_for_capture,
+    )
+
+    calls = []
+    first = SimpleNamespace(
+        prepare_for_capture=lambda: calls.append("first") or True
+    )
+    second = SimpleNamespace(
+        prepare_for_capture=lambda: calls.append("second") or False
+    )
+    modules = [
+        SimpleNamespace(_mono=first),
+        SimpleNamespace(_mono=first, _glm52_mono=second),
+    ]
+    model = SimpleNamespace(modules=lambda: modules)
+
+    assert not prepare_model_monokernels_for_capture(model)
+    assert calls == ["first", "second"]
 
 
 def test_close_model_monokernels_retries_failed_close():

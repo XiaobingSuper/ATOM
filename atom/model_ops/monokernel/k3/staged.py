@@ -160,6 +160,7 @@ class _KimiK3MlaPath:
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
             packed_artifacts=packed_artifacts.get("attention"),
+            monokernel_only=monokernel_only,
         )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
@@ -419,6 +420,7 @@ class _KimiK3MlaPath:
         state_dtype: torch.dtype,
         defer_collectives: bool,
         packed_artifacts: dict[str, torch.Tensor] | None,
+        monokernel_only: bool,
     ):
         if attention_symmetric_allreduce is not None:
             raise ValueError("Kimi-K3 MLA does not accept a KDA all-reduce")
@@ -431,6 +433,7 @@ class _KimiK3MlaPath:
             state_dtype,
             defer_collectives,
             packed_artifacts,
+            monokernel_only,
         )
         return KimiK3MlaAttention(
             weights,
@@ -898,6 +901,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
         state_dtype: torch.dtype,
         defer_collectives: bool,
         packed_artifacts: dict[str, torch.Tensor] | None,
+        monokernel_only: bool,
     ):
         del topk, kv_cache_layout
         return KimiK3KdaAttention(
@@ -918,6 +922,7 @@ class _KimiK3KdaStagedPath(_KimiK3MlaPath):
             state_dtype=state_dtype,
             defer_collectives=defer_collectives,
             packed_artifacts=packed_artifacts,
+            monokernel_only=monokernel_only,
         )
 
     def forward(

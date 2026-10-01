@@ -48,6 +48,46 @@ logger = logging.getLogger("atom")
 # only graph-stable activation/scratch workspaces.
 _PACKED_RESERVE_PER_LAYER = 256 << 20
 _WORKSPACE_RESERVE_PER_LAYER_BUCKET = 32 << 20
+_HIDDEN = KIMI_K3_CONFIG.hidden
+_PROJECTION = KIMI_K3_CONFIG.local_heads * KIMI_K3_CONFIG.v_dim
+_FUSED_PAD = 6400
+
+
+def _mxfp8_packed_nbytes(rows: int, cols: int) -> int:
+    scale_rows = (rows + 255) // 256 * 256
+    return rows * cols + scale_rows * (cols // 32)
+
+
+_FULL_MOE_PACKED_BYTES = (
+    KIMI_K3_CONFIG.n_experts * _HIDDEN * 2
+    + _mxfp8_packed_nbytes(KIMI_K3_CONFIG.routed_hidden, _HIDDEN)
+    + _mxfp8_packed_nbytes(2 * KIMI_K3_CONFIG.shared_inter, _HIDDEN)
+    + _mxfp8_packed_nbytes(_HIDDEN, KIMI_K3_CONFIG.shared_inter)
+    + _mxfp8_packed_nbytes(
+        _HIDDEN // 8,
+        KIMI_K3_CONFIG.routed_hidden,
+    )
+)
+_FULL_KDA_PACKED_BYTES = (
+    _FUSED_PAD * _HIDDEN * 2
+    + _HIDDEN * _PROJECTION * 2
+    + _FULL_MOE_PACKED_BYTES
+)
+_FULL_MLA_PACKED_BYTES = (
+    _HIDDEN * _PROJECTION * 2 + _FULL_MOE_PACKED_BYTES
+)
+_FULL_DENSE_PACKED_BYTES = (
+    _FUSED_PAD * _HIDDEN * 2
+    + _HIDDEN * _PROJECTION * 2
+    + 2 * (33792 // 8) * _HIDDEN * 2
+    + _HIDDEN * (33792 // 8) * 2
+)
+_FULL_WORKSPACE_PER_LAYER_BUCKET = 8 << 20
+_FULL_SHARED_BYTES = (
+    8_969_472
+    + max(KIMI_MLA_AGENTIC_ROWS) * 8 * _HIDDEN * 2
+    + 4
+)
 
 
 def _need(ok: bool, what: str) -> None:
@@ -132,6 +172,83 @@ def _split_kv_b(
 
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     attn = layer.self_attn
+    if not hasattr(layer, "block_sparse_moe"):
+        cfg = KIMI_K3_CONFIG
+        _need(layer.layer_idx == 0, "only Kimi layer 0 may use dense FFN")
+        _need(layer.is_linear_attn, "Kimi dense layer 0 must use KDA")
+        dense_inter = layer.mlp.down_proj.weight.shape[1]
+        _need(
+            dense_inter == 33792 // npes,
+            f"dense FFN shard width {dense_inter}",
+        )
+        tensors = {
+            "g_in": layer.input_layernorm.weight,
+            "g_post": layer.post_attention_layernorm.weight,
+            "g_self_res": layer.self_attention_res_norm.weight,
+            "w_self_res": linear_bf16(
+                layer.self_attention_res_proj,
+                name="self_attention_res_proj",
+                logical_rows=1,
+                logical_cols=cfg.hidden,
+            ).view(-1),
+            "g_mlp_res": layer.mlp_res_norm.weight,
+            "w_mlp_res": linear_bf16(
+                layer.mlp_res_proj,
+                name="mlp_res_proj",
+                logical_rows=1,
+                logical_cols=cfg.hidden,
+            ).view(-1),
+            "w_dense_ug": linear_bf16(
+                layer.mlp.gate_up_proj,
+                name="mlp.gate_up_proj",
+                logical_rows=2 * dense_inter,
+                logical_cols=cfg.hidden,
+            ),
+            "w_dense_dn": linear_bf16(
+                layer.mlp.down_proj,
+                name="mlp.down_proj",
+                logical_rows=cfg.hidden,
+                logical_cols=dense_inter,
+            ),
+            "w_kda_in": linear_bf16(
+                attn.in_proj,
+                name="in_proj",
+                logical_rows=(
+                    4 * cfg.local_heads * cfg.v_dim
+                    + cfg.local_heads
+                    + cfg.v_dim
+                ),
+                logical_cols=cfg.hidden,
+            ),
+            "w_kda_fb": linear_bf16(
+                attn.f_b_proj,
+                name="f_b_proj",
+                logical_rows=cfg.local_heads * cfg.v_dim,
+                logical_cols=cfg.v_dim,
+            ),
+            "w_kda_conv": attn.conv_weight,
+            "kda_a_log": attn.A_log.float().contiguous(),
+            "kda_dt_bias": attn.dt_bias.view(
+                cfg.local_heads,
+                cfg.v_dim,
+            ),
+            "g_kda_out": attn.o_norm.weight,
+            "w_kda_o": linear_bf16(
+                attn.o_proj,
+                name="o_proj",
+                logical_rows=cfg.hidden,
+                logical_cols=cfg.local_heads * cfg.v_dim,
+            ),
+        }
+        return LayerWeights(
+            cfg.local_heads,
+            tensors,
+            cfg,
+            rank,
+            npes,
+            mxfp4_weight_layout=Mxfp4WeightLayout.ATOM,
+            mxfp4_scale_layout=Mxfp4ScaleLayout.ATOM,
+        )
     moe = layer.block_sparse_moe
     experts = moe.experts
     cfg = KIMI_K3_CONFIG
@@ -348,6 +465,12 @@ class _KimiLayerOp:
             )
 
             op_type = KimiK3MlaMonoKernel
+        elif mode == "dense_full":
+            from atom.model_ops.monokernel.k3.dense_full import (
+                KimiK3DenseMonoKernel,
+            )
+
+            op_type = KimiK3DenseMonoKernel
         else:
             op_type = (
                 KimiK3MonoKernel
@@ -376,13 +499,335 @@ class _KimiLayerOp:
             ):
                 op_kwargs.pop(name)
         elif agentic_batch_size:
-            if mode != "mono":
+            if mode not in {"mono", "dense_full"}:
                 raise ValueError("Kimi Agentic q=8 requires the full MonoKernel")
             op_kwargs["agentic_batch_size"] = agentic_batch_size
         self.op = op_type(weights, samples, **op_kwargs)
 
     def initialize_collectives(self, attention=None, moe=None):
         return self.op.initialize_collectives(attention, moe)
+
+
+class KimiFullModelPlan:
+    """Atomically own every DSpark full-layer bucket and shared model arena."""
+
+    def __init__(self, runner: "KimiMonoDecode") -> None:
+        self.runner = runner
+        self.ops: dict[
+            tuple[int, int, str, torch.dtype, int],
+            _KimiLayerOp,
+        ] = {}
+        self.packed_artifacts: dict[int, dict[str, object]] = {}
+        self.reductions: dict[
+            int,
+            tuple[object, object],
+        ] = {}
+        self.max_arena: torch.Tensor | None = None
+        self.block_residual: torch.Tensor | None = None
+        self.model_epoch: torch.Tensor | None = None
+        self.ready = False
+
+    @staticmethod
+    def _backend(layer) -> str:
+        if not hasattr(layer, "block_sparse_moe"):
+            if layer.layer_idx != 0 or not layer.is_linear_attn:
+                raise MonoUnsupported("unsupported dense layer")
+            return "dense_full"
+        return "mono" if layer.is_linear_attn else "mla_full"
+
+    @staticmethod
+    def _scratch(op):
+        scratch = getattr(op, "monokernel_scratch", None)
+        if scratch is not None:
+            return scratch
+        return getattr(getattr(op, "attention", None), "monokernel_scratch", None)
+
+    @staticmethod
+    def _bind_arena_and_epoch(op, arena, epoch) -> None:
+        if hasattr(op, "monokernel_scratch"):
+            op.monokernel_scratch = arena
+        attention = getattr(op, "attention", None)
+        if attention is not None:
+            attention.monokernel_scratch = arena
+            attention.step = epoch
+        if hasattr(op, "step"):
+            op.step = epoch
+
+    def commit(
+        self,
+        candidates,
+        artifacts,
+        reductions,
+        max_arena,
+        block_residual,
+        model_epoch,
+    ) -> None:
+        self.ops = candidates
+        self.packed_artifacts = artifacts
+        self.reductions = reductions
+        self.max_arena = max_arena
+        self.block_residual = block_residual
+        self.model_epoch = model_epoch
+        shared_artifacts = getattr(
+            self.runner,
+            "_packed_artifacts",
+            None,
+        )
+        if shared_artifacts is None:
+            self.runner._packed_artifacts = dict(artifacts)
+        else:
+            shared_artifacts.update(artifacts)
+        self.ready = True
+
+    def prepare(self) -> bool:
+        if self.ready:
+            return True
+        runner = self.runner
+        model = runner._lm.model
+        layers = tuple(
+            model.layers[model.start_layer : model.end_layer]
+        )
+        if not layers or layers[0].layer_idx != 0:
+            return False
+        rank = get_tensor_model_parallel_rank()
+        npes = get_tensor_model_parallel_world_size()
+        tp = get_tp_group()
+        candidates = {}
+        artifacts: dict[int, dict[str, object]] = dict(
+            getattr(runner, "_packed_artifacts", {})
+        )
+        reductions = {}
+        max_arena = block_residual = model_epoch = None
+        from atom.model_ops.monokernel.k3.kernel import (
+            monokernel_scratch_nbytes,
+        )
+
+        arena_bytes = max(
+            monokernel_scratch_nbytes(
+                rows,
+                fuse_attn_res=True,
+                fuse_moe=True,
+                mtp=not mla,
+                mla=mla,
+                dense_ffn=dense,
+            )
+            for rows in KIMI_MLA_AGENTIC_ROWS
+            for mla, dense in ((False, False), (False, True), (True, False))
+        )
+        max_blocks = max(layer.layer_idx // 12 for layer in layers) + 1
+        try:
+            for rows in KIMI_MLA_AGENTIC_ROWS:
+                batch = rows // 8
+                pending = []
+                for layer in layers:
+                    backend = self._backend(layer)
+                    weights = None
+                    error = None
+                    try:
+                        weights = _layer_weights(layer, rank, npes)
+                    except (
+                        AttributeError,
+                        MonoUnsupported,
+                        RuntimeError,
+                        ValueError,
+                    ) as caught:
+                        error = caught
+                    tp_uniform_local_validation(
+                        error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=(
+                            f"Kimi-K3 full-plan layer {layer.layer_idx} "
+                            "weight mapping failed"
+                        ),
+                    )
+                    assert weights is not None
+                    owned = None
+                    error = None
+                    try:
+                        owned = _KimiLayerOp(
+                            layer,
+                            weights,
+                            rows,
+                            backend,
+                            state_dtype=torch.float16,
+                            agentic_batch_size=batch,
+                            defer_collectives=True,
+                            packed_artifacts=artifacts.get(
+                                layer.layer_idx
+                            ),
+                        )
+                    except (
+                        AttributeError,
+                        MonoUnsupported,
+                        RuntimeError,
+                        ValueError,
+                    ) as caught:
+                        error = caught
+                    tp_uniform_local_validation(
+                        error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=(
+                            f"Kimi-K3 full-plan layer {layer.layer_idx} "
+                            f"B{batch} construction failed"
+                        ),
+                    )
+                    assert owned is not None
+                    if max_arena is None:
+                        scratch = self._scratch(owned.op)
+                        allocated = None
+                        error = None
+                        try:
+                            if scratch is None:
+                                raise ValueError(
+                                    "full plan has no device arena"
+                                )
+                            max_arena = torch.zeros(
+                                arena_bytes,
+                                dtype=torch.uint8,
+                                device=scratch.device,
+                            )
+                            block_residual = torch.empty(
+                                max(KIMI_MLA_AGENTIC_ROWS),
+                                max_blocks,
+                                KIMI_K3_CONFIG.hidden,
+                                dtype=torch.bfloat16,
+                                device=scratch.device,
+                            )
+                            model_epoch = torch.zeros(
+                                1,
+                                dtype=torch.int32,
+                                device=scratch.device,
+                            )
+                            allocated = (
+                                max_arena,
+                                block_residual,
+                                model_epoch,
+                            )
+                        except (RuntimeError, ValueError) as caught:
+                            error = caught
+                        tp_uniform_local_validation(
+                            error,
+                            group=tp.cpu_group,
+                            world_size=npes,
+                            context=(
+                                "Kimi-K3 full-plan shared arena "
+                                "allocation failed"
+                            ),
+                        )
+                        assert allocated is not None
+                        max_arena, block_residual, model_epoch = allocated
+                    self._bind_arena_and_epoch(
+                        owned.op,
+                        max_arena,
+                        model_epoch,
+                    )
+                    if layer.layer_idx not in artifacts:
+                        artifacts[layer.layer_idx] = (
+                            owned.op.packed_artifacts()
+                        )
+                    owned.op.release_packed_sources()
+                    key = (
+                        layer.layer_idx,
+                        rows,
+                        backend,
+                        torch.float16,
+                        batch,
+                    )
+                    candidates[key] = owned
+                    pending.append(owned)
+                shared = (None, None)
+                for owned in pending:
+                    initialized = None
+                    error = None
+                    try:
+                        initialized = owned.initialize_collectives(*shared)
+                    except (
+                        AttributeError,
+                        RuntimeError,
+                        ValueError,
+                    ) as caught:
+                        error = caught
+                    tp_uniform_local_validation(
+                        error,
+                        group=tp.cpu_group,
+                        world_size=npes,
+                        context=(
+                            "Kimi-K3 full-plan collective "
+                            f"B{batch} initialization failed"
+                        ),
+                    )
+                    assert initialized is not None
+                    shared = initialized
+                    reductions[rows] = shared
+            assert (
+                max_arena is not None
+                and block_residual is not None
+                and model_epoch is not None
+            )
+            self.commit(
+                candidates,
+                artifacts,
+                reductions,
+                max_arena,
+                block_residual,
+                model_epoch,
+            )
+            return True
+        except (
+            AttributeError,
+            MonoUnsupported,
+            RuntimeError,
+            ValueError,
+        ) as error:
+            closed = set()
+            for attention, moe in reversed(tuple(reductions.values())):
+                for resource in (moe, attention):
+                    if resource is None or id(resource) in closed:
+                        continue
+                    resource.close()
+                    closed.add(id(resource))
+            logger.warning(
+                "Kimi-K3 full-plan fallback before launch: %s",
+                error,
+            )
+            return False
+
+    def lookup(
+        self,
+        layer,
+        rows: int,
+        state_dtype: torch.dtype,
+        batch: int,
+    ) -> _KimiLayerOp:
+        backend = self._backend(layer)
+        key = (layer.layer_idx, rows, backend, state_dtype, batch)
+        try:
+            return self.ops[key]
+        except KeyError as error:
+            raise MonoUnsupported("full plan is incomplete") from error
+
+    def forward(self, callback):
+        if not self.ready or self.model_epoch is None:
+            raise MonoUnsupported("full plan is not ready")
+        return callback()
+
+    def close(self) -> None:
+        closed = set()
+        for attention, moe in reversed(tuple(self.reductions.values())):
+            for resource in (moe, attention):
+                if resource is None or id(resource) in closed:
+                    continue
+                resource.close()
+                closed.add(id(resource))
+        self.reductions.clear()
+        self.ops.clear()
+        self.packed_artifacts.clear()
+        self.max_arena = None
+        self.block_residual = None
+        self.model_epoch = None
+        self.ready = False
 
 
 class KimiMonoDecode:
@@ -400,6 +845,7 @@ class KimiMonoDecode:
         self._packed_artifacts: dict[int, dict[str, object]] = {}
         self._reductions: dict[tuple[int, str], tuple[object, object]] = {}
         self._refused: set[tuple[int, int, str, torch.dtype, int]] = set()
+        self._full_plan = KimiFullModelPlan(self)
         self._stats = MonoRouteStats("kimi_k3")
         self._enabled = mode != "off"
         if not self._enabled:
@@ -451,7 +897,11 @@ class KimiMonoDecode:
     def memory_reserve_bytes(self) -> int:
         """Reserve headroom only for native routes this mode can select."""
 
-        if not self._enabled or self._mode not in {"mono", "staged"}:
+        if not self._enabled or self._mode not in {
+            "auto",
+            "mono",
+            "staged",
+        }:
             return 0
         model = self._lm.model
         dcp = getattr(
@@ -460,30 +910,49 @@ class KimiMonoDecode:
             1,
         ) > 1
         speculative = getattr(self._atom_config, "speculative_config", None)
-        dspark = (
-            self._mode == "mono"
+        full_dspark = (
+            self._mode in {"auto", "mono"}
             and getattr(speculative, "method", None) == "dspark"
+            and not dcp
         )
+        if self._mode == "auto" and not full_dspark:
+            return 0
+        layers = tuple(
+            model.layers[model.start_layer : model.end_layer]
+        )
+        if full_dspark:
+            packed = 0
+            kda_layers = 0
+            for layer in layers:
+                if not hasattr(layer, "block_sparse_moe"):
+                    packed += _FULL_DENSE_PACKED_BYTES
+                elif layer.is_linear_attn:
+                    packed += _FULL_KDA_PACKED_BYTES
+                    kda_layers += 1
+                else:
+                    packed += _FULL_MLA_PACKED_BYTES
+            reserve = (
+                packed
+                + len(layers)
+                * len(KIMI_MLA_AGENTIC_ROWS)
+                * _FULL_WORKSPACE_PER_LAYER_BUCKET
+                + _FULL_SHARED_BYTES
+            )
+            if self._mode == "mono":
+                reserve += (
+                    kda_layers
+                    * len(SAMPLES)
+                    * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
+                )
+            return reserve
         packed_layers: set[int] = set()
         workspace_buckets = 0
-        for layer in model.layers[model.start_layer : model.end_layer]:
+        for layer in layers:
             is_kda = bool(getattr(layer, "is_linear_attn", False))
             if is_kda:
                 buckets = tuple((samples, False) for samples in SAMPLES)
-                if dspark:
-                    buckets += tuple(
-                        (samples, True)
-                        for samples in KIMI_MLA_AGENTIC_ROWS
-                    )
             else:
-                buckets = (
-                    tuple(
-                        (samples, True)
-                        for samples in KIMI_MLA_AGENTIC_ROWS
-                    )
-                    if dspark
-                    else ()
-                )
+                buckets = ()
             for samples, mtp in buckets:
                 route = dict(
                     samples=samples,
@@ -510,6 +979,28 @@ class KimiMonoDecode:
             len(packed_layers) * _PACKED_RESERVE_PER_LAYER
             + workspace_buckets * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
         )
+
+    def prepare_for_capture(self) -> bool:
+        """Build the complete DSpark plan before any graph capture begins."""
+
+        if not self._enabled or self._mode not in {"auto", "mono"}:
+            return True
+        speculative = getattr(
+            self._atom_config,
+            "speculative_config",
+            None,
+        )
+        if (
+            getattr(speculative, "method", None) != "dspark"
+            or getattr(
+                self._atom_config,
+                "decode_context_parallel_size",
+                1,
+            )
+            > 1
+        ):
+            return True
+        return self._full_plan.prepare()
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
         samples = input_ids.numel()
@@ -633,10 +1124,7 @@ class KimiMonoDecode:
         ]
         state_dtype = None
         for layer in model.layers[model.start_layer : model.end_layer]:
-            if not getattr(layer, "is_linear_attn", True) or not hasattr(
-                layer,
-                "block_sparse_moe",
-            ):
+            if not getattr(layer, "is_linear_attn", True):
                 continue
             try:
                 cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
@@ -653,6 +1141,8 @@ class KimiMonoDecode:
                 return self._fallback("mixed_state_dtype", samples)
         if agentic and state_dtype is not torch.float16:
             return self._fallback("state_dtype", samples)
+        if agentic and self._atom_config.kv_cache_dtype != "fp8":
+            return self._fallback("kv_dtype", samples)
         if agentic and mla_layers:
             attention_metadata = fwd.attn_metadata
             try:
@@ -681,11 +1171,28 @@ class KimiMonoDecode:
                 return self._fallback("mla_metadata", samples)
         prepared = False
         if state_dtype is not None:
-            prepared = (
-                self._prepare(samples, state_dtype, agentic_batch_size)
-                if agentic
-                else self._prepare(samples, state_dtype)
-            )
+            full_plan = getattr(self, "_full_plan", None)
+            if (
+                agentic
+                and self._mode in {"auto", "mono"}
+                and full_plan is not None
+            ):
+                if (
+                    torch.cuda.is_current_stream_capturing()
+                    and not full_plan.ready
+                ):
+                    return self._fallback("capture_prepare", samples)
+                prepared = full_plan.prepare()
+            else:
+                prepared = (
+                    self._prepare(
+                        samples,
+                        state_dtype,
+                        agentic_batch_size,
+                    )
+                    if agentic
+                    else self._prepare(samples, state_dtype)
+                )
         if not prepared:
             return self._fallback("prepare", samples)
         return True
@@ -911,7 +1418,7 @@ class KimiMonoDecode:
             **route,
         )
         if backend is None:
-            raise MonoUnsupported("layer fallback")
+            raise MonoUnsupported("backend unavailable")
         key = (
             layer.layer_idx,
             samples,
@@ -924,67 +1431,95 @@ class KimiMonoDecode:
         except KeyError as error:
             raise MonoUnsupported("layer was not prepared before launch") from error
 
-    def forward(
+    @staticmethod
+    def _publish_layer_output(layer, positions, layer_input, post_hidden):
+        """Preserve decoder forward-hook and DSpark aux-output semantics."""
+
+        output = (post_hidden, None, None, None)
+        original = output
+        for hook in getattr(layer, "_forward_hooks", {}).values():
+            if hasattr(hook, "_atom_native_output_buffer"):
+                continue
+            hooked = hook(layer, (positions, layer_input), output)
+            if hooked is not None:
+                output = hooked
+        if output is original:
+            return post_hidden
+        if isinstance(output, tuple):
+            return layer.aux_hidden_state(output)
+        return output
+
+    @staticmethod
+    def _native_output_target(layer, fwd, samples):
+        for hook in getattr(layer, "_forward_hooks", {}).values():
+            buffer = getattr(hook, "_atom_native_output_buffer", None)
+            if buffer is None:
+                continue
+            offset = getattr(fwd.context, "ubatch_token_offset", 0)
+            return buffer[offset : offset + samples]
+        return None
+
+    def _forward_layers(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        inputs_embeds: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        hidden,
+        positions,
+        fwd,
+        md,
+        state_dtype,
+        agentic_batch_size,
+        full_plan,
+    ):
         model = self._lm.model
-        fwd = get_forward_context()
-        md = getattr(fwd.attn_metadata, "kda_metadata", None)
-        if md is None:
-            md = fwd.attn_metadata.gdn_metadata
-        samples = input_ids.numel()
-        state_dtype = _kda_state_dtype(model, fwd) or torch.float32
-        agentic_batch_size = (
-            md.spec_state_indices_tensor.shape[0]
-            if md.num_spec_decodes > 0
-            else 0
+        samples = hidden.shape[0]
+        blocks = (
+            full_plan.block_residual[:samples]
+            if full_plan is not None
+            else hidden.new_zeros(samples, 0, hidden.shape[-1])
         )
-        backend = select_backend(
-            "kimi_k3",
-            self._mode,
-            samples=samples,
-            tp_size=8,
-            kv_cache_dtype=self._atom_config.kv_cache_dtype,
-            mtp=agentic_batch_size > 0,
-            dcp=getattr(
-                self._atom_config,
-                "decode_context_parallel_size",
-                1,
-            )
-            > 1,
-            query_len=8 if agentic_batch_size else 1,
-            replay_ssm=getattr(md, "replayssm", False),
-        )
-        self._route_stats().record_hit(backend or "baseline", samples)
-        hidden = model.get_input_embeddings(input_ids) if inputs_embeds is None else inputs_embeds
-        blocks = hidden.new_zeros(samples, 0, hidden.shape[-1])
         pending = pending2 = None
-        for layer in model.layers[model.start_layer : model.end_layer]:
-            try:
-                owned = self._op(
+        layers = tuple(
+            model.layers[model.start_layer : model.end_layer]
+        )
+        for layer_index, layer in enumerate(layers):
+            advance_epoch = (
+                full_plan is None or layer_index == len(layers) - 1
+            )
+            layer_input = hidden
+            output_target = self._native_output_target(
+                layer,
+                fwd,
+                samples,
+            )
+            if full_plan is not None:
+                owned = full_plan.lookup(
                     layer,
                     samples,
                     state_dtype,
                     agentic_batch_size,
                 )
-            except MonoUnsupported:
-                hidden, pending, pending2, blocks = layer(
-                    positions,
-                    hidden,
-                    blocks,
-                    pending_add=pending,
-                    pending_add2=pending2,
-                )
-                continue
+            else:
+                try:
+                    owned = self._op(
+                        layer,
+                        samples,
+                        state_dtype,
+                        agentic_batch_size,
+                    )
+                except MonoUnsupported:
+                    hidden, pending, pending2, blocks = layer(
+                        positions,
+                        hidden,
+                        blocks,
+                        pending_add=pending,
+                        pending_add2=pending2,
+                    )
+                    continue
             for add in (pending, pending2):
                 if add is not None:
                     hidden = hidden + add
             pending = pending2 = None
             block_idx = owned.op.block_write_idx
-            if block_idx >= blocks.shape[1]:
+            if full_plan is None and block_idx >= blocks.shape[1]:
                 extra = hidden.new_zeros(samples, block_idx + 1 - blocks.shape[1], hidden.shape[-1])
                 blocks = torch.cat((blocks, extra), dim=1)
             cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
@@ -1015,7 +1550,15 @@ class KimiMonoDecode:
                     runtime,
                     cache.k_cache,
                     scale,
+                    x_out=output_target,
                     epoch_layer=layer.layer_idx,
+                    advance=advance_epoch,
+                )
+                hidden = self._publish_layer_output(
+                    layer,
+                    positions,
+                    layer_input,
+                    hidden,
                 )
                 continue
             state_indices = (
@@ -1028,18 +1571,88 @@ class KimiMonoDecode:
                 forward_kwargs["num_accepted_tokens"] = (
                     md.num_accepted_tokens
                 )
+            forward_kwargs["advance"] = advance_epoch
             hidden = owned.op.forward(
                 hidden,
                 blocks,
                 state_indices,
                 cache.k_cache,
                 cache.v_cache,
+                x_out=output_target,
                 **forward_kwargs,
+            )
+            hidden = self._publish_layer_output(
+                layer,
+                positions,
+                layer_input,
+                hidden,
             )
         hidden, _ = model.output_attn_res(hidden, blocks, pending, pending2)
         return hidden
 
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        model = self._lm.model
+        fwd = get_forward_context()
+        md = getattr(fwd.attn_metadata, "kda_metadata", None)
+        if md is None:
+            md = fwd.attn_metadata.gdn_metadata
+        samples = input_ids.numel()
+        state_dtype = _kda_state_dtype(model, fwd) or torch.float32
+        agentic_batch_size = (
+            md.spec_state_indices_tensor.shape[0]
+            if md.num_spec_decodes > 0
+            else 0
+        )
+        hidden = (
+            model.get_input_embeddings(input_ids)
+            if inputs_embeds is None
+            else inputs_embeds
+        )
+        configured_full_plan = getattr(self, "_full_plan", None)
+        full_plan = (
+            configured_full_plan
+            if agentic_batch_size
+            and self._mode in {"auto", "mono"}
+            and configured_full_plan is not None
+            and configured_full_plan.ready
+            else None
+        )
+        if full_plan is not None:
+            hidden = full_plan.forward(
+                lambda: self._forward_layers(
+                    hidden,
+                    positions,
+                    fwd,
+                    md,
+                    state_dtype,
+                    agentic_batch_size,
+                    full_plan,
+                )
+            )
+            backend = "full_model"
+        else:
+            hidden = self._forward_layers(
+                hidden,
+                positions,
+                fwd,
+                md,
+                state_dtype,
+                agentic_batch_size,
+                None,
+            )
+            backend = "staged"
+        self._route_stats().record_hit(backend, samples)
+        return hidden
+
     def close(self) -> None:
+        full_plan = getattr(self, "_full_plan", None)
+        if full_plan is not None:
+            full_plan.close()
         self._close_reductions()
         self._ops.clear()
         self._weights.clear()

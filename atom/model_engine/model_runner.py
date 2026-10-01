@@ -74,6 +74,7 @@ from atom.model_ops.eplb import (
 from atom.model_ops.monokernel import (
     close_model_monokernels,
     model_monokernel_memory_reserve,
+    prepare_model_monokernels_for_capture,
 )
 from atom.model_ops.rejection_sampler import RejectionSampler
 from atom.model_ops.sampler import SAMPLER_EPS, Sampler
@@ -3920,6 +3921,11 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        if not prepare_model_monokernels_for_capture(self.model):
+            logger.warning(
+                "Native MonoKernel full plan unavailable before capture; "
+                "capturing the baseline model route."
+            )
         # M3 indexer-only CP puts an all-to-all in the captured decode path, and
         # NCCL sets up peer connections on a group's FIRST collective -- doing
         # that inside a capture hangs. warmup_model() does not cover it: its

@@ -98,6 +98,7 @@ class KimiK3KdaAttention:
         state_dtype: torch.dtype = torch.float32,
         defer_collectives: bool = False,
         packed_artifacts: dict[str, torch.Tensor] | None = None,
+        monokernel_only: bool = False,
     ) -> None:
         config = weights.config
         if config != KIMI_K3_CONFIG:
@@ -144,6 +145,7 @@ class KimiK3KdaAttention:
         self.agentic_batch_size = agentic_batch_size
         self.conv_state_layout = conv_state_layout
         self.state_dtype = state_dtype
+        self.monokernel_only = monokernel_only
         atom_weight_layout = weights.mxfp4_weight_layout is Mxfp4WeightLayout.ATOM
         atom_scale_layout = weights.mxfp4_scale_layout is Mxfp4ScaleLayout.ATOM
         if atom_weight_layout != atom_scale_layout:
@@ -199,7 +201,8 @@ class KimiK3KdaAttention:
         self.fused_input = self.fused_input_storage[:, :fused_width]
         packed_artifacts = packed_artifacts or {}
         self.w_kda_in_padded = packed_artifacts.get("w_kda_in_padded")
-        if self.w_kda_in_padded is None:
+        self.w_kda_in_packed = packed_artifacts.get("w_kda_in_packed")
+        if self.w_kda_in_padded is None and self.w_kda_in_packed is None:
             self.w_kda_in_padded = torch.zeros(
                 padded_fused_width,
                 config.hidden,
@@ -240,7 +243,6 @@ class KimiK3KdaAttention:
             "moe_packed",
             {},
         )
-        self.w_kda_in_packed = packed_artifacts.get("w_kda_in_packed")
         self.w_kda_o_packed = packed_artifacts.get("w_kda_o_packed")
         if (
             reduce_backend == "symmetric"
@@ -271,7 +273,9 @@ class KimiK3KdaAttention:
             raise ValueError("Kimi-K3 KDA attention requires a GPU-capable TP reduce_group")
 
     def packed_artifacts(self) -> dict[str, torch.Tensor]:
-        artifacts = {"w_kda_in_padded": self.w_kda_in_padded}
+        artifacts = {}
+        if self.w_kda_in_padded is not None and not self.monokernel_only:
+            artifacts["w_kda_in_padded"] = self.w_kda_in_padded
         if self.w_kda_in_packed is not None:
             artifacts["w_kda_in_packed"] = self.w_kda_in_packed
             artifacts["w_kda_o_packed"] = self.w_kda_o_packed
@@ -509,6 +513,7 @@ class KimiK3KdaAttention:
                 moe_peers = hidden_states
             packed = self.moe_packed
             pointer_or_hidden = lambda name: packed[name].data_ptr() if name in packed else hidden_states.data_ptr()
+            tensor_or_hidden = lambda name: self.t[name].data_ptr() if name in self.t else hidden_states.data_ptr()
             self.monokernel_launch(
                 hidden_states.data_ptr(),
                 target.data_ptr(),
@@ -527,7 +532,7 @@ class KimiK3KdaAttention:
                 quantized_moe_scale.data_ptr(),
                 block_stride,
                 pointer_or_hidden("w_r"),
-                self.t["bias"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                tensor_or_hidden("bias") if self.fuse_moe else hidden_states.data_ptr(),
                 pointer_or_hidden("w_latent_down"),
                 pointer_or_hidden("s_latent_down"),
                 pointer_or_hidden("w_shared_ug"),
@@ -536,7 +541,7 @@ class KimiK3KdaAttention:
                 pointer_or_hidden("s_ug"),
                 pointer_or_hidden("w_dn"),
                 pointer_or_hidden("s_dn"),
-                self.t["g_latent"].data_ptr() if self.fuse_moe else hidden_states.data_ptr(),
+                tensor_or_hidden("g_latent") if self.fuse_moe else hidden_states.data_ptr(),
                 pointer_or_hidden("w_shared_dn"),
                 pointer_or_hidden("s_shared_dn"),
                 pointer_or_hidden("w_latent_up"),
@@ -583,10 +588,9 @@ class KimiK3KdaAttention:
                 hidden_states.data_ptr(),
                 self.rank,
                 layer,
+                int(advance),
                 stream=torch.cuda.current_stream(),
             )
-            if advance:
-                self.advance_step()
             return target
 
         gemm_a16w16(
@@ -658,6 +662,8 @@ class KimiK3KdaAttention:
     def release_packed_sources(self) -> None:
         """Drop dense source snapshots after their packed artifacts are built."""
 
+        if self.monokernel_only:
+            self.w_kda_in_padded = None
         keep = {
             "bias",
             "g_in",

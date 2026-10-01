@@ -91,6 +91,7 @@ _TOP_K = 16
 _ROUTED_HIDDEN = 3584
 _INTER = 384
 _SHARED_INTER = 768
+_DENSE_INTER = 33792 // 8
 _HIDDEN_SHARD = _HIDDEN // 8
 _MLA_Q_LORA = 1536
 _MLA_KV_LORA = 512
@@ -108,6 +109,7 @@ def monokernel_layout(
     fuse_moe: bool = False,
     mtp: bool = False,
     mla: bool = False,
+    dense_ffn: bool = False,
 ) -> dict[str, int]:
     """Return byte offsets for the MonoKernel's tagged mailboxes."""
 
@@ -165,15 +167,16 @@ def monokernel_layout(
         offsets["post_stats"] = offset
         offset += samples * _ATTN_RES_CTAS * _ATTN_RES_STATS * 8
     if fuse_moe:
+        ffn_inter = _DENSE_INTER if dense_ffn else _SHARED_INTER
         routed_tiles = _ROUTED_HIDDEN // 16
         for name, size in (
             ("router", samples * _N_EXPERTS * 4),
             ("router_ready", samples * (_N_EXPERTS // 16) * 8),
             ("latent", samples * _ROUTED_HIDDEN * 2),
             ("latent_ready", samples * routed_tiles * 8),
-            ("shared_gu", samples * (2 * _SHARED_INTER) * 2),
-            ("shared_gu_ready", samples * ((2 * _SHARED_INTER) // 16) * 8),
-            ("shared_mid", samples * _SHARED_INTER * 4),
+            ("shared_gu", samples * (2 * ffn_inter) * 2),
+            ("shared_gu_ready", samples * ((2 * ffn_inter) // 16) * 8),
+            ("shared_mid", samples * ffn_inter * 4),
             ("selection_id", samples * _TOP_K * 8),
             ("selection_weight", samples * _TOP_K * 8),
             ("expert_mid", samples * _TOP_K * _INTER * 2),
@@ -219,6 +222,7 @@ def monokernel_scratch_nbytes(
     fuse_moe: bool = False,
     mtp: bool = False,
     mla: bool = False,
+    dense_ffn: bool = False,
 ) -> int:
     """Bytes required by tagged BF16-pair projection mailboxes."""
 
@@ -228,6 +232,7 @@ def monokernel_scratch_nbytes(
         fuse_moe=fuse_moe,
         mtp=mtp,
         mla=mla,
+        dense_ffn=dense_ffn,
     )["_bytes"]
 
 
@@ -245,9 +250,12 @@ def build_kimi_k3_monokernel(
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
     atom_expert_layout: bool = False,
     mla: bool = False,
+    dense_ffn: bool = False,
 ):
     """Build the fixed-shape single-launch Kimi-K3 decode MonoKernel."""
 
+    if dense_ffn and (mla or not fuse_moe):
+        raise ValueError("dense FFN requires the fused KDA layer path")
     if mla:
         if (
             samples not in (8, 16, 32)
@@ -298,6 +306,7 @@ def build_kimi_k3_monokernel(
     conv_slot_bytes = _CONV_CHANNELS * conv_state_length * 2
     latent_projection_waves = 3 if samples <= 4 else 4
     shared_projection_waves = 3 if samples <= 4 else 6
+    ffn_inter = _DENSE_INTER if dense_ffn else _SHARED_INTER
     mtp_splits = 4 if mtp else _MTP_SPLITS
     mtp_rows_per_split = _HEAD_DIM // mtp_splits
     mtp_v_lanes = mtp_rows_per_split // _WAVES
@@ -344,9 +353,9 @@ def build_kimi_k3_monokernel(
     latent_offset = router_ready_offset + samples * (_N_EXPERTS // 16) * 8
     latent_ready_offset = latent_offset + samples * _ROUTED_HIDDEN * 2
     shared_gu_offset = latent_ready_offset + samples * (_ROUTED_HIDDEN // 16) * 8
-    shared_gu_ready_offset = shared_gu_offset + samples * (2 * _SHARED_INTER) * 2
-    shared_mid_offset = shared_gu_ready_offset + samples * ((2 * _SHARED_INTER) // 16) * 8
-    selection_id_offset = shared_mid_offset + samples * _SHARED_INTER * 4
+    shared_gu_ready_offset = shared_gu_offset + samples * (2 * ffn_inter) * 2
+    shared_mid_offset = shared_gu_ready_offset + samples * ((2 * ffn_inter) // 16) * 8
+    selection_id_offset = shared_mid_offset + samples * ffn_inter * 4
     selection_weight_offset = selection_id_offset + samples * _TOP_K * 8
     expert_mid_offset = selection_weight_offset + samples * _TOP_K * 8
     expert_mid_ready_offset = expert_mid_offset + samples * _TOP_K * _INTER * 2
@@ -359,6 +368,7 @@ def build_kimi_k3_monokernel(
         fuse_moe=fuse_moe,
         mtp=mtp,
         mla=mla,
+        dense_ffn=dense_ffn,
     )
     mtp_qkvg_offset = layout.get("mtp_qkvg", 0)
     mtp_conv_ready_offset = layout.get("mtp_conv_ready", 0)
@@ -471,6 +481,7 @@ def build_kimi_k3_monokernel(
         mla_gate_weight: Int64,
         rank: Int32,
         layer: Int32,
+        advance_epoch: Int32,
     ):
         bid = gpu.block_idx.x
         tid = gpu.thread_idx.x
@@ -3709,7 +3720,250 @@ def build_kimi_k3_monokernel(
                 )
         stamp(4)
 
-        if const_expr(fuse_moe):
+        if const_expr(dense_ffn):
+            # Layer 0 uses the checkpoint's BF16 dense SiTU FFN.  Keep its
+            # gate/up, activation, down projection, TP reduction and residual
+            # update in this same application launch.
+            dense_row_groups = 2
+            dense_split_waves = 4
+            dense_row_tile = dense_row_groups * 16
+            dense_row_tasks = (2 * _DENSE_INTER) // dense_row_tile
+            dense_tasks = sample_groups * dense_row_tasks
+            dense_task = bid
+            while dense_task < dense_tasks:
+                if const_expr(sample_groups == 1):
+                    row_task = dense_task
+                    sample_base = 0
+                else:
+                    sample_group = dense_task // dense_row_tasks
+                    row_task = dense_task % dense_row_tasks
+                    sample_base = sample_group * staged_samples
+                stage_moe_hidden(sample_base, staged_samples)
+                gpu.barrier()
+                row_base = row_task * dense_row_groups
+                dense_accumulator = bf16_mfma(
+                    rsrc(packed_shared_up),
+                    row_base,
+                    _HIDDEN,
+                    dense_row_groups,
+                    dense_split_waves,
+                    14,
+                    staged_samples,
+                )
+
+                def emit_dense_up(local_row, sample, value_low, value_high):
+                    row = row_task * dense_row_tile + local_row
+                    store_raw_pair(
+                        shared_gu_mailbox_rsrc,
+                        (sample * (2 * _DENSE_INTER) + row) // 2,
+                        value_low,
+                        value_high,
+                    )
+
+                publish_mfma_pairs(
+                    dense_accumulator,
+                    dense_row_tile,
+                    dense_split_waves,
+                    emit_dense_up,
+                    sample_base,
+                    staged_samples,
+                )
+                rocdl.s_waitcnt(vmcnt=0)
+                gpu.barrier()
+                if tid < dense_row_groups:
+                    for local_sample in range_constexpr(staged_samples):
+                        store_i32(
+                            shared_gu_ready_rsrc,
+                            (sample_base + local_sample)
+                            * ((2 * _DENSE_INTER) // 16)
+                            + row_task * dense_row_groups
+                            + tid,
+                            1,
+                        )
+                dense_task = dense_task + _BLOCKS
+
+            if bid < samples:
+                dense_pairs = _DENSE_INTER // 2
+                dense_tiles = (2 * _DENSE_INTER) // 16
+                for ready_round in range_constexpr(
+                    (dense_tiles + _THREADS - 1) // _THREADS
+                ):
+                    ready = tid + ready_round * _THREADS
+                    if ready < dense_tiles:
+                        load_i32(
+                            shared_gu_ready_rsrc,
+                            bid * dense_tiles + ready,
+                        )
+                gpu.barrier()
+                for pair_round in range_constexpr(
+                    (dense_pairs + _THREADS - 1) // _THREADS
+                ):
+                    pair_in_row = tid + pair_round * _THREADS
+                    if pair_in_row < dense_pairs:
+                        gate_word = load_raw_pair(
+                            shared_gu_mailbox_rsrc,
+                            (bid * (2 * _DENSE_INTER)) // 2 + pair_in_row,
+                        )
+                        up_word = load_raw_pair(
+                            shared_gu_mailbox_rsrc,
+                            (
+                                bid * (2 * _DENSE_INTER)
+                                + _DENSE_INTER
+                            )
+                            // 2
+                            + pair_in_row,
+                        )
+                        gate_values = fx.Vector.from_elements(
+                            [gate_word], fx.Int32
+                        ).bitcast(fx.BFloat16).to(fx.Float32)
+                        up_values = fx.Vector.from_elements(
+                            [up_word], fx.Int32
+                        ).bitcast(fx.BFloat16).to(fx.Float32)
+                        mids = []
+                        for item in range_constexpr(2):
+                            gate_value = gate_values[item]
+                            up_value = up_values[item]
+                            gate_tanh = fx.Float32(2.0) * rcp(
+                                fx.Float32(1.0)
+                                + exp(fx.Float32(-0.5) * gate_value)
+                            ) - fx.Float32(1.0)
+                            gate_sigmoid = rcp(
+                                fx.Float32(1.0) + exp(-gate_value)
+                            )
+                            up_tanh = fx.Float32(2.0) * rcp(
+                                fx.Float32(1.0)
+                                + exp(fx.Float32(-0.08) * up_value)
+                            ) - fx.Float32(1.0)
+                            mids.append(
+                                fx.Float32(4.0)
+                                * gate_tanh
+                                * gate_sigmoid
+                                * fx.Float32(25.0)
+                                * up_tanh
+                            )
+                        store_pair(
+                            shared_mid_mailbox_rsrc,
+                            bid * dense_pairs + pair_in_row,
+                            mids[0],
+                            mids[1],
+                        )
+            stamp(5)
+
+            dense_output_row_groups = 4
+            dense_output_split_waves = 2
+            dense_output_row_tile = dense_output_row_groups * 16
+            dense_output_tasks = samples * (
+                _HIDDEN // dense_output_row_tile
+            )
+            dense_output_task = bid
+            while dense_output_task < dense_output_tasks:
+                sample = dense_output_task // (
+                    _HIDDEN // dense_output_row_tile
+                )
+                row_task = dense_output_task % (
+                    _HIDDEN // dense_output_row_tile
+                )
+                dense_pairs = _DENSE_INTER // 2
+                for load_round in range_constexpr(
+                    (dense_pairs + _THREADS - 1) // _THREADS
+                ):
+                    pair = tid + load_round * _THREADS
+                    if pair < dense_pairs:
+                        packed = load_pair(
+                            shared_mid_mailbox_rsrc,
+                            sample * dense_pairs + pair,
+                        )
+                        lds_store(x, pair, packed.bitcast(fx.Float32))
+                gpu.barrier()
+                dense_down_accumulator = bf16_mfma(
+                    rsrc(packed_shared_down),
+                    row_task * dense_output_row_groups,
+                    _DENSE_INTER,
+                    dense_output_row_groups,
+                    dense_output_split_waves,
+                    11,
+                    1,
+                )
+                fx.ptr_store(
+                    fx.Vector.from_elements(
+                        dense_down_accumulator, fx.Float32
+                    ),
+                    reduction + (wave * _WAVE_SIZE + lane) * 4,
+                )
+                gpu.barrier()
+                if tid < dense_output_row_tile // 2:
+                    local_row = tid * 2
+                    values = []
+                    for pair_element in range_constexpr(2):
+                        row = local_row + pair_element
+                        source_lane = 16 * (row % 16 // 4)
+                        first_wave = (
+                            row // 16
+                        ) * dense_output_split_waves
+                        value = fx.Float32(0.0)
+                        for source_offset in range_constexpr(
+                            dense_output_split_waves
+                        ):
+                            source_index = (
+                                (
+                                    first_wave + source_offset
+                                )
+                                * _WAVE_SIZE
+                                + source_lane
+                            ) * 4 + row % 4
+                            value = value + lds_load(
+                                reduction, source_index
+                            )
+                        values.append(value)
+                    lds_store(
+                        output_values,
+                        tid,
+                        bf16_pair(values[0], values[1]),
+                    )
+                gpu.barrier()
+                pair_base = (
+                    sample * (_HIDDEN // 2)
+                    + row_task * (dense_output_row_tile // 2)
+                )
+
+                def emit_dense_final(
+                    local_pair, value_low, value_high
+                ):
+                    residual_word = fx.Int32(
+                        bo.buffer_load(
+                            rsrc(updated_prefix),
+                            pair_base + local_pair,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    residual_low = (
+                        residual_word << 16
+                    ).bitcast(fx.Float32)
+                    residual_high = (
+                        residual_word & fx.Int32(-65536)
+                    ).bitcast(fx.Float32)
+                    bo.buffer_store(
+                        bf16_pair(
+                            residual_low + value_low,
+                            residual_high + value_high,
+                        ).bitcast(fx.Int32),
+                        rsrc(final_output),
+                        pair_base + local_pair,
+                        cache_modifier=CM_DEV,
+                    )
+
+                moe_peer_reduce(
+                    dense_output_row_tile // 2,
+                    pair_base,
+                    output_values,
+                    1,
+                    emit_dense_final,
+                )
+                dense_output_task = dense_output_task + _BLOCKS
+            stamp(9)
+
+        if const_expr(fuse_moe and not dense_ffn):
             # Stage 5: the BF16 router and the two production MXFP8 dense
             # projections.  All consume the post-AttnRes result; the dense
             # branches directly reuse the quantized activation emitted there.
@@ -4337,6 +4591,13 @@ def build_kimi_k3_monokernel(
                 moe_peer_reduce(16 // 2, pair_base, output_values, 1, emit_final)
                 tail_task = tail_task + _BLOCKS
             stamp(9)
+        if (bid == 0) & (tid == 0) & (advance_epoch != 0):
+            bo.buffer_store(
+                step_value + fx.Int32(1),
+                rsrc(step),
+                0,
+                cache_modifier=CM_DEV,
+            )
 
     @flyc.jit
     def launch(
@@ -4409,6 +4670,7 @@ def build_kimi_k3_monokernel(
         mla_gate_weight: Int64,
         rank: Int32,
         layer: Int32,
+        advance_epoch: Int32,
         stream: Stream = Stream(None),
     ):
         kimi_k3_monokernel(
@@ -4481,6 +4743,7 @@ def build_kimi_k3_monokernel(
             mla_gate_weight,
             rank,
             layer,
+            advance_epoch,
         ).launch(grid=(_BLOCKS,), block=(_THREADS,), stream=stream)
 
     block_tag = f"m{-attn_res_blocks}" if attn_res_blocks < 0 else str(attn_res_blocks)

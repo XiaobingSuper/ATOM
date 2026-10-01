@@ -437,6 +437,11 @@ class Drafter(abc.ABC):
             off = ctx.ubatch_token_offset
             buffer[off : off + tensor.shape[0]].copy_(tensor)
 
+        # Native full-layer routes can publish their post-layer output directly
+        # into this graph-stable buffer and skip the otherwise separate copy
+        # launch. The marker is intentionally on the hook: hook ownership and
+        # removal remain standard PyTorch behavior.
+        _hook._atom_native_output_buffer = buffer
         return _hook
 
     def aux_for(self, target_hidden_states: torch.Tensor) -> list[torch.Tensor] | None:

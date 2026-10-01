@@ -112,7 +112,7 @@ def select_backend(
         return None
     if model == "kimi_k3" and segment == "mla_layer":
         if (
-            mode == "mono"
+            mode in ("auto", "mono")
             and native
             and decode
             and samples in KIMI_MLA_AGENTIC_ROWS
@@ -133,10 +133,10 @@ def select_backend(
         return None
     if model == "kimi_k3" and mtp:
         if (
-            mode == "mono"
+            mode in ("auto", "mono")
             and native
             and decode
-            and samples in KIMI_AGENTIC_ROWS
+            and samples in KIMI_MLA_AGENTIC_ROWS
             and query_len == 8
             and tp_size == 8
             and kv_cache_dtype in ("bf16", "fp8")

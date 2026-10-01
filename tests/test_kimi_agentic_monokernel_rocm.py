@@ -215,6 +215,55 @@ def _deterministic_mla_weights(device, rank):
     return weights
 
 
+def _deterministic_dense_weights(device, rank):
+    import torch
+
+    from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
+
+    weights = _deterministic_weights(device, rank)
+    for name in (
+        "w_r",
+        "bias",
+        "w_latent_down",
+        "g_latent",
+        "w_latent_up",
+        "w_shared_ug",
+        "w_shared_dn",
+        "w_ug",
+        "s_ug",
+        "w_dn",
+        "s_dn",
+    ):
+        weights.t.pop(name)
+    hidden = KIMI_K3_CONFIG.hidden
+    intermediate = 33792 // 8
+    gate_up = torch.zeros(
+        2 * intermediate,
+        hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    gate_up_rows = torch.arange(2 * intermediate, device=device)
+    gate_up[
+        gate_up_rows,
+        gate_up_rows.remainder(hidden),
+    ] = 0.03125
+    down = torch.zeros(
+        hidden,
+        intermediate,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    down_rows = torch.arange(hidden, device=device)
+    down[
+        down_rows,
+        down_rows.remainder(intermediate),
+    ] = (rank + 1) / 1024
+    weights.t["w_dense_ug"] = gate_up
+    weights.t["w_dense_dn"] = down
+    return weights
+
+
 def _projected_input(prefix, weights):
     import torch
 
@@ -709,7 +758,7 @@ def _exercise_batch(op, batch, device, weights):
     from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
 
     rows = batch * 8
-    slots = {1: 13, 4: 37, 8: 67}[batch]
+    slots = {1: 13, 2: 23, 4: 37}[batch]
     snapshots = _slot_table(batch, slots, 1, device)
     conv_initial = torch.linspace(
         -0.125,
@@ -775,18 +824,14 @@ def _exercise_batch(op, batch, device, weights):
     eager_counts = (
         (4,)
         if batch == 1
-        else (
-            (1, 3, 6, 8)
-            if batch == 4
-            else (1, 3, 6, 8, 2, 7, 4, 5)
-        ),
+        else (1, 6)
+        if batch == 2
+        else (1, 3, 6, 8),
         (7,)
         if batch == 1
-        else (
-            (8, 2, 5, 1)
-            if batch == 4
-            else (8, 2, 5, 1, 7, 4, 6, 3)
-        ),
+        else (8, 2)
+        if batch == 2
+        else (8, 2, 5, 1),
     )
     expected_conv = conv_initial.clone()
     expected_recurrent = recurrent_initial.clone()
@@ -831,25 +876,19 @@ def _exercise_batch(op, batch, device, weights):
     graph_counts = (
         (2,)
         if batch == 1
-        else (
-            (2, 7, 1, 5)
-            if batch == 4
-            else (2, 7, 1, 5, 8, 3, 6, 4)
-        ),
+        else (2, 7)
+        if batch == 2
+        else (2, 7, 1, 5),
         (8,)
         if batch == 1
-        else (
-            (8, 1, 4, 6)
-            if batch == 4
-            else (8, 1, 4, 6, 3, 5, 2, 7)
-        ),
+        else (8, 1)
+        if batch == 2
+        else (8, 1, 4, 6),
         (3,)
         if batch == 1
-        else (
-            (3, 3, 8, 2)
-            if batch == 4
-            else (3, 3, 8, 2, 6, 1, 7, 5)
-        ),
+        else (3, 3)
+        if batch == 2
+        else (3, 3, 8, 2),
     )
     accepted.copy_(torch.tensor(graph_counts[0], dtype=torch.int32, device=device))
     op.forward(
@@ -923,6 +962,112 @@ def _exercise_batch(op, batch, device, weights):
         )
 
 
+def _dense_layer0_oracle(op, weights, reduce_group):
+    import torch
+    import torch.distributed as dist
+
+    gate_up = (
+        op.moe_input.float() @ weights.t["w_dense_ug"].float().t()
+    ).to(torch.bfloat16)
+    gate, up = gate_up.float().chunk(2, dim=-1)
+    middle = (
+        4.0
+        * torch.tanh(gate / 4.0)
+        * torch.sigmoid(gate)
+        * 25.0
+        * torch.tanh(up / 25.0)
+    ).to(torch.bfloat16)
+    local = (
+        middle.float() @ weights.t["w_dense_dn"].float().t()
+    ).to(torch.bfloat16)
+    peers = [
+        torch.empty_like(local) for _ in range(dist.get_world_size())
+    ]
+    dist.all_gather(peers, local, group=reduce_group)
+    reduced = torch.zeros_like(local, dtype=torch.float32)
+    for peer in peers:
+        reduced.add_(peer.float())
+    return (op.updated_prefix.float() + reduced).to(torch.bfloat16)
+
+
+def _exercise_dense_layer0(op, batch, device, weights, reduce_group):
+    import torch
+
+    rows = batch * 8
+    slots = {1: 13, 2: 23, 4: 37}[batch]
+    snapshots = _slot_table(batch, slots, 1, device)
+    accepted = torch.full((batch,), 8, dtype=torch.int32, device=device)
+    conv = torch.zeros(
+        slots,
+        10,
+        3 * op.config.local_heads * op.config.v_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    recurrent = torch.zeros(
+        slots,
+        op.config.local_heads,
+        op.config.v_dim,
+        op.config.v_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    prefix = torch.zeros(
+        rows,
+        op.config.hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    prefix[:, :32] = torch.linspace(
+        -0.5,
+        0.5,
+        rows * 32,
+        device=device,
+    ).view(rows, 32).to(torch.bfloat16)
+    blocks = torch.empty(
+        rows,
+        1,
+        op.config.hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    output = torch.empty_like(prefix)
+
+    before = int(op.step.item())
+    op.forward(
+        prefix,
+        blocks,
+        snapshots,
+        conv,
+        recurrent,
+        x_out=output,
+        num_accepted_tokens=accepted,
+    )
+    torch.cuda.synchronize(device)
+    expected = _dense_layer0_oracle(op, weights, reduce_group)
+    torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
+    assert int(op.step.item()) == before + 1
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.forward(
+            prefix,
+            blocks,
+            snapshots,
+            conv,
+            recurrent,
+            x_out=output,
+            num_accepted_tokens=accepted,
+        )
+    prefix[:, :32].mul_(0.75)
+    before = int(op.step.item())
+    graph.replay()
+    torch.cuda.synchronize(device)
+    expected = _dense_layer0_oracle(op, weights, reduce_group)
+    torch.testing.assert_close(output, expected, atol=5e-2, rtol=5e-2)
+    assert int(op.step.item()) == before + 1
+
+
 def _tp8_worker(rank: int, port: int) -> None:
     import torch
     import torch.distributed as dist
@@ -941,7 +1086,7 @@ def _tp8_worker(rank: int, port: int) -> None:
     try:
         weights = _deterministic_weights(device, rank)
         packed = None
-        for batch in (1, 4, 8):
+        for batch in (1, 2, 4):
             op = KimiK3MonoKernel(
                 weights,
                 batch * 8,
@@ -959,6 +1104,53 @@ def _tp8_worker(rank: int, port: int) -> None:
             packed = op.packed_artifacts()
             _exercise_batch(op, batch, device, weights)
             op.close()
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def _tp8_dense_worker(rank: int, port: int) -> None:
+    import torch
+    import torch.distributed as dist
+
+    from atom.model_ops.monokernel.k3.dense_full import (
+        KimiK3DenseMonoKernel,
+    )
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=8,
+    )
+    try:
+        weights = _deterministic_dense_weights(device, rank)
+        packed = None
+        for batch in (1, 2, 4):
+            op = KimiK3DenseMonoKernel(
+                weights,
+                batch * 8,
+                layer_idx=0,
+                rank=rank,
+                npes=8,
+                group=None,
+                reduce_group=dist.group.WORLD,
+                state_dtype=torch.float16,
+                agentic_batch_size=batch,
+                packed_artifacts=packed,
+            )
+            packed = op.packed_artifacts()
+            _exercise_dense_layer0(
+                op,
+                batch,
+                device,
+                weights,
+                dist.group.WORLD,
+            )
+            op.symmetric_allreduce.close()
+            op.attention.close()
             dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -1325,6 +1517,20 @@ def test_kimi_agentic_tp8_q8_eager_and_graph_real_rocm():
     if str(get_rocm_arch() or "") != "gfx950":
         pytest.skip(f"Kimi Agentic MonoKernel requires gfx950, got {get_rocm_arch()}")
     mp.spawn(_tp8_worker, args=(_free_port(),), nprocs=8, join=True)
+
+
+def test_kimi_dense_layer0_tp8_q8_eager_graph_oracle_real_rocm():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+        pytest.skip("Kimi dense layer-0 gate requires eight ROCm devices")
+
+    import torch.multiprocessing as mp
+    from flydsl.runtime.device import get_rocm_arch
+
+    if str(get_rocm_arch() or "") != "gfx950":
+        pytest.skip(f"Kimi dense MonoKernel requires gfx950, got {get_rocm_arch()}")
+    mp.spawn(_tp8_dense_worker, args=(_free_port(),), nprocs=8, join=True)
 
 
 def test_kimi_mla_tp8_q8_eager_and_graph_real_rocm():

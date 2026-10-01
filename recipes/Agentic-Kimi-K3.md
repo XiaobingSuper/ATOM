@@ -140,11 +140,12 @@ export ATOM_GDN_SSM_DTYPE="${ATOM_GDN_SSM_DTYPE:-fp16}"
 export ATOM_USE_FLYDSL_FP8_PREFILL_ATTN=1
 # Set explicitly to 1 for reproducibility; this is also the current default.
 export ATOM_USE_FLYDSL_GATHER_KV_B_PROJ=1
-# Baseline by default. Set to auto for the paired native-decode candidate run.
+# Baseline by default. Native auto is eligible only for TP8/DCP1 DSpark
+# B1/B2/B4 (the interactive band); every other band remains baseline.
 export ATOM_NATIVE_DECODE_MONOKERNEL="${ATOM_NATIVE_DECODE_MONOKERNEL:-off}"
 export PYTHONNOUSERSITE=1
 
-ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
+ONLINE_QUANT_CONFIG='{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","model.layers.0.mlp.*","*self_attn.[qkv]_conv1d*","*block_sparse_moe.experts*","*block_sparse_moe.routed_expert_*","*vision_tower*","*mm_projector*"]}'
 
 # Defaults shared by every band. The case below overrides only what actually
 # differs per concurrency, so a value that is uniform across the sweep is
@@ -260,9 +261,12 @@ fi
 "${ATOM_CMD[@]}" 2>&1 | tee "server-kimik3-agentx-c${CONC}.log"
 ```
 
-For a MonoKernel A/B, cold-start the same concurrency twice and change only
-`ATOM_NATIVE_DECODE_MONOKERNEL=off|auto`. Keep every other environment
-variable, server argument, workload input, and random seed identical.
+For a MonoKernel A/B on interactive CONC 1/2/4, cold-start the same
+concurrency twice and change only
+`ATOM_NATIVE_DECODE_MONOKERNEL=off|auto`. The native route requires
+TP8/DCP1, DSpark, FP8 KV, ReplaySSM off, and B1/B2/B4; `auto` stays on the
+baseline route outside those gates. Keep every other environment variable,
+server argument, workload input, and random seed identical.
 
 ### Synthetic acceptance semantics
 
