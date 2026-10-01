@@ -2557,28 +2557,7 @@ def test_kimi_failed_prepare_preserves_existing_shared_reductions():
     assert runner._reductions == {(4, "staged"): existing}
 
 
-@pytest.mark.parametrize(
-    ("mode", "spec_method", "expected"),
-    (
-        ("off", "dspark", 0),
-        ("auto", "dspark", 0),
-        (
-            "mono",
-            "eagle",
-            2 * (256 << 20) + (2 * 2) * (32 << 20),
-        ),
-        (
-            "mono",
-            "dspark",
-            4 * (256 << 20) + (2 * 5 + 2 * 3) * (32 << 20),
-        ),
-    ),
-)
-def test_kimi_memory_reserve_matches_selectable_graph_buckets(
-    mode,
-    spec_method,
-    expected,
-):
+def _kimi_memory_reserve_runner(mode, spec_method):
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = mode != "off"
@@ -2614,8 +2593,61 @@ def test_kimi_memory_reserve_matches_selectable_graph_buckets(
     runner._lm = SimpleNamespace(
         model=SimpleNamespace(layers=layers, start_layer=0, end_layer=4)
     )
+    return runner
+
+
+@pytest.mark.parametrize(
+    ("mode", "spec_method", "expected"),
+    (
+        ("off", "dspark", 0),
+        ("auto", "dspark", 0),
+        (
+            "staged",
+            "dspark",
+            2 * (256 << 20) + (2 * 2) * (32 << 20),
+        ),
+        (
+            "mono",
+            "eagle",
+            2 * (256 << 20) + (2 * 2) * (32 << 20),
+        ),
+        (
+            "mono",
+            "dspark",
+            4 * (256 << 20) + (2 * 5 + 2 * 3) * (32 << 20),
+        ),
+    ),
+)
+def test_kimi_memory_reserve_matches_selectable_graph_buckets(
+    mode,
+    spec_method,
+    expected,
+):
+    runner = _kimi_memory_reserve_runner(mode, spec_method)
 
     assert runner.memory_reserve_bytes() == expected
+
+
+def test_kimi_staged_reserve_prevents_kv_oom_budget_overcommit():
+    from atom.model_ops.monokernel import model_monokernel_memory_reserve
+
+    staged = _kimi_memory_reserve_runner("staged", "dspark")
+    model = SimpleNamespace(
+        modules=lambda: [SimpleNamespace(_mono=staged)]
+    )
+    staged_reserve = 2 * (256 << 20) + (2 * 2) * (32 << 20)
+    available_before_reserve = staged_reserve - 1
+
+    assert model_monokernel_memory_reserve(model) == staged_reserve
+    assert available_before_reserve - model_monokernel_memory_reserve(model) == -1
+    source = (
+        Path(__file__).parents[1] / "atom" / "model_engine" / "model_runner.py"
+    ).read_text()
+    reserve_at = source.index(
+        "available_for_kv_budget -= self._kv_budget_extra_reserve(total)"
+    )
+    size_at = source.index("plan_pools(specs, available_for_kv", reserve_at)
+    assert reserve_at < size_at
 
 
 def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():

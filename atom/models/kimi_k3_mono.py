@@ -449,9 +449,9 @@ class KimiMonoDecode:
             self._reductions.pop(key)
 
     def memory_reserve_bytes(self) -> int:
-        """Reserve headroom only for full-layer routes this mode can select."""
+        """Reserve headroom only for native routes this mode can select."""
 
-        if not self._enabled or self._mode != "mono":
+        if not self._enabled or self._mode not in {"mono", "staged"}:
             return 0
         model = self._lm.model
         dcp = getattr(
@@ -460,7 +460,10 @@ class KimiMonoDecode:
             1,
         ) > 1
         speculative = getattr(self._atom_config, "speculative_config", None)
-        dspark = getattr(speculative, "method", None) == "dspark"
+        dspark = (
+            self._mode == "mono"
+            and getattr(speculative, "method", None) == "dspark"
+        )
         packed_layers: set[int] = set()
         workspace_buckets = 0
         for layer in model.layers[model.start_layer : model.end_layer]:
@@ -500,7 +503,7 @@ class KimiMonoDecode:
                         replay_ssm=False,
                     )
                 backend = select_backend("kimi_k3", self._mode, **route)
-                if backend in {"mono", "mla_full"}:
+                if backend in {"mono", "mla_full", "staged"}:
                     packed_layers.add(layer.layer_idx)
                     workspace_buckets += 1
         return (
