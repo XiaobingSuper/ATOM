@@ -162,10 +162,7 @@ class _KimiK3MlaPath:
             packed_artifacts=packed_artifacts.get("attention"),
             monokernel_only=monokernel_only,
         )
-        retain_staged_workspaces = (
-            not monokernel_only
-            or isinstance(self.attention, KimiK3KdaAttention)
-        )
+        retain_staged_workspaces = not monokernel_only
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.pre_updated = torch.empty_like(self.pre_attn)
@@ -263,7 +260,18 @@ class _KimiK3MlaPath:
         self.s_latent_down = self.latent_projection.scale
         self.w_shared_ug = self.shared_projection.weight
         self.s_shared_ug = self.shared_projection.scale
-        if monokernel_only and not retain_staged_workspaces:
+        self.shared_activation_owner = None
+        if (
+            monokernel_only
+            and not retain_staged_workspaces
+            and isinstance(self.attention, KimiK3KdaAttention)
+        ):
+            # KDA's fused full-layer launch requires this graph-stable backing
+            # allocation to remain live. Keep only the exact activation tile;
+            # the unused scale workspace and projection object are discarded.
+            self.shared_activation_owner = self.shared_projection.activation
+            self.shared_projection = None
+        elif monokernel_only and not retain_staged_workspaces:
             # The fused application kernel consumes only the shared packed
             # weights; staged projection activation workspaces are dead.
             self.shared_projection = None
@@ -460,6 +468,8 @@ class _KimiK3MlaPath:
             self.attention_delta,
             *self.attention.full_plan_workspace_tensors(),
         )
+        if self.shared_activation_owner is not None:
+            tensors = (*tensors, self.shared_activation_owner)
         if self.routed_partial is None:
             return tensors
         return (

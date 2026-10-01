@@ -162,7 +162,10 @@ def _deterministic_mla_weights(device, rank):
         )
 
     tensors = weights.t
-    tensors["w_qkv_a"] = bf16(config.qkv_a_rows, hidden)
+    tensors["w_qkv_a"] = bf16(
+        config.q_lora + config.kv_lora + config.pe_dim,
+        hidden,
+    )
     tensors["g_q"] = bf16(config.q_lora, value=1)
     tensors["g_kv"] = bf16(config.kv_lora, value=1)
     tensors["w_q_b"] = bf16(
@@ -177,7 +180,10 @@ def _deterministic_mla_weights(device, rank):
     tensors["w_gate"] = bf16(projection, hidden)
     tensors["w_o"] = bf16(hidden, projection)
 
-    qkv_rows = torch.arange(config.qkv_a_rows, device=device)
+    qkv_rows = torch.arange(
+        config.q_lora + config.kv_lora + config.pe_dim,
+        device=device,
+    )
     tensors["w_qkv_a"][
         qkv_rows,
         qkv_rows.remainder(32),
@@ -1074,7 +1080,10 @@ def _tp8_worker(rank: int, port: int) -> None:
 
     from atom.model_ops.monokernel.config import ConvStateLayout
     from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
-    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
+    from atom.models.kimi_k3_mono import (
+        _full_layer_source_nbytes,
+        _full_layer_workspace_nbytes,
+    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1107,6 +1116,27 @@ def _tp8_worker(rank: int, port: int) -> None:
                 for tensor in op.full_plan_workspace_tensors()
             ) == _full_layer_workspace_nbytes("mono", batch * 8)
             packed = op.packed_artifacts()
+            op.release_packed_sources()
+            retained = {
+                tensor.data_ptr(): tensor
+                for mapping in (op.t, op.attention.t)
+                for tensor in mapping.values()
+            }
+            retained_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in retained.values()
+            )
+            expected_source_bytes = _full_layer_source_nbytes("mono")
+            assert retained_bytes == expected_source_bytes, (
+                retained_bytes,
+                expected_source_bytes,
+                {
+                    name: tensor.numel() * tensor.element_size()
+                    for mapping in (op.t, op.attention.t)
+                    for name, tensor in mapping.items()
+                },
+            )
+            assert op.t["g_in"] is weights.t["g_in"]
             _exercise_batch(op, batch, device, weights)
             op.close()
             dist.barrier()
@@ -1121,7 +1151,10 @@ def _tp8_dense_worker(rank: int, port: int) -> None:
     from atom.model_ops.monokernel.k3.dense_full import (
         KimiK3DenseMonoKernel,
     )
-    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
+    from atom.models.kimi_k3_mono import (
+        _full_layer_source_nbytes,
+        _full_layer_workspace_nbytes,
+    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1155,6 +1188,17 @@ def _tp8_dense_worker(rank: int, port: int) -> None:
                 batch * 8,
             )
             packed = op.packed_artifacts()
+            op.release_packed_sources()
+            retained = {
+                tensor.data_ptr(): tensor
+                for mapping in (op.t, op.attention.t)
+                for tensor in mapping.values()
+            }
+            assert sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in retained.values()
+            ) == _full_layer_source_nbytes("dense_full")
+            assert op.t["g_in"] is weights.t["g_in"]
             _exercise_dense_layer0(
                 op,
                 batch,
@@ -1487,7 +1531,10 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
     import torch.distributed as dist
 
     from atom.model_ops.monokernel.k3.mla_full import KimiK3MlaMonoKernel
-    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
+    from atom.models.kimi_k3_mono import (
+        _full_layer_source_nbytes,
+        _full_layer_workspace_nbytes,
+    )
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1525,6 +1572,24 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
                 batch * 8,
             )
             packed = op.packed_artifacts()
+            op.release_packed_sources()
+            retained = {
+                tensor.data_ptr(): tensor for tensor in op.t.values()
+            }
+            retained_bytes = sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in retained.values()
+            )
+            expected_source_bytes = _full_layer_source_nbytes("mla_full")
+            assert retained_bytes == expected_source_bytes, (
+                retained_bytes,
+                expected_source_bytes,
+                {
+                    name: tensor.numel() * tensor.element_size()
+                    for name, tensor in op.t.items()
+                },
+            )
+            assert op.t["g_in"] is weights.t["g_in"]
             _exercise_mla_batch(op, batch, device, weights)
             op.close()
             dist.barrier()

@@ -125,31 +125,49 @@ def _full_layer_workspace_nbytes(backend: str, rows: int) -> int:
         + padded_rows * (_HIDDEN // 32)
         + timeline
     )
-    if backend == "mla_full":
-        return common
-    max_sorted = rows * KIMI_K3_CONFIG.top_k * 16
-    max_blocks = (max_sorted + 15) // 16
-    staged = (
-        padded_rows * _HIDDEN
-        + padded_rows * (_HIDDEN // 32)
-        + 2 * max_sorted * 4
-        + max_blocks * 4
-        + 2 * 4
-        + max_sorted * KIMI_K3_CONFIG.inter * _BF16_BYTES
-        + rows * KIMI_K3_CONFIG.n_experts * (2 + 4 + 8)
-        + rows * KIMI_K3_CONFIG.top_k * (4 + 8 + 4 + 4)
-        + 4
-        * rows
-        * KIMI_K3_CONFIG.routed_hidden
-        * _BF16_BYTES
-        + 3
-        * rows
-        * KIMI_K3_CONFIG.shared_inter
-        * _BF16_BYTES
-        + 3 * rows * _HIDDEN * _BF16_BYTES
-        + rows * (_HIDDEN // 8) * _BF16_BYTES
+    return (
+        common + padded_rows * _HIDDEN
+        if backend == "mono"
+        else common
     )
-    return common + staged
+
+
+def _full_layer_source_nbytes(backend: str) -> int:
+    """Exact model-plan-owned source bytes retained once per layer."""
+
+    cfg = KIMI_K3_CONFIG
+    residual = 6 * _HIDDEN * _BF16_BYTES
+    recurrent = (
+        cfg.v_dim * _BF16_BYTES
+        + cfg.local_heads * 4
+        + cfg.local_heads * cfg.v_dim * _BF16_BYTES
+        + 3 * _PROJECTION * 4 * _BF16_BYTES
+        + _PROJECTION * cfg.v_dim * _BF16_BYTES
+    )
+    if backend == "dense_full":
+        return residual + recurrent
+    moe_runtime = (
+        cfg.n_experts * 4
+        + cfg.routed_hidden * _BF16_BYTES
+    )
+    if backend == "mono":
+        return residual + moe_runtime + recurrent
+    if backend != "mla_full":
+        raise ValueError(f"unsupported Kimi full backend {backend!r}")
+    mla_runtime = (
+        (cfg.q_lora + cfg.kv_lora) * _BF16_BYTES
+        + (
+            (cfg.q_lora + cfg.kv_lora + cfg.pe_dim) * _HIDDEN
+            + cfg.local_heads
+            * (cfg.nope_dim + cfg.pe_dim)
+            * cfg.q_lora
+            + cfg.local_heads * cfg.kv_lora * cfg.nope_dim
+            + cfg.local_heads * cfg.v_dim * cfg.kv_lora
+            + _PROJECTION * _HIDDEN
+        )
+        * _BF16_BYTES
+    )
+    return residual + moe_runtime + mla_runtime
 
 
 def _need(ok: bool, what: str) -> None:
@@ -570,6 +588,66 @@ class _KimiLayerOp:
         return self.op.initialize_collectives(attention, moe)
 
 
+_FULL_RESIDUAL_SOURCE_NAMES = {
+    "g_in",
+    "g_mlp_res",
+    "g_post",
+    "g_self_res",
+    "w_mlp_res",
+    "w_self_res",
+}
+_FULL_KDA_SOURCE_NAMES = {
+    "g_kda_out",
+    "kda_a_log",
+    "kda_dt_bias",
+    "w_kda_conv",
+    "w_kda_fb",
+}
+_FULL_MOE_SOURCE_NAMES = {"bias", "g_latent"}
+_FULL_MLA_SOURCE_NAMES = {
+    "g_kv",
+    "g_q",
+    "w_gate",
+    "w_q_b",
+    "w_qkv_a",
+    "w_uk",
+    "w_uv",
+}
+
+
+class KimiLayerSourceOwner:
+    """Own one layer's immutable fused-runtime source tensors."""
+
+    def __init__(self, weights: LayerWeights, backend: str) -> None:
+        self.weights = weights
+        self.backend = backend
+        self.tensors = dict(weights.t)
+
+    def retain_runtime_sources(self) -> None:
+        names = set(_FULL_RESIDUAL_SOURCE_NAMES)
+        if self.backend in {"dense_full", "mono"}:
+            names.update(_FULL_KDA_SOURCE_NAMES)
+        if self.backend in {"mono", "mla_full"}:
+            names.update(_FULL_MOE_SOURCE_NAMES)
+        if self.backend == "mla_full":
+            names.update(_FULL_MLA_SOURCE_NAMES)
+        retained = {
+            name: tensor
+            for name, tensor in self.weights.t.items()
+            if name in names
+        }
+        if self.weights.t and not retained:
+            raise ValueError(
+                f"Kimi {self.backend} source owner retained no tensors"
+            )
+        self.tensors = retained
+        self.weights.t = self.tensors
+
+    def close(self) -> None:
+        self.tensors.clear()
+        self.weights.t = {}
+
+
 class KimiFullModelPlan:
     """Atomically own every DSpark full-layer bucket and shared model arena."""
 
@@ -580,6 +658,7 @@ class KimiFullModelPlan:
             _KimiLayerOp,
         ] = {}
         self.packed_artifacts: dict[int, dict[str, object]] = {}
+        self.source_owners: dict[int, KimiLayerSourceOwner] = {}
         self.reductions: dict[
             int,
             tuple[object, object],
@@ -629,6 +708,7 @@ class KimiFullModelPlan:
         self,
         candidates,
         artifacts,
+        source_owners,
         reductions,
         max_arena,
         block_residual,
@@ -636,6 +716,7 @@ class KimiFullModelPlan:
     ) -> None:
         self.ops = candidates
         self.packed_artifacts = artifacts
+        self.source_owners = source_owners
         self.reductions = reductions
         self.max_arena = max_arena
         self.block_residual = block_residual
@@ -668,6 +749,10 @@ class KimiFullModelPlan:
         artifacts: dict[int, dict[str, object]] = dict(
             getattr(runner, "_packed_artifacts", {})
         )
+        source_owners: dict[int, KimiLayerSourceOwner] = {}
+        pending_by_rows = {
+            rows: [] for rows in KIMI_MLA_AGENTIC_ROWS
+        }
         reductions = {}
         tracked_collectives: dict[int, object] = {}
         max_arena = block_residual = model_epoch = None
@@ -689,32 +774,34 @@ class KimiFullModelPlan:
         )
         max_blocks = max(layer.layer_idx // 12 for layer in layers) + 1
         try:
-            for rows in KIMI_MLA_AGENTIC_ROWS:
-                batch = rows // 8
-                pending = []
-                for layer in layers:
-                    backend = self._backend(layer)
-                    weights = None
-                    error = None
-                    try:
-                        weights = _layer_weights(layer, rank, npes)
-                    except (
-                        AttributeError,
-                        MonoUnsupported,
-                        RuntimeError,
-                        ValueError,
-                    ) as caught:
-                        error = caught
-                    tp_uniform_local_validation(
-                        error,
-                        group=tp.cpu_group,
-                        world_size=npes,
-                        context=(
-                            f"Kimi-K3 full-plan layer {layer.layer_idx} "
-                            "weight mapping failed"
-                        ),
-                    )
-                    assert weights is not None
+            for layer in layers:
+                backend = self._backend(layer)
+                weights = None
+                error = None
+                try:
+                    weights = _layer_weights(layer, rank, npes)
+                except (
+                    AttributeError,
+                    MonoUnsupported,
+                    RuntimeError,
+                    ValueError,
+                ) as caught:
+                    error = caught
+                tp_uniform_local_validation(
+                    error,
+                    group=tp.cpu_group,
+                    world_size=npes,
+                    context=(
+                        f"Kimi-K3 full-plan layer {layer.layer_idx} "
+                        "weight mapping failed"
+                    ),
+                )
+                assert weights is not None
+                owner = KimiLayerSourceOwner(weights, backend)
+                source_owners[layer.layer_idx] = owner
+                layer_artifacts = artifacts.get(layer.layer_idx)
+                for rows in KIMI_MLA_AGENTIC_ROWS:
+                    batch = rows // 8
                     owned = None
                     error = None
                     try:
@@ -726,9 +813,7 @@ class KimiFullModelPlan:
                             state_dtype=torch.float16,
                             agentic_batch_size=batch,
                             defer_collectives=True,
-                            packed_artifacts=artifacts.get(
-                                layer.layer_idx
-                            ),
+                            packed_artifacts=layer_artifacts,
                         )
                     except (
                         AttributeError,
@@ -796,10 +881,9 @@ class KimiFullModelPlan:
                         max_arena,
                         model_epoch,
                     )
-                    if layer.layer_idx not in artifacts:
-                        artifacts[layer.layer_idx] = (
-                            owned.op.packed_artifacts()
-                        )
+                    if layer_artifacts is None:
+                        layer_artifacts = owned.op.packed_artifacts()
+                        artifacts[layer.layer_idx] = layer_artifacts
                     owned.op.release_packed_sources()
                     key = (
                         layer.layer_idx,
@@ -809,9 +893,12 @@ class KimiFullModelPlan:
                         batch,
                     )
                     candidates[key] = owned
-                    pending.append(owned)
+                    pending_by_rows[rows].append(owned)
+                owner.retain_runtime_sources()
+            for rows in KIMI_MLA_AGENTIC_ROWS:
+                batch = rows // 8
                 shared = (None, None)
-                for owned in pending:
+                for owned in pending_by_rows[rows]:
                     initialized = None
                     error = None
                     try:
@@ -851,6 +938,7 @@ class KimiFullModelPlan:
             self.commit(
                 candidates,
                 artifacts,
+                source_owners,
                 reductions,
                 max_arena,
                 block_residual,
@@ -865,6 +953,8 @@ class KimiFullModelPlan:
         ) as error:
             for resource in reversed(tuple(tracked_collectives.values())):
                 resource.close()
+            for owner in source_owners.values():
+                owner.close()
             logger.warning(
                 "Kimi-K3 full-plan fallback before launch: %s",
                 error,
@@ -900,6 +990,9 @@ class KimiFullModelPlan:
                 closed.add(id(resource))
         self.reductions.clear()
         self.ops.clear()
+        for owner in self.source_owners.values():
+            owner.close()
+        self.source_owners.clear()
         self.packed_artifacts.clear()
         self.max_arena = None
         self.block_residual = None
@@ -999,6 +1092,7 @@ class KimiMonoDecode:
         )
         if full_dspark:
             packed = 0
+            sources = 0
             workspaces = 0
             kda_layers = 0
             for layer in layers:
@@ -1010,12 +1104,14 @@ class KimiMonoDecode:
                     kda_layers += 1
                 else:
                     packed += _FULL_MLA_PACKED_BYTES
+                sources += _full_layer_source_nbytes(backend)
                 workspaces += sum(
                     _full_layer_workspace_nbytes(backend, rows)
                     for rows in KIMI_MLA_AGENTIC_ROWS
                 )
             reserve = (
                 packed
+                + sources
                 + workspaces
                 + _FULL_SHARED_BYTES
             )

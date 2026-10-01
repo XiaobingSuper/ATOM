@@ -700,7 +700,6 @@ class KimiK3KdaAttention:
             "kda_dt_bias",
             "w_kda_conv",
             "w_kda_fb",
-            "w_kda_o",
             "w_mlp_res",
             "w_self_res",
         }

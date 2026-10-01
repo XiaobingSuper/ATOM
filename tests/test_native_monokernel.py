@@ -866,7 +866,11 @@ def test_kimi_full_model_plan_prepares_all_layers_and_buckets_atomically(
         def initialize_collectives(self, *shared):
             return self.op.initialize_collectives(*shared)
 
-    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(
+        module,
+        "_layer_weights",
+        lambda *_args: SimpleNamespace(t={}),
+    )
     monkeypatch.setattr(module, "_KimiLayerOp", Owned)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -893,6 +897,103 @@ def test_kimi_full_model_plan_prepares_all_layers_and_buckets_atomically(
     assert resources
     assert all(resource.closed == 1 for resource in resources)
     assert not plan.ready
+
+
+def test_kimi_full_plan_maps_sources_once_and_owns_bucket_lifetime(
+    monkeypatch,
+):
+    import torch
+
+    module = _kimi_mono_module()
+    layers = [
+        SimpleNamespace(layer_idx=0, is_linear_attn=True),
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+    ]
+    runner = SimpleNamespace(
+        _lm=SimpleNamespace(
+            model=SimpleNamespace(
+                layers=layers,
+                start_layer=0,
+                end_layer=2,
+            )
+        ),
+        _packed_artifacts={},
+    )
+    mapped = []
+    constructed = []
+
+    def map_weights(layer, *_args):
+        source = torch.tensor([layer.layer_idx], dtype=torch.bfloat16)
+        weights = SimpleNamespace(t={"g_in": source})
+        mapped.append((layer.layer_idx, weights, source))
+        return weights
+
+    class FakeOp:
+        def __init__(self, layer, weights, rows, _backend, **kwargs):
+            self.layer = layer
+            self.weights = weights
+            self.rows = rows
+            self.received = kwargs["packed_artifacts"]
+            self.monokernel_scratch = torch.empty(1, dtype=torch.uint8)
+            self.step = torch.zeros(1, dtype=torch.int32)
+            self.block_write_idx = 0
+            self.attention = SimpleNamespace(symmetric_allreduce=None)
+            self.symmetric_allreduce = None
+            self._artifacts = {"probe": object()}
+            constructed.append(self)
+
+        def packed_artifacts(self):
+            return self._artifacts
+
+        def release_packed_sources(self):
+            self.weights = None
+
+        def initialize_collectives(self, attention=None, moe=None):
+            return attention or SimpleNamespace(close=lambda: None), (
+                moe or SimpleNamespace(close=lambda: None)
+            )
+
+    class Owned:
+        def __init__(self, *args, **kwargs):
+            self.op = FakeOp(*args, **kwargs)
+
+        def initialize_collectives(self, *shared):
+            return self.op.initialize_collectives(*shared)
+
+    monkeypatch.setattr(module, "_layer_weights", map_weights)
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    plan = module.KimiFullModelPlan(runner)
+    assert plan.prepare()
+    assert [layer for layer, *_ in mapped] == [0, 1]
+    assert set(plan.source_owners) == {0, 1}
+    for layer_idx, owner in plan.source_owners.items():
+        original = mapped[layer_idx]
+        assert owner.weights is original[1]
+        assert owner.tensors["g_in"] is original[2]
+        buckets = [op for op in constructed if op.layer.layer_idx == layer_idx]
+        assert len(buckets) == 3
+        assert buckets[0].received is None
+        assert buckets[1].received is plan.packed_artifacts[layer_idx]
+        assert buckets[2].received is plan.packed_artifacts[layer_idx]
+
+    owners = tuple(plan.source_owners.values())
+    plan.close()
+    assert not plan.source_owners
+    assert all(not owner.tensors for owner in owners)
 
 
 def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
@@ -926,7 +1027,11 @@ def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
                 release_packed_sources=lambda: None,
             )
 
-    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(
+        module,
+        "_layer_weights",
+        lambda *_args: SimpleNamespace(t={}),
+    )
     monkeypatch.setattr(module, "_KimiLayerOp", Owned)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -996,7 +1101,11 @@ def test_kimi_full_model_plan_closes_partial_collectives_once(monkeypatch):
                 self.op.symmetric_allreduce,
             )
 
-    monkeypatch.setattr(module, "_layer_weights", lambda *_args: object())
+    monkeypatch.setattr(
+        module,
+        "_layer_weights",
+        lambda *_args: SimpleNamespace(t={}),
+    )
     monkeypatch.setattr(module, "_KimiLayerOp", Owned)
     monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -3056,6 +3165,12 @@ def test_kimi_memory_reserve_matches_selectable_graph_buckets(
             + module._FULL_KDA_PACKED_BYTES
             + 2 * module._FULL_MLA_PACKED_BYTES
             + sum(
+                module._full_layer_source_nbytes(
+                    module.KimiFullModelPlan._backend(layer)
+                )
+                for layer in runner._lm.model.layers
+            )
+            + sum(
                 module._full_layer_workspace_nbytes(
                     module.KimiFullModelPlan._backend(layer),
                     rows,
@@ -3131,6 +3246,12 @@ def test_kimi_full_plan_reserve_uses_shared_arena_not_phantom_per_layer():
         + kda_layers * module._FULL_KDA_PACKED_BYTES
         + mla_layers * module._FULL_MLA_PACKED_BYTES
         + sum(
+            module._full_layer_source_nbytes(
+                module.KimiFullModelPlan._backend(layer)
+            )
+            for layer in layers
+        )
+        + sum(
             module._full_layer_workspace_nbytes(
                 module.KimiFullModelPlan._backend(layer),
                 rows,
@@ -3157,6 +3278,12 @@ def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
         module._FULL_DENSE_PACKED_BYTES
         + module._FULL_KDA_PACKED_BYTES
         + 2 * module._FULL_MLA_PACKED_BYTES
+        + sum(
+            module._full_layer_source_nbytes(
+                module.KimiFullModelPlan._backend(layer)
+            )
+            for layer in runner._lm.model.layers
+        )
     )
     layers = runner._lm.model.layers
     workspaces = sum(
@@ -3202,22 +3329,6 @@ def test_kimi_full_workspace_recipes_enumerate_persistent_tensors(rows):
         + padded_rows * (hidden // 32)
         + timeline
     )
-    max_sorted = rows * module.KIMI_K3_CONFIG.top_k * 16
-    max_blocks = (max_sorted + 15) // 16
-    kda = common + (
-        padded_rows * hidden
-        + padded_rows * (hidden // 32)
-        + 2 * max_sorted * 4
-        + max_blocks * 4
-        + 2 * 4
-        + max_sorted * module.KIMI_K3_CONFIG.inter * 2
-        + rows * module.KIMI_K3_CONFIG.n_experts * (2 + 4 + 8)
-        + rows * module.KIMI_K3_CONFIG.top_k * (4 + 8 + 4 + 4)
-        + 4 * rows * module.KIMI_K3_CONFIG.routed_hidden * 2
-        + 3 * rows * module.KIMI_K3_CONFIG.shared_inter * 2
-        + 3 * rows * hidden * 2
-        + rows * (hidden // 8) * 2
-    )
     dense = (
         6 * rows * hidden * 2
         + rows * hidden
@@ -3225,11 +3336,54 @@ def test_kimi_full_workspace_recipes_enumerate_persistent_tensors(rows):
         + timeline
     )
 
-    assert module._full_layer_workspace_nbytes("mono", rows) == kda
+    assert (
+        module._full_layer_workspace_nbytes("mono", rows)
+        == common + padded_rows * hidden
+    )
     assert module._full_layer_workspace_nbytes("mla_full", rows) == common
     assert (
         module._full_layer_workspace_nbytes("dense_full", rows)
         == dense
+    )
+
+
+def test_kimi_full_source_recipes_count_shared_bf16_once_per_layer():
+    module = _kimi_mono_module()
+    cfg = module.KIMI_K3_CONFIG
+    hidden = cfg.hidden
+    projection = cfg.local_heads * cfg.v_dim
+    residual = 6 * hidden * 2
+    recurrent = (
+        cfg.v_dim * 2
+        + cfg.local_heads * 4
+        + cfg.local_heads * cfg.v_dim * 2
+        + 3 * projection * 4 * 2
+        + projection * cfg.v_dim * 2
+    )
+    moe_runtime = cfg.n_experts * 4 + cfg.routed_hidden * 2
+    mla_runtime = (
+        cfg.q_lora + cfg.kv_lora
+    ) * 2 + (
+        (cfg.q_lora + cfg.kv_lora + cfg.pe_dim) * hidden
+        + cfg.local_heads
+        * (cfg.nope_dim + cfg.pe_dim)
+        * cfg.q_lora
+        + cfg.local_heads * cfg.kv_lora * cfg.nope_dim
+        + cfg.local_heads * cfg.v_dim * cfg.kv_lora
+        + projection * hidden
+    ) * 2
+
+    assert (
+        module._full_layer_source_nbytes("dense_full")
+        == residual + recurrent
+    )
+    assert (
+        module._full_layer_source_nbytes("mono")
+        == residual + moe_runtime + recurrent
+    )
+    assert (
+        module._full_layer_source_nbytes("mla_full")
+        == residual + moe_runtime + mla_runtime
     )
 
 
@@ -3249,6 +3403,12 @@ def test_kimi_full_reserve_never_undercounts_aggregate_workspaces():
         module._FULL_DENSE_PACKED_BYTES
         + module._FULL_KDA_PACKED_BYTES
         + 2 * module._FULL_MLA_PACKED_BYTES
+        + sum(
+            module._full_layer_source_nbytes(
+                module.KimiFullModelPlan._backend(layer)
+            )
+            for layer in layers
+        )
         + module._FULL_SHARED_BYTES
     )
     undercount = (
