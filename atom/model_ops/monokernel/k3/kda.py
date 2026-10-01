@@ -345,7 +345,13 @@ class KimiK3KdaAttention:
         self.w_kda_in_packed = pack_bf16(monokernel_input)
         self.w_kda_o_packed = pack_bf16(self.t["w_kda_o"])
 
-    def configure_monokernel(self, layer_idx: int, *, fuse_moe: bool = False) -> None:
+    def configure_monokernel(
+        self,
+        layer_idx: int,
+        *,
+        fuse_moe: bool = False,
+        moe_packed: dict[str, torch.Tensor] | None = None,
+    ) -> None:
         """Specialize the single launch for both AttnRes mixers and latent-MoE."""
 
         block = self.config.attn_res_block_size
@@ -355,6 +361,10 @@ class KimiK3KdaAttention:
         self.block_write_idx = layer_idx // block if layer_idx % block == 0 else -1
         self.fuse_attn_res = True
         self.fuse_moe = fuse_moe
+        if moe_packed is not None:
+            if self.moe_packed and self.moe_packed is not moe_packed:
+                raise ValueError("KDA MoE packed artifact owner mismatch")
+            self.moe_packed = moe_packed
         device = self.t["w_kda_in"].device
         self._pack_monokernel_projections()
         if fuse_moe and not self.moe_packed:

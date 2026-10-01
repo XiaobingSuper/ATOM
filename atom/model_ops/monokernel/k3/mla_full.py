@@ -185,21 +185,6 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
         self.w_o_packed = packed_artifacts.get("w_o_packed")
         if self.w_o_packed is None:
             self.w_o_packed = pack_bf16(self.t["w_o"])
-        self.moe_packed = {
-            "w_r": self.w_router,
-            "w_latent_down": self.w_latent_down,
-            "s_latent_down": self.s_latent_down,
-            "w_shared_ug": self.w_shared_ug,
-            "s_shared_ug": self.s_shared_ug,
-            "w_ug": self.w_ug,
-            "s_ug": self.s_ug,
-            "w_dn": self.w_dn,
-            "s_dn": self.s_dn,
-            "w_shared_dn": self.w_shared_dn,
-            "s_shared_dn": self.s_shared_dn,
-            "w_latent_up": self.w_latent_up,
-            "s_latent_up": self.s_latent_up,
-        }
         layout = mla_full_layout(samples)
         device = self.t["w_qkv_a"].device
         self.monokernel_scratch = torch.zeros(

@@ -721,15 +721,9 @@ class KimiFullModelPlan:
         self.max_arena = max_arena
         self.block_residual = block_residual
         self.model_epoch = model_epoch
-        shared_artifacts = getattr(
-            self.runner,
-            "_packed_artifacts",
-            None,
-        )
-        if shared_artifacts is None:
-            self.runner._packed_artifacts = dict(artifacts)
-        else:
-            shared_artifacts.update(artifacts)
+        shared_artifacts = getattr(self.runner, "_packed_artifacts", None)
+        if shared_artifacts is not None:
+            shared_artifacts.clear()
         self.ready = True
 
     def prepare(self) -> bool:

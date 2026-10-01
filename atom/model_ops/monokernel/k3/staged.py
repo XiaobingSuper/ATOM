@@ -187,7 +187,19 @@ class _KimiK3MlaPath:
                 source_override_idx=0 if self.inline_pre_attn else -1,
             )
 
-        self.w_ug, self.s_ug, self.w_dn, self.s_dn = prepare_mxfp4_expert_storage(weights)
+        injected_moe = packed_artifacts.get("moe_packed")
+        if injected_moe is None:
+            (
+                self.w_ug,
+                self.s_ug,
+                self.w_dn,
+                self.s_dn,
+            ) = prepare_mxfp4_expert_storage(weights)
+        else:
+            self.w_ug = injected_moe["w_ug"]
+            self.s_ug = injected_moe["s_ug"]
+            self.w_dn = injected_moe["w_dn"]
+            self.s_dn = injected_moe["s_dn"]
         if packed_artifacts:
             required = {
                 "w_router",
@@ -260,6 +272,33 @@ class _KimiK3MlaPath:
         self.s_latent_down = self.latent_projection.scale
         self.w_shared_ug = self.shared_projection.weight
         self.s_shared_ug = self.shared_projection.scale
+        local_moe = {
+            "w_r": self.w_router,
+            "w_latent_down": self.w_latent_down,
+            "s_latent_down": self.s_latent_down,
+            "w_shared_ug": self.w_shared_ug,
+            "s_shared_ug": self.s_shared_ug,
+            "w_ug": self.w_ug,
+            "s_ug": self.s_ug,
+            "w_dn": self.w_dn,
+            "s_dn": self.s_dn,
+            "w_shared_dn": self.w_shared_dn,
+            "s_shared_dn": self.s_shared_dn,
+            "w_latent_up": self.w_latent_up,
+            "s_latent_up": self.s_latent_up,
+        }
+        canonical_moe = packed_artifacts.get("moe_packed")
+        attention_moe = getattr(self.attention, "moe_packed", None)
+        if canonical_moe is None and attention_moe:
+            canonical_moe = attention_moe
+        if canonical_moe is None:
+            canonical_moe = local_moe
+        elif any(
+            canonical_moe.get(name) is not tensor
+            for name, tensor in local_moe.items()
+        ):
+            raise ValueError("Kimi MoE packed artifact alias mismatch")
+        self.moe_packed = canonical_moe
         self.shared_activation_owner = None
         if (
             monokernel_only
@@ -441,6 +480,7 @@ class _KimiK3MlaPath:
     def packed_artifacts(self) -> dict[str, object]:
         return {
             "attention": self.attention.packed_artifacts(),
+            "moe_packed": self.moe_packed,
             "w_router": self.w_router,
             "w_latent_down": self.w_latent_down,
             "s_latent_down": self.s_latent_down,

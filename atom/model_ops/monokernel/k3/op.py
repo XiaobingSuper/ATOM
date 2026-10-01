@@ -69,7 +69,11 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
             packed_artifacts=packed_artifacts,
             monokernel_only=True,
         )
-        self.attention.configure_monokernel(layer_idx, fuse_moe=True)
+        self.attention.configure_monokernel(
+            layer_idx,
+            fuse_moe=True,
+            moe_packed=getattr(self, "moe_packed", None),
+        )
 
     def forward(
         self,

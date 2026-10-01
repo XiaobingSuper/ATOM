@@ -1078,6 +1078,8 @@ def _tp8_worker(rank: int, port: int) -> None:
     import torch
     import torch.distributed as dist
 
+    from atom.model_ops.monokernel.k3 import kda as kda_module
+    from atom.model_ops.monokernel.k3 import staged as staged_module
     from atom.model_ops.monokernel.config import ConvStateLayout
     from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
     from atom.models.kimi_k3_mono import (
@@ -1094,8 +1096,29 @@ def _tp8_worker(rank: int, port: int) -> None:
         world_size=8,
     )
     try:
+        pack_calls = {"quantize": 0, "expert": 0, "attention": 0}
+        staged_quantize = staged_module.quantize_mxfp8
+        staged_expert = staged_module.prepare_mxfp4_expert_storage
+        attention_quantize = kda_module.quantize_mxfp8
+
+        def count_quantize(*args, **kwargs):
+            pack_calls["quantize"] += 1
+            return staged_quantize(*args, **kwargs)
+
+        def count_expert(*args, **kwargs):
+            pack_calls["expert"] += 1
+            return staged_expert(*args, **kwargs)
+
+        def count_attention(*args, **kwargs):
+            pack_calls["attention"] += 1
+            return attention_quantize(*args, **kwargs)
+
+        staged_module.quantize_mxfp8 = count_quantize
+        staged_module.prepare_mxfp4_expert_storage = count_expert
+        kda_module.quantize_mxfp8 = count_attention
         weights = _deterministic_weights(device, rank)
         packed = None
+        canonical_moe = None
         for batch in (1, 2, 4):
             op = KimiK3MonoKernel(
                 weights,
@@ -1116,6 +1139,15 @@ def _tp8_worker(rank: int, port: int) -> None:
                 for tensor in op.full_plan_workspace_tensors()
             ) == _full_layer_workspace_nbytes("mono", batch * 8)
             packed = op.packed_artifacts()
+            if canonical_moe is None:
+                canonical_moe = packed["moe_packed"]
+            assert packed["moe_packed"] is canonical_moe
+            assert op.moe_packed is canonical_moe
+            assert op.attention.moe_packed is canonical_moe
+            assert all(
+                op.attention.moe_packed[name] is tensor
+                for name, tensor in canonical_moe.items()
+            )
             op.release_packed_sources()
             retained = {
                 tensor.data_ptr(): tensor
@@ -1139,7 +1171,13 @@ def _tp8_worker(rank: int, port: int) -> None:
             assert op.t["g_in"] is weights.t["g_in"]
             _exercise_batch(op, batch, device, weights)
             op.close()
+            assert all(tensor.numel() for tensor in canonical_moe.values())
             dist.barrier()
+        assert pack_calls == {
+            "quantize": 4,
+            "expert": 1,
+            "attention": 0,
+        }
     finally:
         dist.destroy_process_group()
 

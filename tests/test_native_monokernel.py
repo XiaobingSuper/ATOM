@@ -952,6 +952,9 @@ def test_kimi_full_plan_maps_sources_once_and_owns_bucket_lifetime(
         def release_packed_sources(self):
             self.weights = None
 
+        def close(self):
+            self.received = None
+
         def initialize_collectives(self, attention=None, moe=None):
             return attention or SimpleNamespace(close=lambda: None), (
                 moe or SimpleNamespace(close=lambda: None)
@@ -990,10 +993,60 @@ def test_kimi_full_plan_maps_sources_once_and_owns_bucket_lifetime(
         assert buckets[1].received is plan.packed_artifacts[layer_idx]
         assert buckets[2].received is plan.packed_artifacts[layer_idx]
 
+    assert runner._packed_artifacts == {}
+    canonical = plan.packed_artifacts[0]
+    constructed[1].close()
+    assert plan.packed_artifacts[0] is canonical
     owners = tuple(plan.source_owners.values())
     plan.close()
     assert not plan.source_owners
     assert all(not owner.tensors for owner in owners)
+
+
+def test_kimi_kda_configure_aliases_injected_moe_artifacts(monkeypatch):
+    import torch
+
+    from atom.model_ops.monokernel.config import ConvStateLayout
+    from atom.model_ops.monokernel.k3 import kda
+
+    attention = object.__new__(kda.KimiK3KdaAttention)
+    attention.config = SimpleNamespace(
+        attn_res_block_size=12,
+        hidden=16,
+    )
+    attention.t = {"w_kda_in": torch.empty(1)}
+    attention.S = 8
+    attention.npes = 8
+    attention.launches_per_step = 1
+    attention.mtp = True
+    attention.agentic_batch_size = 1
+    attention.state_dtype = torch.float16
+    attention.conv_state_layout = ConvStateLayout.TIME_MAJOR
+    attention.atom_expert_layout = True
+    attention.monokernel_timeline = None
+    attention.moe_packed = {}
+    attention._pack_monokernel_projections = lambda: None
+    artifacts = {"probe": torch.tensor([1])}
+
+    monkeypatch.setattr(
+        kda,
+        "quantize_mxfp8",
+        lambda *_args: pytest.fail("injected MoE artifacts were repacked"),
+    )
+    monkeypatch.setattr(kda, "monokernel_scratch_nbytes", lambda *_a, **_k: 1)
+    monkeypatch.setattr(
+        kda,
+        "build_kimi_k3_monokernel",
+        lambda *_args, **_kwargs: object(),
+    )
+
+    attention.configure_monokernel(
+        1,
+        fuse_moe=True,
+        moe_packed=artifacts,
+    )
+
+    assert attention.moe_packed is artifacts
 
 
 def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
@@ -3314,6 +3367,50 @@ def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
         + workspaces
         + module._FULL_SHARED_ARENA_BYTES
         + mailboxes
+    )
+
+
+def test_kimi_full_reserve_counts_one_moe_artifact_set_per_layer():
+    module = _kimi_mono_module()
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+    layers = runner._lm.model.layers
+    kda = sum(
+        hasattr(layer, "block_sparse_moe") and layer.is_linear_attn
+        for layer in layers
+    )
+    mla = sum(
+        hasattr(layer, "block_sparse_moe") and not layer.is_linear_attn
+        for layer in layers
+    )
+    dense = len(layers) - kda - mla
+    packed = (
+        dense * module._FULL_DENSE_PACKED_BYTES
+        + kda * module._FULL_KDA_PACKED_BYTES
+        + mla * module._FULL_MLA_PACKED_BYTES
+    )
+    nonpacked = (
+        sum(
+            module._full_layer_source_nbytes(
+                module.KimiFullModelPlan._backend(layer)
+            )
+            for layer in layers
+        )
+        + sum(
+            module._full_layer_workspace_nbytes(
+                module.KimiFullModelPlan._backend(layer),
+                rows,
+            )
+            for layer in layers
+            for rows in module.KIMI_MLA_AGENTIC_ROWS
+        )
+        + module._FULL_SHARED_BYTES
+    )
+
+    assert runner.memory_reserve_bytes() - nonpacked == packed
+    assert module._FULL_KDA_PACKED_BYTES == (
+        module._FUSED_PAD * module._HIDDEN * 2
+        + module._HIDDEN * module._PROJECTION * 2
+        + module._FULL_MOE_PACKED_BYTES
     )
 
 
