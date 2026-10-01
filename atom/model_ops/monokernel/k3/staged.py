@@ -162,6 +162,10 @@ class _KimiK3MlaPath:
             packed_artifacts=packed_artifacts.get("attention"),
             monokernel_only=monokernel_only,
         )
+        retain_staged_workspaces = (
+            not monokernel_only
+            or isinstance(self.attention, KimiK3KdaAttention)
+        )
         device = torch.device("cuda", torch.cuda.current_device())
         self.pre_attn = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
         self.pre_updated = torch.empty_like(self.pre_attn)
@@ -259,26 +263,80 @@ class _KimiK3MlaPath:
         self.s_latent_down = self.latent_projection.scale
         self.w_shared_ug = self.shared_projection.weight
         self.s_shared_ug = self.shared_projection.scale
+        if monokernel_only and not retain_staged_workspaces:
+            # The fused application kernel consumes only the shared packed
+            # weights; staged projection activation workspaces are dead.
+            self.shared_projection = None
 
-        # At most one padded BM tile is needed per selected route: there can be
-        # no more active experts than routes.  The old ``routes + E*(BM-1)``
-        # bound made the expert GEMMs launch tens of thousands of empty CTAs at
-        # low token counts.
-        max_sorted = samples * config.top_k * _ROUTING_TILE_M
-        max_blocks = (max_sorted + _ROUTING_TILE_M - 1) // _ROUTING_TILE_M
-        self.max_sorted = max_sorted
-        self.sorted_token_ids = torch.empty(max_sorted, dtype=torch.int32, device=device)
-        self.sorted_weights = torch.empty(max_sorted, dtype=torch.float32, device=device)
-        self.sorted_expert_ids = torch.empty(max_blocks, dtype=torch.int32, device=device)
-        self.num_valid_ids = torch.empty(2, dtype=torch.int32, device=device)
-        self.inter_sorted = torch.empty(max_sorted, config.inter, dtype=torch.bfloat16, device=device)
-
-        self.router_logits = torch.empty(samples, config.n_experts, dtype=torch.bfloat16, device=device)
-        self.router_scores = torch.empty(samples, config.n_experts, dtype=torch.float32, device=device)
-        self.topk_keys = torch.empty(samples, config.top_k, dtype=torch.float32, device=device)
-        self.topk_ids_i64 = torch.empty(samples, config.top_k, dtype=torch.int64, device=device)
-        self.topk_ids = torch.empty(samples, config.top_k, dtype=torch.int32, device=device)
-        self.topk_weights = torch.empty(samples, config.top_k, dtype=torch.float32, device=device)
+        self.max_sorted = 0
+        self.sorted_token_ids = self.sorted_weights = None
+        self.sorted_expert_ids = self.num_valid_ids = None
+        self.inter_sorted = None
+        self.router_logits = self.router_scores = None
+        self.topk_keys = self.topk_ids_i64 = None
+        self.topk_ids = self.topk_weights = None
+        if retain_staged_workspaces:
+            # At most one padded BM tile is needed per selected route: there
+            # can be no more active experts than routes.
+            max_sorted = samples * config.top_k * _ROUTING_TILE_M
+            max_blocks = (
+                max_sorted + _ROUTING_TILE_M - 1
+            ) // _ROUTING_TILE_M
+            self.max_sorted = max_sorted
+            self.sorted_token_ids = torch.empty(
+                max_sorted, dtype=torch.int32, device=device
+            )
+            self.sorted_weights = torch.empty(
+                max_sorted, dtype=torch.float32, device=device
+            )
+            self.sorted_expert_ids = torch.empty(
+                max_blocks, dtype=torch.int32, device=device
+            )
+            self.num_valid_ids = torch.empty(
+                2, dtype=torch.int32, device=device
+            )
+            self.inter_sorted = torch.empty(
+                max_sorted,
+                config.inter,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.router_logits = torch.empty(
+                samples,
+                config.n_experts,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.router_scores = torch.empty(
+                samples,
+                config.n_experts,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.topk_keys = torch.empty(
+                samples,
+                config.top_k,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.topk_ids_i64 = torch.empty(
+                samples,
+                config.top_k,
+                dtype=torch.int64,
+                device=device,
+            )
+            self.topk_ids = torch.empty(
+                samples,
+                config.top_k,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.topk_weights = torch.empty(
+                samples,
+                config.top_k,
+                dtype=torch.float32,
+                device=device,
+            )
         self.router_select = self.router_projection = None
         if not monokernel_only:
             self.router_select = SigmoidTopkRouter(
@@ -295,29 +353,65 @@ class _KimiK3MlaPath:
                 config.situ_beta,
                 config.situ_linear_beta,
             )
-        self.router_score_mailbox = torch.zeros(
-            samples * config.n_experts * 2,
-            dtype=torch.int32,
-            device=device,
+        self.router_score_mailbox = None
+        self.latent = self.routed_partial = self.routed_reduced = None
+        self.latent_norm = self.shared_gu = self.shared_mid = None
+        self.shared_partial = self.tail = self.final_partial = None
+        self.moe_delta = None
+        if retain_staged_workspaces:
+            self.router_score_mailbox = torch.zeros(
+                samples * config.n_experts * 2,
+                dtype=torch.int32,
+                device=device,
+            )
+            self.latent = torch.empty(
+                samples,
+                self.routed_hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.routed_partial = torch.empty_like(self.latent)
+            self.routed_reduced = torch.empty_like(self.latent)
+            self.latent_norm = torch.empty_like(self.latent)
+            self.shared_gu = torch.empty(
+                samples,
+                2 * self.shared_inter,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.shared_mid = torch.empty(
+                samples,
+                self.shared_inter,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.shared_partial = torch.empty(
+                samples,
+                config.hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.tail = torch.empty(
+                samples,
+                self.hidden_shard,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.final_partial = torch.empty_like(self.shared_partial)
+            self.moe_delta = torch.empty_like(self.shared_partial)
+        self.output = torch.empty(
+            samples, config.hidden, dtype=torch.bfloat16, device=device
         )
-        self.latent = torch.empty(samples, self.routed_hidden, dtype=torch.bfloat16, device=device)
-        self.routed_partial = torch.empty_like(self.latent)
-        self.routed_reduced = torch.empty_like(self.latent)
-        self.latent_norm = torch.empty_like(self.latent)
-        self.shared_gu = torch.empty(samples, 2 * self.shared_inter, dtype=torch.bfloat16, device=device)
-        self.shared_mid = torch.empty(samples, self.shared_inter, dtype=torch.bfloat16, device=device)
-        self.shared_partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
-        self.tail = torch.empty(samples, self.hidden_shard, dtype=torch.bfloat16, device=device)
-        self.final_partial = torch.empty_like(self.shared_partial)
-        self.moe_delta = torch.empty_like(self.shared_partial)
-        self.output = torch.empty_like(self.shared_partial)
-        self.attention_delta = torch.empty_like(self.shared_partial)
+        self.attention_delta = torch.empty_like(self.output)
         self._profiler = CudaStageProfiler()
         if reduce_backend == "symmetric":
             self.symmetric_allreduce = moe_symmetric_allreduce
             if self.symmetric_allreduce is None and not defer_collectives:
                 self.symmetric_allreduce = SymmetricBf16Allreduce(
-                    (self.routed_partial.numel(), self.final_partial.numel()),
+                    (
+                        samples * self.routed_hidden,
+                        samples * config.hidden,
+                    ),
                     rank=rank,
                     npes=npes,
                     group=group,
@@ -349,6 +443,52 @@ class _KimiK3MlaPath:
             "w_latent_up": self.w_latent_up,
             "s_latent_up": self.s_latent_up,
         }
+
+    def full_plan_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Enumerate exact bucket-local tensors retained by fused layers."""
+
+        if not self.monokernel_only:
+            raise ValueError("workspace enumeration requires monokernel_only")
+        tensors = (
+            self.pre_attn,
+            self.pre_updated,
+            self.moe_input,
+            self.updated_prefix,
+            self.latent_projection.activation,
+            self.latent_projection.activation_scale,
+            self.output,
+            self.attention_delta,
+            *self.attention.full_plan_workspace_tensors(),
+        )
+        if self.routed_partial is None:
+            return tensors
+        return (
+            *tensors,
+            self.shared_projection.activation,
+            self.shared_projection.activation_scale,
+            self.sorted_token_ids,
+            self.sorted_weights,
+            self.sorted_expert_ids,
+            self.num_valid_ids,
+            self.inter_sorted,
+            self.router_logits,
+            self.router_scores,
+            self.topk_keys,
+            self.topk_ids_i64,
+            self.topk_ids,
+            self.topk_weights,
+            self.router_score_mailbox,
+            self.latent,
+            self.routed_partial,
+            self.routed_reduced,
+            self.latent_norm,
+            self.shared_gu,
+            self.shared_mid,
+            self.shared_partial,
+            self.tail,
+            self.final_partial,
+            self.moe_delta,
+        )
 
     def _build_fused_tail(self):
         if (
@@ -387,7 +527,10 @@ class _KimiK3MlaPath:
                 moe
                 if moe is not None
                 else SymmetricBf16Allreduce(
-                    (self.routed_partial.numel(), self.final_partial.numel()),
+                    (
+                        self.S * self.routed_hidden,
+                        self.S * self.config.hidden,
+                    ),
                     rank=self.rank,
                     npes=self.npes,
                     group=self.group,

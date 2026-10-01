@@ -3055,7 +3055,14 @@ def test_kimi_memory_reserve_matches_selectable_graph_buckets(
             module._FULL_DENSE_PACKED_BYTES
             + module._FULL_KDA_PACKED_BYTES
             + 2 * module._FULL_MLA_PACKED_BYTES
-            + 4 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+            + sum(
+                module._full_layer_workspace_nbytes(
+                    module.KimiFullModelPlan._backend(layer),
+                    rows,
+                )
+                for layer in runner._lm.model.layers
+                for rows in module.KIMI_MLA_AGENTIC_ROWS
+            )
             + module._FULL_SHARED_BYTES
         )
         if mode == "mono":
@@ -3123,7 +3130,14 @@ def test_kimi_full_plan_reserve_uses_shared_arena_not_phantom_per_layer():
         module._FULL_DENSE_PACKED_BYTES
         + kda_layers * module._FULL_KDA_PACKED_BYTES
         + mla_layers * module._FULL_MLA_PACKED_BYTES
-        + 93 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+        + sum(
+            module._full_layer_workspace_nbytes(
+                module.KimiFullModelPlan._backend(layer),
+                rows,
+            )
+            for layer in layers
+            for rows in module.KIMI_MLA_AGENTIC_ROWS
+        )
         + module._FULL_SHARED_BYTES
     )
 
@@ -3144,7 +3158,15 @@ def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
         + module._FULL_KDA_PACKED_BYTES
         + 2 * module._FULL_MLA_PACKED_BYTES
     )
-    workspaces = 4 * 3 * module._FULL_WORKSPACE_PER_LAYER_BUCKET
+    layers = runner._lm.model.layers
+    workspaces = sum(
+        module._full_layer_workspace_nbytes(
+            module.KimiFullModelPlan._backend(layer),
+            rows,
+        )
+        for layer in layers
+        for rows in module.KIMI_MLA_AGENTIC_ROWS
+    )
     mailboxes = sum(
         symmetric_allreduce_nbytes(
             (rows * module.KIMI_K3_CONFIG.hidden,),
@@ -3166,6 +3188,75 @@ def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
         + module._FULL_SHARED_ARENA_BYTES
         + mailboxes
     )
+
+
+@pytest.mark.parametrize("rows", (8, 16, 32))
+def test_kimi_full_workspace_recipes_enumerate_persistent_tensors(rows):
+    module = _kimi_mono_module()
+    hidden = module.KIMI_K3_CONFIG.hidden
+    padded_rows = (rows + 31) // 32 * 32
+    timeline = 10 * 8
+    common = (
+        6 * rows * hidden * 2
+        + padded_rows * hidden
+        + padded_rows * (hidden // 32)
+        + timeline
+    )
+    max_sorted = rows * module.KIMI_K3_CONFIG.top_k * 16
+    max_blocks = (max_sorted + 15) // 16
+    kda = common + (
+        padded_rows * hidden
+        + padded_rows * (hidden // 32)
+        + 2 * max_sorted * 4
+        + max_blocks * 4
+        + 2 * 4
+        + max_sorted * module.KIMI_K3_CONFIG.inter * 2
+        + rows * module.KIMI_K3_CONFIG.n_experts * (2 + 4 + 8)
+        + rows * module.KIMI_K3_CONFIG.top_k * (4 + 8 + 4 + 4)
+        + 4 * rows * module.KIMI_K3_CONFIG.routed_hidden * 2
+        + 3 * rows * module.KIMI_K3_CONFIG.shared_inter * 2
+        + 3 * rows * hidden * 2
+        + rows * (hidden // 8) * 2
+    )
+    dense = (
+        6 * rows * hidden * 2
+        + rows * hidden
+        + rows * ((hidden + 255) // 256)
+        + timeline
+    )
+
+    assert module._full_layer_workspace_nbytes("mono", rows) == kda
+    assert module._full_layer_workspace_nbytes("mla_full", rows) == common
+    assert (
+        module._full_layer_workspace_nbytes("dense_full", rows)
+        == dense
+    )
+
+
+def test_kimi_full_reserve_never_undercounts_aggregate_workspaces():
+    module = _kimi_mono_module()
+    runner = _kimi_memory_reserve_runner("auto", "dspark")
+    layers = runner._lm.model.layers
+    enumerated = sum(
+        module._full_layer_workspace_nbytes(
+            module.KimiFullModelPlan._backend(layer),
+            rows,
+        )
+        for layer in layers
+        for rows in module.KIMI_MLA_AGENTIC_ROWS
+    )
+    packed_and_shared = (
+        module._FULL_DENSE_PACKED_BYTES
+        + module._FULL_KDA_PACKED_BYTES
+        + 2 * module._FULL_MLA_PACKED_BYTES
+        + module._FULL_SHARED_BYTES
+    )
+    undercount = (
+        packed_and_shared + enumerated - runner.memory_reserve_bytes()
+    )
+
+    assert undercount <= 0
+    assert undercount < (1 << 30)
 
 
 def test_kimi_mla_output_projection_is_a_shared_packed_artifact():

@@ -201,6 +201,19 @@ class KimiK3DenseMonoKernel:
             "w_dense_dn": self.w_dense_dn,
         }
 
+    def full_plan_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            self.pre_updated,
+            self.pre_attn,
+            self.updated_prefix,
+            self.moe_input,
+            self.output,
+            self.attention_delta,
+            self.quantized_moe_input,
+            self.quantized_moe_scale,
+            *self.attention.full_plan_workspace_tensors(),
+        )
+
     def release_packed_sources(self) -> None:
         self.attention.release_packed_sources()
         keep = {

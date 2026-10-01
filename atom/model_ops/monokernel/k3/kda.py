@@ -192,13 +192,15 @@ class KimiK3KdaAttention:
         device = self.t["w_kda_in"].device
         padded_fused_width = (fused_width + _INPUT_GEMM_ALIGNMENT - 1) // _INPUT_GEMM_ALIGNMENT
         padded_fused_width *= _INPUT_GEMM_ALIGNMENT
-        self.fused_input_storage = torch.empty(
-            samples,
-            padded_fused_width,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.fused_input = self.fused_input_storage[:, :fused_width]
+        self.fused_input_storage = self.fused_input = None
+        if not monokernel_only:
+            self.fused_input_storage = torch.empty(
+                samples,
+                padded_fused_width,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.fused_input = self.fused_input_storage[:, :fused_width]
         packed_artifacts = packed_artifacts or {}
         self.w_kda_in_padded = packed_artifacts.get("w_kda_in_padded")
         self.w_kda_in_packed = packed_artifacts.get("w_kda_in_packed")
@@ -210,10 +212,25 @@ class KimiK3KdaAttention:
                 device=device,
             )
             self.w_kda_in_padded[:fused_width].copy_(self.t["w_kda_in"])
-        self.partial = torch.empty(samples, config.hidden, dtype=torch.bfloat16, device=device)
-        self.output = torch.empty_like(self.partial)
+        self.partial = self.output = None
+        if not monokernel_only:
+            self.partial = torch.empty(
+                samples,
+                config.hidden,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.output = torch.empty_like(self.partial)
         self.step = torch.zeros(1, dtype=torch.int32, device=device)
-        self.normed = torch.empty(samples, config.local_heads, _HEAD_DIM, dtype=torch.bfloat16, device=device)
+        self.normed = None
+        if not monokernel_only:
+            self.normed = torch.empty(
+                samples,
+                config.local_heads,
+                _HEAD_DIM,
+                dtype=torch.bfloat16,
+                device=device,
+            )
         self.core = (
             None
             if agentic_batch_size
@@ -223,7 +240,7 @@ class KimiK3KdaAttention:
             self.symmetric_allreduce = symmetric_allreduce
             if self.symmetric_allreduce is None and not defer_collectives:
                 self.symmetric_allreduce = SymmetricBf16Allreduce(
-                    (self.partial.numel(),),
+                    (samples * config.hidden,),
                     rank=rank,
                     npes=npes,
                     group=group,
@@ -283,6 +300,13 @@ class KimiK3KdaAttention:
             artifacts["moe_packed"] = self.moe_packed
         return artifacts
 
+    def full_plan_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return bucket-local tensors retained after full-plan rebinding."""
+
+        if not self.monokernel_only:
+            raise ValueError("workspace enumeration requires monokernel_only")
+        return (self.monokernel_timeline,)
+
     def initialize_symmetric_allreduce(
         self,
         shared: SymmetricBf16Allreduce | None = None,
@@ -296,7 +320,7 @@ class KimiK3KdaAttention:
                 shared
                 if shared is not None
                 else SymmetricBf16Allreduce(
-                    (self.partial.numel(),),
+                    (self.S * self.config.hidden,),
                     rank=self.rank,
                     npes=self.npes,
                     group=self.group,

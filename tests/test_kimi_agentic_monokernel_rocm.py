@@ -1074,6 +1074,7 @@ def _tp8_worker(rank: int, port: int) -> None:
 
     from atom.model_ops.monokernel.config import ConvStateLayout
     from atom.model_ops.monokernel.k3.op import KimiK3MonoKernel
+    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1101,6 +1102,10 @@ def _tp8_worker(rank: int, port: int) -> None:
                 state_dtype=torch.float16,
                 packed_artifacts=packed,
             )
+            assert sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in op.full_plan_workspace_tensors()
+            ) == _full_layer_workspace_nbytes("mono", batch * 8)
             packed = op.packed_artifacts()
             _exercise_batch(op, batch, device, weights)
             op.close()
@@ -1116,6 +1121,7 @@ def _tp8_dense_worker(rank: int, port: int) -> None:
     from atom.model_ops.monokernel.k3.dense_full import (
         KimiK3DenseMonoKernel,
     )
+    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1140,6 +1146,13 @@ def _tp8_dense_worker(rank: int, port: int) -> None:
                 state_dtype=torch.float16,
                 agentic_batch_size=batch,
                 packed_artifacts=packed,
+            )
+            assert sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in op.full_plan_workspace_tensors()
+            ) == _full_layer_workspace_nbytes(
+                "dense_full",
+                batch * 8,
             )
             packed = op.packed_artifacts()
             _exercise_dense_layer0(
@@ -1474,6 +1487,7 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
     import torch.distributed as dist
 
     from atom.model_ops.monokernel.k3.mla_full import KimiK3MlaMonoKernel
+    from atom.models.kimi_k3_mono import _full_layer_workspace_nbytes
 
     device = torch.device("cuda", rank)
     torch.cuda.set_device(device)
@@ -1503,6 +1517,13 @@ def _tp8_mla_worker(rank: int, port: int) -> None:
             )
             if previous_w_o is not None:
                 assert op.w_o_packed is previous_w_o
+            assert sum(
+                tensor.numel() * tensor.element_size()
+                for tensor in op.full_plan_workspace_tensors()
+            ) == _full_layer_workspace_nbytes(
+                "mla_full",
+                batch * 8,
+            )
             packed = op.packed_artifacts()
             _exercise_mla_batch(op, batch, device, weights)
             op.close()

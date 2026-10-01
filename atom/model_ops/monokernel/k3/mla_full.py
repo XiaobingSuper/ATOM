@@ -70,6 +70,9 @@ class _MlaAttentionArena:
     def packed_artifacts(self) -> dict[str, torch.Tensor]:
         return {}
 
+    def full_plan_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        return ()
+
     def release_packed_sources(self) -> None:
         return None
 
@@ -224,6 +227,12 @@ class KimiK3MlaMonoKernel(_KimiK3MlaPath):
             **super().packed_artifacts(),
             "w_o_packed": self.w_o_packed,
         }
+
+    def full_plan_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        return (
+            *super().full_plan_workspace_tensors(),
+            self.monokernel_timeline,
+        )
 
     def forward(
         self,

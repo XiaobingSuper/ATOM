@@ -53,6 +53,8 @@ _WORKSPACE_RESERVE_PER_LAYER_BUCKET = 32 << 20
 _HIDDEN = KIMI_K3_CONFIG.hidden
 _PROJECTION = KIMI_K3_CONFIG.local_heads * KIMI_K3_CONFIG.v_dim
 _FUSED_PAD = 6400
+_BF16_BYTES = 2
+_INT64_BYTES = 8
 
 
 def _mxfp8_packed_nbytes(rows: int, cols: int) -> int:
@@ -84,7 +86,6 @@ _FULL_DENSE_PACKED_BYTES = (
     + 2 * (33792 // 8) * _HIDDEN * 2
     + _HIDDEN * (33792 // 8) * 2
 )
-_FULL_WORKSPACE_PER_LAYER_BUCKET = 8 << 20
 _FULL_SHARED_ARENA_BYTES = (
     8_969_472
     + max(KIMI_MLA_AGENTIC_ROWS) * 8 * _HIDDEN * 2
@@ -102,6 +103,53 @@ _FULL_COLLECTIVE_BYTES = sum(
     for rows in KIMI_MLA_AGENTIC_ROWS
 )
 _FULL_SHARED_BYTES = _FULL_SHARED_ARENA_BYTES + _FULL_COLLECTIVE_BYTES
+
+
+def _full_layer_workspace_nbytes(backend: str, rows: int) -> int:
+    """Exact persistent bucket-local bytes after shared-plan rebinding."""
+
+    timeline = 10 * _INT64_BYTES
+    if backend == "dense_full":
+        return (
+            6 * rows * _HIDDEN * _BF16_BYTES
+            + rows * _HIDDEN
+            + rows * ((_HIDDEN + 255) // 256)
+            + timeline
+        )
+    if backend not in {"mono", "mla_full"}:
+        raise ValueError(f"unsupported Kimi full backend {backend!r}")
+    padded_rows = (rows + 31) // 32 * 32
+    common = (
+        6 * rows * _HIDDEN * _BF16_BYTES
+        + padded_rows * _HIDDEN
+        + padded_rows * (_HIDDEN // 32)
+        + timeline
+    )
+    if backend == "mla_full":
+        return common
+    max_sorted = rows * KIMI_K3_CONFIG.top_k * 16
+    max_blocks = (max_sorted + 15) // 16
+    staged = (
+        padded_rows * _HIDDEN
+        + padded_rows * (_HIDDEN // 32)
+        + 2 * max_sorted * 4
+        + max_blocks * 4
+        + 2 * 4
+        + max_sorted * KIMI_K3_CONFIG.inter * _BF16_BYTES
+        + rows * KIMI_K3_CONFIG.n_experts * (2 + 4 + 8)
+        + rows * KIMI_K3_CONFIG.top_k * (4 + 8 + 4 + 4)
+        + 4
+        * rows
+        * KIMI_K3_CONFIG.routed_hidden
+        * _BF16_BYTES
+        + 3
+        * rows
+        * KIMI_K3_CONFIG.shared_inter
+        * _BF16_BYTES
+        + 3 * rows * _HIDDEN * _BF16_BYTES
+        + rows * (_HIDDEN // 8) * _BF16_BYTES
+    )
+    return common + staged
 
 
 def _need(ok: bool, what: str) -> None:
@@ -951,8 +999,10 @@ class KimiMonoDecode:
         )
         if full_dspark:
             packed = 0
+            workspaces = 0
             kda_layers = 0
             for layer in layers:
+                backend = KimiFullModelPlan._backend(layer)
                 if not hasattr(layer, "block_sparse_moe"):
                     packed += _FULL_DENSE_PACKED_BYTES
                 elif layer.is_linear_attn:
@@ -960,11 +1010,13 @@ class KimiMonoDecode:
                     kda_layers += 1
                 else:
                     packed += _FULL_MLA_PACKED_BYTES
+                workspaces += sum(
+                    _full_layer_workspace_nbytes(backend, rows)
+                    for rows in KIMI_MLA_AGENTIC_ROWS
+                )
             reserve = (
                 packed
-                + len(layers)
-                * len(KIMI_MLA_AGENTIC_ROWS)
-                * _FULL_WORKSPACE_PER_LAYER_BUCKET
+                + workspaces
                 + _FULL_SHARED_BYTES
             )
             if self._mode == "mono":
