@@ -1049,6 +1049,97 @@ def test_kimi_kda_configure_aliases_injected_moe_artifacts(monkeypatch):
     assert attention.moe_packed is artifacts
 
 
+def test_kimi_ordinary_buckets_borrow_full_plan_artifacts(monkeypatch):
+    import torch
+
+    module = _kimi_mono_module()
+    layer = SimpleNamespace(layer_idx=1, is_linear_attn=True)
+    canonical = {"moe_packed": {"probe": torch.tensor([1])}}
+    constructed = []
+    pack_calls = []
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._ops = {}
+    runner._weights = {}
+    runner._packed_artifacts = {}
+    runner._reductions = {}
+    runner._refused = set()
+    owner_closes = []
+    owner = SimpleNamespace(close=lambda: owner_closes.append(1))
+    runner._full_plan = module.KimiFullModelPlan(runner)
+    runner._full_plan.commit(
+        {},
+        {1: canonical},
+        {1: owner},
+        {},
+        torch.empty(0),
+        torch.empty(0),
+        torch.empty(0),
+    )
+    runner._layer_specs = lambda samples, state_dtype, batch=0: [
+        (
+            layer,
+            "mono",
+            (layer.layer_idx, samples, "mono", state_dtype, batch),
+        )
+    ]
+
+    class FakeOp:
+        def __init__(self, packed_artifacts):
+            self.received = packed_artifacts
+            self.attention = SimpleNamespace(symmetric_allreduce=None)
+            self.symmetric_allreduce = None
+            constructed.append(self)
+
+        def packed_artifacts(self):
+            pack_calls.append(1)
+            return {"unexpected": object()}
+
+        def release_packed_sources(self):
+            return None
+
+        def initialize_collectives(self, attention=None, moe=None):
+            return attention, moe
+
+        def close(self):
+            self.received = None
+
+    class Owned:
+        def __init__(self, _layer, _weights, _samples, _backend, **kwargs):
+            self.op = FakeOp(kwargs["packed_artifacts"])
+
+        def initialize_collectives(self, *shared):
+            return self.op.initialize_collectives(*shared)
+
+    monkeypatch.setattr(
+        module,
+        "_layer_weights",
+        lambda *_args: SimpleNamespace(t={}),
+    )
+    monkeypatch.setattr(module, "_KimiLayerOp", Owned)
+    monkeypatch.setattr(module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(
+        module,
+        "get_tp_group",
+        lambda: SimpleNamespace(cpu_group=None),
+    )
+
+    assert runner._prepare(4, torch.float32)
+    assert runner._prepare(8, torch.float32)
+    assert pack_calls == []
+    assert len(constructed) == 2
+    assert all(op.received is canonical for op in constructed)
+    constructed[0].close()
+    assert canonical["moe_packed"]["probe"].item() == 1
+    assert runner._packed_artifacts == {}
+    constructed[1].close()
+    runner._full_plan.close()
+    assert owner_closes == [1]
+    assert runner._full_plan.packed_artifacts == {}
+
+
 def test_kimi_full_model_plan_rolls_back_incomplete_prepare(monkeypatch):
     import torch
 

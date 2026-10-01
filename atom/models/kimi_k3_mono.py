@@ -726,6 +726,12 @@ class KimiFullModelPlan:
             shared_artifacts.clear()
         self.ready = True
 
+    def artifacts_for_layer(self, layer_idx: int):
+        """Return canonical packed artifacts without transferring ownership."""
+        if not self.ready:
+            return None
+        return self.packed_artifacts.get(layer_idx)
+
     def prepare(self) -> bool:
         if self.ready:
             return True
@@ -1551,8 +1557,21 @@ class KimiMonoDecode:
                 self._weights[layer.layer_idx] = weights
                 owned = None
                 construction_error = None
-                packed_artifacts = self._packed_artifacts.get(layer.layer_idx)
+                full_plan = getattr(self, "_full_plan", None)
+                borrow_from_plan = bool(
+                    full_plan is not None and full_plan.ready
+                )
+                packed_artifacts = (
+                    full_plan.artifacts_for_layer(layer.layer_idx)
+                    if borrow_from_plan
+                    else self._packed_artifacts.get(layer.layer_idx)
+                )
                 try:
+                    if borrow_from_plan and packed_artifacts is None:
+                        raise MonoUnsupported(
+                            "committed full plan has no packed artifacts "
+                            f"for layer {layer.layer_idx}"
+                        )
                     owned = _KimiLayerOp(
                         layer,
                         weights,
@@ -1911,10 +1930,10 @@ class KimiMonoDecode:
 
     def close(self) -> None:
         full_plan = getattr(self, "_full_plan", None)
-        if full_plan is not None:
-            full_plan.close()
         self._close_reductions()
         self._ops.clear()
         self._weights.clear()
         getattr(self, "_packed_artifacts", {}).clear()
         self._refused.clear()
+        if full_plan is not None:
+            full_plan.close()
