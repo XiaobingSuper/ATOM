@@ -993,9 +993,18 @@ def _exercise_mla_batch(op, batch, device, weights) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    # Eight fresh rows straddle two logical blocks. Older rows are already
-    # resident in a separately permuted physical cache.
-    positions = torch.arange(125, 133, dtype=torch.int64, device=device).repeat(batch)
+    # Kimi-K3 is NoPE. Production keeps only a one-row BF16 placeholder cache,
+    # so this maximum checkpoint position proves the full kernel never indexes
+    # that placeholder. Physical fresh rows still straddle block 128 below.
+    positions = torch.full(
+        (rows,),
+        1_048_575,
+        dtype=torch.int64,
+        device=device,
+    )
+    fresh_positions = torch.arange(
+        125, 133, dtype=torch.int64, device=device
+    ).repeat(batch)
     metadata_builder = object.__new__(AiterMLAMetadataBuilder)
     metadata_builder.model_runner = SimpleNamespace(
         forward_vars={
@@ -1018,8 +1027,10 @@ def _exercise_mla_batch(op, batch, device, weights) -> None:
         device=device,
     )
     block_tables = physical_blocks.view(batch, 2).contiguous()
-    logical_blocks = positions.view(batch, 8).div(128, rounding_mode="floor")
-    offsets = positions.view(batch, 8).remainder(128)
+    logical_blocks = fresh_positions.view(batch, 8).div(
+        128, rounding_mode="floor"
+    )
+    offsets = fresh_positions.view(batch, 8).remainder(128)
     slot_mapping = (
         block_tables.gather(1, logical_blocks.to(torch.int64)).to(torch.int64) * 128
         + offsets
@@ -1050,8 +1061,13 @@ def _exercise_mla_batch(op, batch, device, weights) -> None:
             )
             cache_rows[physical].copy_(values.to(torch.float8_e4m3fn))
     scale = torch.tensor([0.015625], dtype=torch.float32, device=device)
-    rope_cos = torch.ones(256, 1, 1, 32, device=device)
-    rope_sin = torch.zeros_like(rope_cos)
+    rope_cos = torch.full(
+        (1, 32),
+        float("nan"),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    rope_sin = torch.full_like(rope_cos, float("nan"))
     output = torch.empty_like(prefix)
 
     class PassThroughKda:
@@ -1253,10 +1269,10 @@ def _exercise_mla_batch(op, batch, device, weights) -> None:
             batch_ids[-8:].fill_(batch - 1)
             slot_mapping[-8:].copy_(
                 block_tables[-1].gather(
-                    0, positions[-8:].div(128, rounding_mode="floor")
+                    0, fresh_positions[-8:].div(128, rounding_mode="floor")
                 ).to(torch.int64)
                 * 128
-                + positions[-8:].remainder(128)
+                + fresh_positions[-8:].remainder(128)
             )
 
 

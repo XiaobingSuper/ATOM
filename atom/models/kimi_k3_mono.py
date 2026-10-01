@@ -974,7 +974,6 @@ class KimiMonoDecode:
                     block_size=attention_metadata.block_size,
                     block_ratio=attention_metadata.block_ratio,
                 )
-                attn = layer.self_attn
                 scale = _mla_cache_descale(layer, cache.k_cache)
                 hidden = owned.op.forward(
                     hidden,
@@ -982,8 +981,6 @@ class KimiMonoDecode:
                     runtime,
                     cache.k_cache,
                     scale,
-                    attn.rotary_emb.cos_cache,
-                    attn.rotary_emb.sin_cache,
                     epoch_layer=layer.layer_idx,
                 )
                 continue

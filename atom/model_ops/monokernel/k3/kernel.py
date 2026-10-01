@@ -462,8 +462,6 @@ def build_kimi_k3_monokernel(
         mla_block_ratio: Int32,
         mla_cache: Int64,
         mla_cache_scale: Int64,
-        mla_rope_cos: Int64,
-        mla_rope_sin: Int64,
         mla_qkv_weight: Int64,
         mla_q_norm: Int64,
         mla_kv_norm: Int64,
@@ -1998,14 +1996,6 @@ def build_kimi_k3_monokernel(
                     )
                     kv_pair = kv_pair + _THREADS
 
-                position = uniform(
-                    bo.buffer_load(
-                        rsrc(mla_positions),
-                        sample,
-                        vec_width=1,
-                        dtype=T.i64,
-                    )
-                )
                 pe_pair = tid
                 while pe_pair < _MLA_PE // 2:
                     pe0, pe1 = pair_values(
@@ -2014,29 +2004,13 @@ def build_kimi_k3_monokernel(
                         + (_MLA_Q_LORA + _MLA_KV_LORA) // 2
                         + pe_pair,
                     )
-                    cosine = fx.Float32(
-                        bo.buffer_load(
-                            rsrc(mla_rope_cos),
-                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
-                    sine = fx.Float32(
-                        bo.buffer_load(
-                            rsrc(mla_rope_sin),
-                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
                     store_pair(
                         mla_fresh_rsrc,
                         sample * (_MLA_CACHE_ROW // 2)
                         + _MLA_KV_LORA // 2
                         + pe_pair,
-                        pe0 * cosine - pe1 * sine,
-                        pe0 * sine + pe1 * cosine,
+                        pe0,
+                        pe1,
                     )
                     pe_pair = pe_pair + _THREADS
                 gpu.barrier()
@@ -2144,36 +2118,6 @@ def build_kimi_k3_monokernel(
                         (row + 1) * _MLA_Q_LORA + k,
                     )
                     k = k + 1
-                row_in_head = row % _MLA_Q_HEAD
-                if row_in_head >= _HEAD_DIM:
-                    position = uniform(
-                        bo.buffer_load(
-                            rsrc(mla_positions),
-                            sample,
-                            vec_width=1,
-                            dtype=T.i64,
-                        )
-                    )
-                    pe_pair = (row_in_head - _HEAD_DIM) // 2
-                    cosine = fx.Float32(
-                        bo.buffer_load(
-                            rsrc(mla_rope_cos),
-                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
-                    sine = fx.Float32(
-                        bo.buffer_load(
-                            rsrc(mla_rope_sin),
-                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
-                    )
-                    rotated_low = low * cosine - high * sine
-                    high = low * sine + high * cosine
-                    low = rotated_low
                 store_pair(
                     mla_q_rsrc,
                     sample * q_pairs + row // 2,
@@ -4456,8 +4400,6 @@ def build_kimi_k3_monokernel(
         mla_block_ratio: Int32,
         mla_cache: Int64,
         mla_cache_scale: Int64,
-        mla_rope_cos: Int64,
-        mla_rope_sin: Int64,
         mla_qkv_weight: Int64,
         mla_q_norm: Int64,
         mla_kv_norm: Int64,
@@ -4530,8 +4472,6 @@ def build_kimi_k3_monokernel(
             mla_block_ratio,
             mla_cache,
             mla_cache_scale,
-            mla_rope_cos,
-            mla_rope_sin,
             mla_qkv_weight,
             mla_q_norm,
             mla_kv_norm,

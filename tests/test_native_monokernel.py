@@ -755,6 +755,8 @@ def test_kimi_mla_full_kernel_has_one_index_free_device_launch(rows):
     assert "mla_block_tables" in kernel_source
     assert "mla_slot_mapping" in kernel_source
     assert "mla_context_lens" in kernel_source
+    assert "mla_rope_cos" not in kernel_source
+    assert "mla_rope_sin" not in kernel_source
     assert kernel_source.count("@flyc.kernel") == 1
     assert kernel_source.count(").launch(grid=") == 1
 
@@ -778,6 +780,8 @@ def test_kimi_model_routes_mla_only_in_explicit_mode():
     assert "KimiK3MlaMonoKernel" in source
     assert '"mla_full"' in source
     assert "external_indexer=False" in source
+    assert "rotary_emb.cos_cache" not in source
+    assert "rotary_emb.sin_cache" not in source
     assert "mode != \"mono\"" in source
     assert "ReplaySSM" not in source
 
