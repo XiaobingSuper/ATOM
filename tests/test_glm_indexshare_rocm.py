@@ -1284,7 +1284,12 @@ def _tp4_worker(
         dist.destroy_process_group()
 
 
-def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
+def _tp4_selector_worker(
+    rank: int,
+    device_offset: int,
+    port: int,
+    position: int,
+) -> None:
     from datetime import timedelta
 
     import torch
@@ -1316,7 +1321,7 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
         world_size=4,
         timeout=timedelta(seconds=90),
     )
-    kernel = None
+    kernel = shared_kernel = None
     try:
         weights, artifacts, attention, _experts = _packed_test_weights(
             device,
@@ -1361,8 +1366,36 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
             attention_weight=AttentionWeight.FP8_PER_ROW,
             kv_cache_layout=KvCacheLayout.ATOM_FP8,
             agentic_row_contract=True,
+            timeline=True,
             packed_artifacts=packed_artifacts,
         )
+        short_context = position + 1 <= 2048
+        if short_context:
+            shared_artifacts = Glm5PackedArtifacts(
+                weights=mapped,
+                tensors=MappingProxyType(packed),
+                npes=4,
+                attention_weight=AttentionWeight.FP8_PER_ROW,
+                with_indexer=False,
+                expert_mxfp4=base.expert_mxfp4,
+                atom_expert_layout=base.atom_expert_layout,
+            )
+            shared_kernel = Glm5MonoKernel(
+                mapped,
+                1,
+                rank=rank,
+                npes=4,
+                group=None,
+                topk=2048,
+                with_indexer=False,
+                index_share=True,
+                index_max_seq=4096,
+                cache_slots=4096,
+                attention_weight=AttentionWeight.FP8_PER_ROW,
+                kv_cache_layout=KvCacheLayout.ATOM_FP8,
+                agentic_row_contract=True,
+                packed_artifacts=shared_artifacts,
+            )
         cfg = mapped.config
         hidden = torch.randn(
             1,
@@ -1371,7 +1404,6 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
             dtype=torch.bfloat16,
             device=device,
         )
-        position = 2111
         positions = torch.tensor([position], dtype=torch.int64, device=device)
         slot_mapping = torch.full(
             (1,), -1, dtype=torch.int64, device=device
@@ -1442,12 +1474,28 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
             4, dtype=torch.int64, device=device
         )
         storage[byte_offsets] = scales.view(torch.uint8).view(-1, 4)
+        if short_context:
+            current_slot = int(physical[-1].item())
+            slot_mapping[0] = current_slot
+            current_key_offsets = torch.tensor(
+                [
+                    index_cache_key_byte_offset(current_slot, dim)
+                    for dim in range(128)
+                ],
+                dtype=torch.int64,
+                device=device,
+            )
+            current_scale_offset = index_cache_scale_byte_offset(current_slot)
+            storage[current_key_offsets] = 0
+            storage[
+                current_scale_offset : current_scale_offset + 4
+            ] = 0
         cos = torch.ones(
             4096, 32, dtype=torch.bfloat16, device=device
         )
         sin = torch.zeros_like(cos)
 
-        kernel.forward(
+        full_output = kernel.forward(
             hidden,
             torch.tensor([position], dtype=torch.int32, device=device),
             cache,
@@ -1466,13 +1514,32 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
             context_lens=context_lens,
         )
         torch.cuda.synchronize(device)
+        if rank == 0:
+            print("\nGLM selector timeline\n" + kernel.timeline_report())
+
+        def timeline_stage(name):
+            offset = 0
+            for stage_name, count in kernel.stages:
+                if stage_name == name:
+                    return kernel.timeline[offset : offset + count]
+                offset += count
+            raise AssertionError(f"missing timeline stage {name}")
+
+        qkv_timeline = timeline_stage("qkv_a")
+        index_q_timeline = timeline_stage("index_q")
+        selector_timeline = timeline_stage("index_select")
+        if short_context:
+            assert not qkv_timeline[:, 5].any()
+            assert not index_q_timeline.any()
+            assert not selector_timeline[:, 5:7].any()
+        else:
+            score_tiles = (position + 1 + 63) // 64
+            assert qkv_timeline[:, 5].count_nonzero().item() == 2
+            assert index_q_timeline[:, 0].count_nonzero().item() == 256
+            assert selector_timeline[0, 5].item() == 6 * score_tiles
+            assert selector_timeline[0, 6].item() == 4
+
         index_k_actual = kernel.debug("index_k", (1, 128))
-        index_q_actual = kernel.debug(
-            "index_q",
-            (1, 32, 128),
-            bf2=True,
-        )
-        index_weights_actual = kernel.debug("index_w", (1, 32))
 
         def block_round(value):
             blocks = value.float().reshape(value.shape[0], -1, 128)
@@ -1492,10 +1559,6 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
                 hidden.float().square().mean(-1, keepdim=True) + 1e-6
             )
         ).to(torch.bfloat16)
-        qkv = torch.nn.functional.linear(
-            block_round(normalized.float()),
-            source["qkv_a"],
-        )
         index_k_reference = torch.nn.functional.linear(
             normalized.float(),
             source["index_k"],
@@ -1506,52 +1569,119 @@ def _tp4_selector_worker(rank: int, device_offset: int, port: int) -> None:
             atol=0.002,
             rtol=2e-3,
         )
-        qa = qkv[:, : cfg.q_lora]
-        qa = (
-            qa
-            * torch.rsqrt(qa.square().mean(-1, keepdim=True) + 1e-6)
-        ).to(torch.bfloat16)
-        index_q_reference = torch.nn.functional.linear(
-            block_round(qa),
-            source["index_q"],
-        ).view(1, 32, 128)
-        index_q_reference = index_q_reference.to(torch.bfloat16).float()
-        torch.testing.assert_close(
-            index_q_actual,
-            index_q_reference,
-            atol=0.08,
-            rtol=3e-2,
-        )
-        index_weights = torch.nn.functional.linear(
-            normalized.float(),
-            source["index_w"],
-        )
-        torch.testing.assert_close(
-            index_weights_actual,
-            index_weights,
-            atol=0.002,
-            rtol=2e-3,
-        )
-        index_weights = index_weights[0]
-        key_dequant = (448.0 * scales).to(torch.bfloat16).float()
-        scores = (
-            torch.relu(index_q_reference[0, :, 0, None] * key_dequant)
-            * index_weights[:, None]
-        ).sum(0)
-        expected, expected_count = stable_physical_topk(
-            scores.cpu(),
-            block_tables.cpu(),
-            batch_id=0,
-            position=position,
-            request_context=position + 1,
-            topk=2048,
-        )
-        assert expected_count == 2048
+        if short_context:
+            expected = torch.zeros(2048, dtype=torch.int32)
+            expected[: position + 1] = physical.to(
+                device="cpu",
+                dtype=torch.int32,
+            )
+            expected_count = position + 1
+            assert storage[current_key_offsets].count_nonzero().item() > 0
+            published_scale = (
+                storage[
+                    current_scale_offset : current_scale_offset + 4
+                ]
+                .cpu()
+                .contiguous()
+                .view(torch.float32)
+                .item()
+            )
+            assert published_scale > 0
+        else:
+            index_q_actual = kernel.debug(
+                "index_q",
+                (1, 32, 128),
+                bf2=True,
+            )
+            index_weights_actual = kernel.debug("index_w", (1, 32))
+            qkv = torch.nn.functional.linear(
+                block_round(normalized.float()),
+                source["qkv_a"],
+            )
+            qa = qkv[:, : cfg.q_lora]
+            qa = (
+                qa
+                * torch.rsqrt(qa.square().mean(-1, keepdim=True) + 1e-6)
+            ).to(torch.bfloat16)
+            index_q_reference = torch.nn.functional.linear(
+                block_round(qa),
+                source["index_q"],
+            ).view(1, 32, 128)
+            index_q_reference = index_q_reference.to(torch.bfloat16).float()
+            torch.testing.assert_close(
+                index_q_actual,
+                index_q_reference,
+                atol=0.08,
+                rtol=3e-2,
+            )
+            index_weights = torch.nn.functional.linear(
+                normalized.float(),
+                source["index_w"],
+            )
+            torch.testing.assert_close(
+                index_weights_actual,
+                index_weights,
+                atol=0.002,
+                rtol=2e-3,
+            )
+            index_weights = index_weights[0]
+            key_dequant = (448.0 * scales).to(torch.bfloat16).float()
+            scores = (
+                torch.relu(
+                    index_q_reference[0, :, 0, None] * key_dequant
+                )
+                * index_weights[:, None]
+            ).sum(0)
+            expected, expected_count = stable_physical_topk(
+                scores.cpu(),
+                block_tables.cpu(),
+                batch_id=0,
+                position=position,
+                request_context=position + 1,
+                topk=2048,
+            )
+        assert expected_count == min(position + 1, 2048)
         assert kernel.index_counts is not None
         assert kernel.index_counts[0].item() == expected_count
         assert sparse_indptr.cpu().tolist() == [0, expected_count]
         assert torch.equal(indices.cpu(), expected)
+
+        if short_context:
+            baseline_indices = expected.to(device)
+            baseline_indptr = torch.tensor(
+                [0, expected_count], dtype=torch.int32, device=device
+            )
+            baseline_counts = torch.tensor(
+                [expected_count], dtype=torch.int32, device=device
+            )
+            baseline_output = shared_kernel.forward(
+                hidden,
+                torch.tensor([position], dtype=torch.int32, device=device),
+                cache,
+                cache,
+                baseline_indices,
+                cos,
+                sin,
+                positions=positions,
+                slot_mapping=slot_mapping,
+                sparse_kv_indptr=baseline_indptr,
+                batch_ids=batch_ids,
+                owned_counts=owned_counts,
+                kv_cache_scale=cache_scale,
+                block_tables=block_tables,
+                context_lens=context_lens,
+                selected_counts=baseline_counts,
+            )
+            torch.cuda.synchronize(device)
+            torch.testing.assert_close(
+                full_output,
+                baseline_output,
+                atol=0.25,
+                rtol=0.08,
+            )
     finally:
+        if shared_kernel is not None:
+            shared_kernel.close()
         if kernel is not None:
             kernel.close()
         dist.destroy_process_group()
@@ -1890,7 +2020,32 @@ def test_glm_tp4_full_selector_real_rocm_launch():
     offset = max(0, torch.cuda.device_count() - 4)
     mp.spawn(
         _tp4_selector_worker,
-        args=(offset, _free_port()),
+        args=(offset, _free_port(), 2111),
+        nprocs=4,
+        join=True,
+    )
+
+
+def test_glm_tp4_short_context_selector_bypass_real_rocm_launch():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm device is unavailable")
+    if torch.cuda.device_count() < 4:
+        pytest.skip("TP4 selector launch requires four visible ROCm devices")
+    try:
+        from flydsl.runtime.device import get_rocm_arch
+    except ImportError:
+        pytest.skip("FlyDSL ROCm compiler support is unavailable")
+    if str(get_rocm_arch() or "") != "gfx950":
+        pytest.skip(f"GLM TP4 MonoKernel requires gfx950, got {get_rocm_arch()}")
+
+    import torch.multiprocessing as mp
+
+    offset = max(0, torch.cuda.device_count() - 4)
+    mp.spawn(
+        _tp4_selector_worker,
+        args=(offset, _free_port(), 63),
         nprocs=4,
         join=True,
     )

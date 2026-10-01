@@ -1419,6 +1419,33 @@ def test_glm_flat_and_paged_sparse_indices_are_physical_rows():
     ) == [99, 8, 70]
 
 
+def test_glm_timeline_report_ignores_zero_and_unstamped_stages():
+    import torch
+
+    from atom.model_ops.monokernel.glm.op import Glm5MonoKernel
+
+    probe = SimpleNamespace(
+        timeline=torch.tensor(
+            [
+                [0, 0, 0, 0, 0, 0, 0, 0],
+                [100, 110, 120, 130, 140, 0, 0, 0],
+            ]
+        ),
+        stages=(
+            ("index_score", 0),
+            ("index_q", 1),
+            ("index_select", 1),
+        ),
+        S=1,
+    )
+
+    report = Glm5MonoKernel.timeline_report(probe)
+
+    assert "index_score" not in report
+    assert "index_q" not in report
+    assert "index_select x   1" in report
+
+
 def test_glm_padded_rows_use_safe_physical_row_without_cache_store():
     physical = [17]
     indptr = [0, 1, 1, 1, 1]

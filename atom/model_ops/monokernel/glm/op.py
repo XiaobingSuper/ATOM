@@ -632,11 +632,19 @@ class Glm5MonoKernel:
         """Per stage, in us from launch start: [first start, median hint seen, last end]
         and median per-task phases (hint wait, payload staging, compute, epilogue)."""
         tl = self.timeline[:, :5].cpu().double() / 100.0  # s_memrealtime ticks at 100 MHz
-        t0 = tl[:, 0].min()
+        started = tl[:, 0] > 0
+        if not started.any():
+            return ""
+        t0 = tl[started, 0].min()
         rows, i = [], 0
         for name, n in self.stages:
             st = tl[i : i + n].clone()
             i += n
+            if n == 0:
+                continue
+            st = st[st[:, 0] > 0]
+            if st.shape[0] == 0:
+                continue
             for c in (1, 2, 3):  # missing marks inherit the previous one
                 st[:, c] = torch.where(st[:, c] > 0, st[:, c], st[:, c - 1])
             d = (st[:, 1:] - st[:, :-1]).median(0).values

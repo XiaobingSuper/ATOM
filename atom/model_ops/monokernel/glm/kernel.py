@@ -1209,6 +1209,30 @@ def build_glm5_monokernel(
                             now,
                         )
 
+            def timeline_value(name, t, which, value):
+                if const_expr(timeline):
+                    if tid == 0:
+                        tl_addr = (
+                            index_arg(7)
+                            if const_expr(with_indexer)
+                            else timeline_buf
+                        )
+                        fx.generic_store(
+                            fx.inttoptr(
+                                fx.PointerType.get(
+                                    fx.Int64.ir_type,
+                                    fx.AddressSpace.Global,
+                                    8,
+                                ),
+                                tl_addr
+                                + fx.Int64(
+                                    (first[name] + t) * TL_COLS + which
+                                )
+                                * 8,
+                            ),
+                            fx.Int64(value),
+                        )
+
             def n_sel(count=S):
                 """This lane's local MFMA B column; inactive columns duplicate the last one."""
                 return fx.min(lane % 16, count - 1)
@@ -1372,6 +1396,16 @@ def build_glm5_monokernel(
             def row_writes_cache(s):
                 return row_active(s) & (row_slot(s) >= 0)
 
+            all_index_rows_short = True
+            if const_expr(with_indexer):
+                # Uniform metadata lets every CTA skip only index Q/weight work;
+                # index K remains live for this row's future long-context use.
+                for index_s in range_constexpr(S):
+                    all_index_rows_short = all_index_rows_short & (
+                        (~row_local_sparse_active(index_s))
+                        | (row_context_len(index_s) <= topk)
+                    )
+
             # ================================================= 1. q_a / kv_a GEMV
             # 1 row group x 96 chunks: 8 waves split K, 12 chunks each (all prefetched)
             r_wqa, r_sqa = _rsrc(w_qkv_a), _rsrc(s_qkv_a)
@@ -1502,7 +1536,11 @@ def build_glm5_monokernel(
 
                             ik_acc = run_units(u_index_k, QA_UNITS, QA_UNITS)
                             iw_acc = [fx.Float32(0.0) for _ in range(4)]
-                            if t < INDEX_HEADS // QKV_A_TILE:
+                            if (
+                                (t < INDEX_HEADS // QKV_A_TILE)
+                                & (~all_index_rows_short)
+                            ):
+                                stamp("qkv_a", t, 5)
                                 iw_acc = run_units(u_index_w, IW_CPW, IW_CPW)
                             reduce_rows(1, ik_acc, emit_out(INDEX_TILE), group_count)
                             gpu.barrier()
@@ -1510,7 +1548,10 @@ def build_glm5_monokernel(
                                 s = sample_base + tid // INDEX_TILE
                                 row = t * INDEX_TILE + tid % INDEX_TILE
                                 put(mb("index_k"), s * INDEX_DIM + row, lds_ld(outs, tid))
-                            if t < INDEX_HEADS // QKV_A_TILE:
+                            if (
+                                (t < INDEX_HEADS // QKV_A_TILE)
+                                & (~all_index_rows_short)
+                            ):
                                 reduce_rows(1, iw_acc, emit_out(INDEX_TILE), group_count)
                                 gpu.barrier()
                                 if tid < group_count * INDEX_TILE:
@@ -1810,98 +1851,137 @@ def build_glm5_monokernel(
                 stamp("q_b", t, 4)
 
                 if const_expr(with_indexer):
-                    # Reuse this CTA's normalized q_lora tile for one index-query
-                    # row tile.  Complementary CTAs compute the remaining half below.
-                    iq_t = t
-                    stamp("index_q", iq_t, 0)
+                    if ~all_index_rows_short:
+                        # Reuse this CTA's normalized q_lora tile for one
+                        # index-query row tile. Complementary CTAs compute the
+                        # remaining half below.
+                        iq_t = t
+                        stamp("index_q", iq_t, 0)
 
-                    def u_index_q(c):
-                        kc = (wave * QB_UNITS + c) * 2
-                        return unit_fp8x2(
-                            r_wiq,
-                            r_siq,
-                            iq_t,
-                            kc,
-                            QB_NKC,
-                            Q_LORA,
-                            (n_sel() * Q_LORA + kc * 64) // 2,
-                            per_row=attention_per_row,
-                        )
+                        def u_index_q(c):
+                            kc = (wave * QB_UNITS + c) * 2
+                            return unit_fp8x2(
+                                r_wiq,
+                                r_siq,
+                                iq_t,
+                                kc,
+                                QB_NKC,
+                                Q_LORA,
+                                (n_sel() * Q_LORA + kc * 64) // 2,
+                                per_row=attention_per_row,
+                            )
 
-                    iq_acc = run_units(u_index_q, QB_UNITS, QB_UNITS)
-                    reduce_rows(
-                        1,
-                        iq_acc,
-                        emit_out(INDEX_TILE),
-                        row_scale_rsrc=(
-                            r_siq if const_expr(attention_per_row) else None
-                        ),
-                        row_scale_base=iq_t * INDEX_TILE,
-                    )
-                    stamp("index_q", iq_t, 3)
-                    gpu.barrier()
-                    if tid < S * INDEX_TILE // 4:
-                        s = tid // (INDEX_TILE // 4)
-                        r = (tid % (INDEX_TILE // 4)) * 4
-                        put_bf(
-                            mb("index_q"),
-                            s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
-                            [lds_ld(outs, s * INDEX_TILE + r + j) for j in range(4)],
+                        iq_acc = run_units(
+                            u_index_q, QB_UNITS, QB_UNITS
                         )
-                    stamp("index_q", iq_t, 4)
+                        reduce_rows(
+                            1,
+                            iq_acc,
+                            emit_out(INDEX_TILE),
+                            row_scale_rsrc=(
+                                r_siq
+                                if const_expr(attention_per_row)
+                                else None
+                            ),
+                            row_scale_base=iq_t * INDEX_TILE,
+                        )
+                        stamp("index_q", iq_t, 3)
+                        gpu.barrier()
+                        if tid < S * INDEX_TILE // 4:
+                            s = tid // (INDEX_TILE // 4)
+                            r = (tid % (INDEX_TILE // 4)) * 4
+                            put_bf(
+                                mb("index_q"),
+                                s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
+                                [
+                                    lds_ld(
+                                        outs,
+                                        s * INDEX_TILE + r + j,
+                                    )
+                                    for j in range(4)
+                                ],
+                            )
+                        stamp("index_q", iq_t, 4)
 
             if const_expr(with_indexer):
-                # The 128 CTAs without q_b work produce the other 128 index-query
-                # tiles concurrently.  They reload q_a, but remove one full GEMV
-                # from the q_b CTAs' serialized critical path.
-                N_INDEX_Q_EXTRA = INDEX_Q_ROWS // INDEX_TILE - N_QB
-                for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
-                    tt = fx.Int32(tt)
-                    iq_t = N_QB + tt
-                    stamp("index_q", iq_t, 0)
+                if ~all_index_rows_short:
+                    # The CTAs without q_b work produce the remaining
+                    # index-query tiles concurrently.
+                    N_INDEX_Q_EXTRA = INDEX_Q_ROWS // INDEX_TILE - N_QB
+                    for tt in range(start("index_q"), N_INDEX_Q_EXTRA, G):
+                        tt = fx.Int32(tt)
+                        iq_t = N_QB + tt
+                        stamp("index_q", iq_t, 0)
 
-                    def u_index_q_extra(c):
-                        kc = (wave * QB_UNITS + c) * 2
-                        return unit_fp8x2(
-                            r_wiq,
-                            r_siq,
-                            iq_t,
-                            kc,
-                            QB_NKC,
-                            Q_LORA,
-                            (n_sel() * Q_LORA + kc * 64) // 2,
-                            per_row=attention_per_row,
+                        def u_index_q_extra(c):
+                            kc = (wave * QB_UNITS + c) * 2
+                            return unit_fp8x2(
+                                r_wiq,
+                                r_siq,
+                                iq_t,
+                                kc,
+                                QB_NKC,
+                                Q_LORA,
+                                (n_sel() * Q_LORA + kc * 64) // 2,
+                                per_row=attention_per_row,
+                            )
+
+                        pre = [
+                            u_index_q_extra(c)
+                            for c in range(QB_UNITS)
+                        ]
+                        hint_wait(
+                            S,
+                            lambda s: (
+                                mb("q_an"),
+                                (
+                                    s * Q_LORA
+                                    + Q_LORA
+                                    - 2
+                                )
+                                // 2,
+                            ),
+                            mark=("index_q", iq_t),
                         )
-
-                    pre = [u_index_q_extra(c) for c in range(QB_UNITS)]
-                    hint_wait(S, lambda s: (mb("q_an"), (s * Q_LORA + Q_LORA - 2) // 2), mark=("index_q", iq_t))
-                    stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
-                    if const_expr(attention_per_row):
+                        stage_x_pairs("q_an", S * Q_LORA, lambda k: k)
+                        if const_expr(attention_per_row):
+                            gpu.barrier()
+                            round_x_ptpc(Q_LORA)
+                        stamp("index_q", iq_t, 2)
                         gpu.barrier()
-                        round_x_ptpc(Q_LORA)
-                    stamp("index_q", iq_t, 2)
-                    gpu.barrier()
-                    iq_acc = run_units(u_index_q_extra, QB_UNITS, QB_UNITS, pre)
-                    reduce_rows(
-                        1,
-                        iq_acc,
-                        emit_out(INDEX_TILE),
-                        row_scale_rsrc=(
-                            r_siq if const_expr(attention_per_row) else None
-                        ),
-                        row_scale_base=iq_t * INDEX_TILE,
-                    )
-                    stamp("index_q", iq_t, 3)
-                    gpu.barrier()
-                    if tid < S * INDEX_TILE // 4:
-                        s = tid // (INDEX_TILE // 4)
-                        r = (tid % (INDEX_TILE // 4)) * 4
-                        put_bf(
-                            mb("index_q"),
-                            s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
-                            [lds_ld(outs, s * INDEX_TILE + r + j) for j in range(4)],
+                        iq_acc = run_units(
+                            u_index_q_extra,
+                            QB_UNITS,
+                            QB_UNITS,
                         )
-                    stamp("index_q", iq_t, 4)
+                        reduce_rows(
+                            1,
+                            iq_acc,
+                            emit_out(INDEX_TILE),
+                            row_scale_rsrc=(
+                                r_siq
+                                if const_expr(attention_per_row)
+                                else None
+                            ),
+                            row_scale_base=iq_t * INDEX_TILE,
+                        )
+                        stamp("index_q", iq_t, 3)
+                        gpu.barrier()
+                        if tid < S * INDEX_TILE // 4:
+                            s = tid // (INDEX_TILE // 4)
+                            r = (tid % (INDEX_TILE // 4)) * 4
+                            put_bf(
+                                mb("index_q"),
+                                s * INDEX_Q_ROWS + iq_t * INDEX_TILE + r,
+                                [
+                                    lds_ld(
+                                        outs,
+                                        s * INDEX_TILE + r + j,
+                                    )
+                                    for j in range(4)
+                                ],
+                            )
+                        stamp("index_q", iq_t, 4)
 
             # ==================================== 4. absorbed query: q_lat = W_UK^T q_nope
             # 8 row groups (128 latent rows of one head) x 3 chunks: one row group per wave
@@ -1968,32 +2048,61 @@ def build_glm5_monokernel(
                         context_bound,
                         fx.Int32(0),
                     )
-                    get(mb("index_ready"), s)
-                    if tid < INDEX_HEADS:
-                        lds_st(
-                            index_weights,
-                            tid,
-                            get(mb("index_w"), s * INDEX_HEADS + tid),
+                    long_context = bound > topk
+                    if long_context:
+                        score_tiles = (
+                            bound + INDEX_KEYS_PER_TASK - 1
+                        ) // INDEX_KEYS_PER_TASK
+                        timeline_value(
+                            "index_select",
+                            s,
+                            5,
+                            score_tiles * 6,
                         )
-                    for b in range_constexpr((INDEX_Q_ROWS // 2) // THREADS):
-                        q_pair = tid + b * THREADS
-                        q_elem = q_pair * 2
-                        kq = q_elem % INDEX_DIM
-                        q0, q1 = get_bf2_many(
-                            [(mb("index_q"), s * INDEX_Q_ROWS + q_elem)]
-                        )[0]
-                        if kq < PE_DIM:
-                            c = ld_bf16(
-                                _rsrc(rope_cos),
-                                row_position(s) * (PE_DIM // 2) + kq // 2,
+                        timeline_value("index_select", s, 6, 4)
+                        get(mb("index_ready"), s)
+                        if tid < INDEX_HEADS:
+                            lds_st(
+                                index_weights,
+                                tid,
+                                get(
+                                    mb("index_w"),
+                                    s * INDEX_HEADS + tid,
+                                ),
                             )
-                            sn = ld_bf16(
-                                _rsrc(rope_sin),
-                                row_position(s) * (PE_DIM // 2) + kq // 2,
-                            )
-                            q0, q1 = q0 * c - q1 * sn, q0 * sn + q1 * c
-                        lds_st(xs, q_pair, bf16_pair(q0, q1))
-                    gpu.barrier()
+                        for b in range_constexpr(
+                            (INDEX_Q_ROWS // 2) // THREADS
+                        ):
+                            q_pair = tid + b * THREADS
+                            q_elem = q_pair * 2
+                            kq = q_elem % INDEX_DIM
+                            q0, q1 = get_bf2_many(
+                                [
+                                    (
+                                        mb("index_q"),
+                                        s * INDEX_Q_ROWS + q_elem,
+                                    )
+                                ]
+                            )[0]
+                            if kq < PE_DIM:
+                                c = ld_bf16(
+                                    _rsrc(rope_cos),
+                                    row_position(s)
+                                    * (PE_DIM // 2)
+                                    + kq // 2,
+                                )
+                                sn = ld_bf16(
+                                    _rsrc(rope_sin),
+                                    row_position(s)
+                                    * (PE_DIM // 2)
+                                    + kq // 2,
+                                )
+                                q0, q1 = (
+                                    q0 * c - q1 * sn,
+                                    q0 * sn + q1 * c,
+                                )
+                            lds_st(xs, q_pair, bf16_pair(q0, q1))
+                        gpu.barrier()
 
                     def score_key(tile):
                         """Recompute one 64-key score tile; no context-sized storage."""
@@ -2140,29 +2249,41 @@ def build_glm5_monokernel(
                     prefix = fx.Uint32(0)
                     prefix_mask = fx.Uint32(0)
                     remain = fx.min(fx.Int32(topk), bound)
-                    for digit_pass in range_constexpr(4):
-                        shift = 24 - digit_pass * 8
-                        if tid < 256:
-                            lds_st(keys, tid, fx.Int32(0))
-                        gpu.barrier()
-                        for tile in range(
-                            (bound + INDEX_KEYS_PER_TASK - 1)
-                            // INDEX_KEYS_PER_TASK
-                        ):
-                            key, _, valid = score_key(tile)
-                            if valid & ((key & prefix_mask) == prefix):
-                                digit = fx.Int32(
-                                    (key >> shift) & fx.Uint32(255)
-                                )
-                                fx.atomic_add(
-                                    keys + digit,
-                                    fx.Int32(1),
-                                    syncscope="workgroup",
-                                )
+                    if long_context:
+                        for digit_pass in range_constexpr(4):
+                            shift = 24 - digit_pass * 8
+                            if tid < 256:
+                                lds_st(keys, tid, fx.Int32(0))
                             gpu.barrier()
-                        gpu.barrier()
-                        prefix, remain = select_digit(shift, prefix, remain)
-                        prefix_mask = prefix_mask | fx.Uint32(255 << shift)
+                            for tile in range(
+                                (
+                                    bound
+                                    + INDEX_KEYS_PER_TASK
+                                    - 1
+                                )
+                                // INDEX_KEYS_PER_TASK
+                            ):
+                                key, _, valid = score_key(tile)
+                                if valid & (
+                                    (key & prefix_mask) == prefix
+                                ):
+                                    digit = fx.Int32(
+                                        (key >> shift)
+                                        & fx.Uint32(255)
+                                    )
+                                    fx.atomic_add(
+                                        keys + digit,
+                                        fx.Int32(1),
+                                        syncscope="workgroup",
+                                    )
+                                gpu.barrier()
+                            gpu.barrier()
+                            prefix, remain = select_digit(
+                                shift, prefix, remain
+                            )
+                            prefix_mask = prefix_mask | fx.Uint32(
+                                255 << shift
+                            )
 
                     threshold = prefix
                     if s > 0:
@@ -2204,14 +2325,19 @@ def build_glm5_monokernel(
                         fx.recast_iter(fx.Int32, xs)
                         + INDEX_LDS["sort_logical"].start
                     )
-                    for batch in range_constexpr(
-                        (topk + THREADS - 1) // THREADS
-                    ):
-                        j = tid + batch * THREADS
-                        if j < topk:
-                            lds_st(sort_keys, j, fx.Int32(0))
-                            lds_st(sort_logical, j, fx.Int32(-1))
-                    gpu.barrier()
+                    if long_context:
+                        for batch in range_constexpr(
+                            (topk + THREADS - 1) // THREADS
+                        ):
+                            j = tid + batch * THREADS
+                            if j < topk:
+                                lds_st(sort_keys, j, fx.Int32(0))
+                                lds_st(
+                                    sort_logical,
+                                    j,
+                                    fx.Int32(-1),
+                                )
+                        gpu.barrier()
 
                     def scan_flag(flag):
                         count = flag.select(fx.Int32(1), fx.Int32(0))
@@ -2231,35 +2357,63 @@ def build_glm5_monokernel(
                         return before_wave + inclusive - count, total
 
                     out_gt = fx.Int32(0)
-                    for tile in range(
-                        (bound + INDEX_KEYS_PER_TASK - 1)
-                        // INDEX_KEYS_PER_TASK
-                    ):
-                        key, logical, valid = score_key(tile)
-                        flag = valid & (key > threshold)
-                        offset, tile_total = scan_flag(flag)
-                        if flag:
-                            slot = out_gt + offset
-                            lds_st(sort_keys, slot, fx.Int32(key))
-                            lds_st(sort_logical, slot, logical)
-                        out_gt = out_gt + tile_total
-                        gpu.barrier()
+                    if long_context:
+                        for tile in range(
+                            (
+                                bound
+                                + INDEX_KEYS_PER_TASK
+                                - 1
+                            )
+                            // INDEX_KEYS_PER_TASK
+                        ):
+                            key, logical, valid = score_key(tile)
+                            flag = valid & (key > threshold)
+                            offset, tile_total = scan_flag(flag)
+                            if flag:
+                                slot = out_gt + offset
+                                lds_st(
+                                    sort_keys,
+                                    slot,
+                                    fx.Int32(key),
+                                )
+                                lds_st(
+                                    sort_logical,
+                                    slot,
+                                    logical,
+                                )
+                            out_gt = out_gt + tile_total
+                            gpu.barrier()
 
                     need_eq = fx.min(fx.Int32(topk), bound) - out_gt
                     out_eq = fx.Int32(0)
-                    for tile in range(
-                        (bound + INDEX_KEYS_PER_TASK - 1)
-                        // INDEX_KEYS_PER_TASK
-                    ):
-                        key, logical, valid = score_key(tile)
-                        flag = valid & (key == threshold)
-                        offset, tile_total = scan_flag(flag)
-                        if flag & (out_eq + offset < need_eq):
-                            slot = out_gt + out_eq + offset
-                            lds_st(sort_keys, slot, fx.Int32(key))
-                            lds_st(sort_logical, slot, logical)
-                        out_eq = out_eq + tile_total
-                        gpu.barrier()
+                    if long_context:
+                        for tile in range(
+                            (
+                                bound
+                                + INDEX_KEYS_PER_TASK
+                                - 1
+                            )
+                            // INDEX_KEYS_PER_TASK
+                        ):
+                            key, logical, valid = score_key(tile)
+                            flag = valid & (key == threshold)
+                            offset, tile_total = scan_flag(flag)
+                            if flag & (
+                                out_eq + offset < need_eq
+                            ):
+                                slot = out_gt + out_eq + offset
+                                lds_st(
+                                    sort_keys,
+                                    slot,
+                                    fx.Int32(key),
+                                )
+                                lds_st(
+                                    sort_logical,
+                                    slot,
+                                    logical,
+                                )
+                            out_eq = out_eq + tile_total
+                            gpu.barrier()
 
                     selected_count = fx.min(fx.Int32(topk), bound)
                     # Sort only the bounded selected set.  Invalid tail entries stay
@@ -2271,72 +2425,90 @@ def build_glm5_monokernel(
                                 sort_stride = 1 << (
                                     sort_log_size - reverse_stage - 1
                                 )
-                                for batch in range_constexpr(
-                                    (topk // 2 + THREADS - 1) // THREADS
-                                ):
-                                    pair = tid + batch * THREADS
-                                    if pair < topk // 2:
-                                        i = (
-                                            (pair // sort_stride)
-                                            * (sort_stride * 2)
-                                            + pair % sort_stride
-                                        )
-                                        partner = i + sort_stride
-                                        key_a = fx.Uint32(lds_ld(sort_keys, i))
-                                        key_b = fx.Uint32(
-                                            lds_ld(sort_keys, partner)
-                                        )
-                                        logical_a = lds_ld(sort_logical, i)
-                                        logical_b = lds_ld(
-                                            sort_logical, partner
-                                        )
-                                        valid_a = logical_a >= 0
-                                        valid_b = logical_b >= 0
-                                        a_before_b = valid_a & (
-                                            (~valid_b)
-                                            | (key_a > key_b)
-                                            | (
-                                                (key_a == key_b)
-                                                & (logical_a < logical_b)
+                                if long_context:
+                                    for batch in range_constexpr(
+                                        (topk // 2 + THREADS - 1) // THREADS
+                                    ):
+                                        pair = tid + batch * THREADS
+                                        if pair < topk // 2:
+                                            i = (
+                                                (pair // sort_stride)
+                                                * (sort_stride * 2)
+                                                + pair % sort_stride
                                             )
-                                        )
-                                        b_before_a = valid_b & (
-                                            (~valid_a)
-                                            | (key_b > key_a)
-                                            | (
-                                                (key_a == key_b)
-                                                & (logical_b < logical_a)
+                                            partner = i + sort_stride
+                                            key_a = fx.Uint32(
+                                                lds_ld(sort_keys, i)
                                             )
-                                        )
-                                        want_before = (
-                                            i & sort_size
-                                        ) == 0
-                                        swap = (
-                                            want_before & b_before_a
-                                        ) | ((~want_before) & a_before_b)
-                                        if swap:
-                                            lds_st(sort_keys, i, fx.Int32(key_b))
-                                            lds_st(
-                                                sort_keys,
-                                                partner,
-                                                fx.Int32(key_a),
+                                            key_b = fx.Uint32(
+                                                lds_ld(sort_keys, partner)
                                             )
-                                            lds_st(
-                                                sort_logical, i, logical_b
+                                            logical_a = lds_ld(
+                                                sort_logical, i
                                             )
-                                            lds_st(
-                                                sort_logical,
-                                                partner,
-                                                logical_a,
+                                            logical_b = lds_ld(
+                                                sort_logical, partner
                                             )
-                                gpu.barrier()
+                                            valid_a = logical_a >= 0
+                                            valid_b = logical_b >= 0
+                                            a_before_b = valid_a & (
+                                                (~valid_b)
+                                                | (key_a > key_b)
+                                                | (
+                                                    (key_a == key_b)
+                                                    & (logical_a < logical_b)
+                                                )
+                                            )
+                                            b_before_a = valid_b & (
+                                                (~valid_a)
+                                                | (key_b > key_a)
+                                                | (
+                                                    (key_a == key_b)
+                                                    & (logical_b < logical_a)
+                                                )
+                                            )
+                                            want_before = (
+                                                i & sort_size
+                                            ) == 0
+                                            swap = (
+                                                want_before & b_before_a
+                                            ) | (
+                                                (~want_before) & a_before_b
+                                            )
+                                            if swap:
+                                                lds_st(
+                                                    sort_keys,
+                                                    i,
+                                                    fx.Int32(key_b),
+                                                )
+                                                lds_st(
+                                                    sort_keys,
+                                                    partner,
+                                                    fx.Int32(key_a),
+                                                )
+                                                lds_st(
+                                                    sort_logical,
+                                                    i,
+                                                    logical_b,
+                                                )
+                                                lds_st(
+                                                    sort_logical,
+                                                    partner,
+                                                    logical_a,
+                                                )
+                                    gpu.barrier()
 
                     for batch in range_constexpr(
                         (topk + THREADS - 1) // THREADS
                     ):
                         j = tid + batch * THREADS
                         if j < selected_count:
-                            logical = lds_ld(sort_logical, j)
+                            # Below top-k the baseline sees every visible token.
+                            # Publish logical order directly; long rows retain the
+                            # exact score/tie-break order from the stable selector.
+                            logical = j
+                            if long_context:
+                                logical = lds_ld(sort_logical, j)
                             selected = logical_physical_slot(s, logical)
                             bo.buffer_store(
                                 fx.Int32(selected),
