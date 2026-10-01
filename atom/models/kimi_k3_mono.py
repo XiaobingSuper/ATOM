@@ -86,6 +86,24 @@ def _kda_state_dtype(model, fwd) -> torch.dtype | None:
     return None
 
 
+def _mla_cache_descale(layer, cache: torch.Tensor) -> torch.Tensor:
+    """Bind the device scalar owned by the production attention implementation."""
+
+    scale = layer.self_attn.attn.impl._k_scale_device
+    if (
+        not isinstance(scale, torch.Tensor)
+        or scale.dtype is not torch.float32
+        or scale.numel() != 1
+        or not scale.is_contiguous()
+        or scale.device != cache.device
+    ):
+        raise ValueError(
+            "Kimi MLA cache descale must be one contiguous FP32 scalar "
+            "on the cache device"
+        )
+    return scale
+
+
 def _split_kv_b(
     weight: torch.Tensor,
     *,
@@ -600,7 +618,7 @@ class KimiMonoDecode:
                     cache = fwd.kv_cache_data[
                         f"layer_{layer.layer_idx}"
                     ].k_cache
-                    scale = layer.self_attn.attn._k_scale
+                    scale = _mla_cache_descale(layer, cache)
                     from atom.model_ops.monokernel.k3.mla_cache import (
                         validate_fp8_mla_cache,
                     )
@@ -936,12 +954,13 @@ class KimiMonoDecode:
                     attention_metadata.block_tables,
                 )
                 attn = layer.self_attn
+                scale = _mla_cache_descale(layer, cache.k_cache)
                 hidden = owned.op.forward(
                     hidden,
                     blocks,
                     runtime,
                     cache.k_cache,
-                    attn.attn._k_scale,
+                    scale,
                     attn.rotary_emb.cos_cache,
                     attn.rotary_emb.sin_cache,
                     epoch_layer=layer.layer_idx,

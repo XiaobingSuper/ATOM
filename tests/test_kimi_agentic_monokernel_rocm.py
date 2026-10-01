@@ -415,15 +415,21 @@ def _check_moe_and_tp_output(op, rows, output):
     import torch
     import torch.distributed as dist
 
-    from atom.model_ops.monokernel.k3.kernel import monokernel_layout
+    if hasattr(op, "monokernel_scratch"):
+        from atom.model_ops.monokernel.k3.mla_full_kernel import mla_full_layout
 
-    layout = monokernel_layout(
-        rows,
-        fuse_attn_res=True,
-        fuse_moe=True,
-        mtp=True,
-    )
-    scratch = op.attention.monokernel_scratch
+        layout = mla_full_layout(rows)
+        scratch = op.monokernel_scratch
+    else:
+        from atom.model_ops.monokernel.k3.kernel import monokernel_layout
+
+        layout = monokernel_layout(
+            rows,
+            fuse_attn_res=True,
+            fuse_moe=True,
+            mtp=True,
+        )
+        scratch = op.attention.monokernel_scratch
     regions = (
         ("router", rows * 896 * 4),
         ("shared_mid", rows * 768 * 4),
@@ -444,6 +450,53 @@ def _check_moe_and_tp_output(op, rows, output):
     dist.all_gather(gathered, checksum)
     for peer in gathered[1:]:
         torch.testing.assert_close(peer, gathered[0], atol=1e-2, rtol=1e-5)
+
+
+def _check_mla_attention_reference(
+    op,
+    *,
+    cache,
+    scale,
+    positions,
+    batch_ids,
+    context_lens,
+    block_tables,
+    slot_mapping,
+):
+    import torch
+
+    from atom.model_ops.monokernel.k3.mla_cache import (
+        dense_fp8_paged_mla_reference,
+    )
+    from atom.model_ops.monokernel.k3.mla_full_kernel import mla_full_layout
+
+    rows = positions.numel()
+    heads = op.config.local_heads
+    scratch = op.monokernel_scratch
+    layout = mla_full_layout(rows)
+
+    def fp32(name, count):
+        start = layout[name]
+        return scratch[start : start + count * 4].view(torch.float32)
+
+    q = fp32("mla_q", rows * heads * 192).view(rows, heads, 192)
+    q_latent = fp32("mla_qlat", rows * heads * 512).view(rows, heads, 512)
+    query = torch.cat((q_latent, q[..., 128:]), dim=-1).to(torch.bfloat16)
+    fresh = fp32("mla_fresh", rows * 576).view(rows, 576).to(torch.bfloat16)
+    expected, _ = dense_fp8_paged_mla_reference(
+        query=query,
+        main_cache=cache,
+        main_scale=scale,
+        positions=positions,
+        batch_ids=batch_ids,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        fresh_slots=slot_mapping,
+        fresh_values=fresh,
+        softmax_scale=192**-0.5,
+    )
+    actual = fp32("mla_dense_acc", rows * heads * 512).view(rows, heads, 512)
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
 
 
 def _slot_table(batch, slots, shift, device):
@@ -719,12 +772,12 @@ def _tp8_worker(rank: int, port: int) -> None:
 def _exercise_mla_batch(op, batch, device) -> None:
     import torch
     import torch.distributed as dist
+    from types import SimpleNamespace
 
-    from atom.model_ops.monokernel.abi import AgenticDecodeShape
-    from atom.model_ops.monokernel.k3.abi import (
-        KimiAgenticShape,
-        KimiMlaAgenticRuntime,
-    )
+    from atom.models.kimi_k3_mono import KimiMonoDecode
+    from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
+    from atom.model_ops.monokernel.telemetry import MonoRouteStats
+    from atom.utils.forward_context import get_forward_context
 
     rows = batch * 8
     hidden = op.config.hidden
@@ -742,102 +795,183 @@ def _exercise_mla_batch(op, batch, device) -> None:
         dtype=torch.bfloat16,
         device=device,
     )
-    positions = torch.arange(8, dtype=torch.int64, device=device).repeat(
-        batch
-    )
+    # Eight fresh rows straddle two logical blocks. Older rows are already
+    # resident in a separately permuted physical cache.
+    positions = torch.arange(13, 21, dtype=torch.int64, device=device).repeat(batch)
     batch_ids = torch.arange(
         batch,
         dtype=torch.int32,
         device=device,
     ).repeat_interleave(8)
     physical_blocks = torch.arange(
-        batch - 1,
+        2 * batch - 1,
         -1,
         -1,
         dtype=torch.int32,
         device=device,
     )
-    block_tables = physical_blocks.view(batch, 1).contiguous()
+    block_tables = physical_blocks.view(batch, 2).contiguous()
+    logical_blocks = positions.view(batch, 8).div(16, rounding_mode="floor")
+    offsets = positions.view(batch, 8).remainder(16)
     slot_mapping = (
-        physical_blocks.to(torch.int64).repeat_interleave(8) * 16
-        + positions
-    ).contiguous()
+        block_tables.gather(1, logical_blocks.to(torch.int64)).to(torch.int64) * 16
+        + offsets
+    ).reshape(-1).contiguous()
     context_lens = torch.full(
         (batch,),
-        8,
+        21,
         dtype=torch.int32,
         device=device,
     )
-    shape = KimiAgenticShape(
-        common=AgenticDecodeShape(
-            running_bs=batch,
-            query_len=8,
-            batch_capacity=batch,
-            row_capacity=rows,
-        ),
-        dcp_size=1,
-        replay_ssm=False,
-    )
-    runtime = KimiMlaAgenticRuntime.bind(
-        shape,
-        positions,
-        slot_mapping,
-        batch_ids,
-        context_lens,
-        block_tables,
-    )
     cache = torch.zeros(
-        batch * 16,
+        2 * batch * 16,
         1,
         576,
         dtype=torch.float8_e4m3fn,
         device=device,
     )
+    cache_rows = cache.view(-1, 576)
+    for request in range(batch):
+        for logical_position in range(13):
+            logical_block, offset = divmod(logical_position, 16)
+            physical = int(block_tables[request, logical_block]) * 16 + offset
+            values = (
+                torch.arange(576, device=device, dtype=torch.float32)
+                .remainder(31)
+                .sub(15)
+                .mul((request + 1) / 128)
+            )
+            cache_rows[physical].copy_(values.to(torch.float8_e4m3fn))
     scale = torch.tensor([0.015625], dtype=torch.float32, device=device)
-    rope_cos = torch.ones(rows, 1, 1, 32, device=device)
+    rope_cos = torch.ones(32, 1, 1, 32, device=device)
     rope_sin = torch.zeros_like(rope_cos)
     output = torch.empty_like(prefix)
 
-    op.forward(
-        prefix,
-        blocks,
-        runtime,
-        cache,
-        scale,
-        rope_cos,
-        rope_sin,
-        x_out=output,
+    class PassThroughKda:
+        block_write_idx = 0
+
+        @staticmethod
+        def forward(hidden_states, *_args, **_kwargs):
+            return hidden_states
+
+    kda_layer = SimpleNamespace(
+        layer_idx=0,
+        is_linear_attn=True,
+        block_sparse_moe=object(),
     )
+    mla_layer = SimpleNamespace(
+        layer_idx=1,
+        is_linear_attn=False,
+        block_sparse_moe=object(),
+        self_attn=SimpleNamespace(
+            attn=SimpleNamespace(impl=SimpleNamespace(_k_scale_device=scale)),
+            rotary_emb=SimpleNamespace(cos_cache=rope_cos, sin_cache=rope_sin),
+        ),
+    )
+    model = SimpleNamespace(
+        layers=[kda_layer, mla_layer],
+        start_layer=0,
+        end_layer=2,
+        get_input_embeddings=lambda _ids: pytest.fail("inputs_embeds must be used"),
+        output_attn_res=lambda value, *_args: (value, None),
+    )
+    adapter = object.__new__(KimiMonoDecode)
+    adapter._lm = SimpleNamespace(model=model)
+    adapter._mode = "mono"
+    adapter._enabled = True
+    adapter._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    adapter._stats = MonoRouteStats("kimi_k3_mla_gate")
+    adapter._refused = set()
+    adapter._weights = {}
+    adapter._packed_artifacts = {}
+    adapter._reductions = {}
+    key_kda = (0, rows, "mono", torch.float16, batch)
+    key_mla = (1, rows, "mla_full", torch.float16, batch)
+    adapter._ops = {
+        key_kda: SimpleNamespace(op=PassThroughKda()),
+        key_mla: SimpleNamespace(op=op),
+    }
+    snapshots = torch.arange(rows, dtype=torch.int32, device=device).view(batch, 8)
+    accepted = torch.full((batch,), 8, dtype=torch.int32, device=device)
+    kda_metadata = SimpleNamespace(
+        num_prefills=0,
+        num_decodes=0,
+        num_spec_decodes=batch,
+        num_spec_decode_tokens=rows,
+        num_actual_tokens=rows,
+        replayssm=False,
+        spec_state_indices_tensor=snapshots,
+        num_accepted_tokens=accepted,
+    )
+    metadata = SimpleNamespace(
+        kda_metadata=kda_metadata,
+        slot_mapping=slot_mapping,
+        batch_id_per_q_token=batch_ids,
+        context_lens=context_lens,
+        block_tables=block_tables,
+    )
+    conv = torch.zeros(
+        rows,
+        10,
+        3 * KIMI_K3_CONFIG.local_heads * KIMI_K3_CONFIG.v_dim,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    recurrent = torch.zeros(
+        rows,
+        KIMI_K3_CONFIG.local_heads,
+        KIMI_K3_CONFIG.v_dim,
+        KIMI_K3_CONFIG.v_dim,
+        dtype=torch.float16,
+        device=device,
+    )
+    fwd = get_forward_context()
+    fwd.context = SimpleNamespace(
+        is_prefill=False,
+        running_bs=batch,
+        running_tokens=rows,
+        max_seqlen_q=8,
+    )
+    fwd.ubatch_slices = None
+    fwd.attn_metadata = metadata
+    fwd.kv_cache_data = {
+        "layer_0": SimpleNamespace(k_cache=conv, v_cache=recurrent),
+        "layer_1": SimpleNamespace(k_cache=cache),
+    }
+    input_ids = torch.arange(rows, dtype=torch.int64, device=device)
+    assert adapter.supports(input_ids, positions, None, prefix)
+    # All keys are already populated, but this still exercises the production
+    # atomic prepare path used by supports().
+    assert adapter._prepare(rows, torch.float16, batch)
+    output.copy_(adapter.forward(input_ids, positions, prefix))
     torch.cuda.synchronize(device)
     assert torch.isfinite(output).all() and output.abs().max() > 0
+    _check_mla_attention_reference(
+        op,
+        cache=cache,
+        scale=scale,
+        positions=positions,
+        batch_ids=batch_ids,
+        context_lens=context_lens,
+        block_tables=block_tables,
+        slot_mapping=slot_mapping,
+    )
+    _check_moe_and_tp_output(op, rows, output)
     written = cache.view(-1, 576)[slot_mapping]
     assert (written.view(torch.uint8) != 0).any()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        op.forward(
-            prefix,
-            blocks,
-            runtime,
-            cache,
-            scale,
-            rope_cos,
-            rope_sin,
-            x_out=output,
-        )
+        output.copy_(adapter.forward(input_ids, positions, prefix))
 
+    padded_cache_before = None
     for replay in range(3):
-        eager_output = torch.empty_like(output)
-        op.forward(
-            prefix,
-            blocks,
-            runtime,
-            cache,
-            scale,
-            rope_cos,
-            rope_sin,
-            x_out=eager_output,
-        )
+        eager_output = adapter.forward(input_ids, positions, prefix).clone()
         output.fill_(float("nan"))
         graph.replay()
         torch.cuda.synchronize(device)
@@ -861,14 +995,20 @@ def _exercise_mla_batch(op, batch, device) -> None:
             )
         if rows > 8 and int(batch_ids[-1]) < 0:
             assert torch.count_nonzero(output[-8:]) == 0
+            assert torch.equal(cache, padded_cache_before)
 
         if replay == 1 and rows > 8:
             batch_ids[-8:].fill_(-1)
             slot_mapping[-8:].fill_(-1)
+            padded_cache_before = cache.clone()
         elif replay == 2 and rows > 8:
             batch_ids[-8:].fill_(batch - 1)
             slot_mapping[-8:].copy_(
-                physical_blocks[-1].to(torch.int64) * 16 + positions[-8:]
+                block_tables[-1].gather(
+                    0, positions[-8:].div(16, rounding_mode="floor")
+                ).to(torch.int64)
+                * 16
+                + positions[-8:].remainder(16)
             )
 
 

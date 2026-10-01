@@ -782,6 +782,52 @@ def test_kimi_model_routes_mla_only_in_explicit_mode():
     assert "ReplaySSM" not in source
 
 
+def test_kimi_dense_mla_metadata_publishes_graph_stable_padded_query_map():
+    source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "plugin"
+        / "vllm"
+        / "attention"
+        / "metadata.py"
+    ).read_text()
+
+    dense = source[
+        source.index("class AiterMlaMetadataBuilderForVllm") :
+        source.index("class AiterMlaSparseMetadataBuilder")
+    ]
+    assert "self.batch_id_per_q_token_buffer = torch.full(" in dense
+    assert "batch_ids.fill_(-1)" in dense
+    assert "batch_id_per_q_token=batch_id_per_q_token" in dense
+    assert "slot_mapping = common_attn_metadata.slot_mapping\n" in dense
+
+
+def test_kimi_mla_cache_descale_binds_strict_impl_device_scalar():
+    import torch
+
+    module = _kimi_mono_module()
+    cache = torch.empty(2, 1, 576, dtype=torch.float8_e4m3fn)
+    device_scale = torch.ones(1, dtype=torch.float32)
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(
+            attn=SimpleNamespace(
+                impl=SimpleNamespace(_k_scale_device=device_scale),
+                _k_scale=torch.full((1,), 99.0),
+            )
+        )
+    )
+
+    assert module._mla_cache_descale(layer, cache) is device_scale
+    for invalid in (
+        torch.ones(2, dtype=torch.float32),
+        torch.ones(1, dtype=torch.bfloat16),
+        torch.ones(2, 2, dtype=torch.float32).t()[:1],
+    ):
+        layer.self_attn.attn.impl._k_scale_device = invalid
+        with pytest.raises(ValueError, match="one contiguous FP32 scalar"):
+            module._mla_cache_descale(layer, cache)
+
+
 def test_kimi_mixed_agentic_specs_share_explicit_full_route():
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
