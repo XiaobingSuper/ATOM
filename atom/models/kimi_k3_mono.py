@@ -27,7 +27,6 @@ from atom.model_ops.monokernel.k3.abi import (
     KimiMlaAgenticRuntime,
 )
 from atom.model_ops.monokernel.dispatch import (
-    KIMI_AGENTIC_ROWS,
     KIMI_MLA_AGENTIC_ROWS,
     SAMPLES,
     MonoUnsupported,
@@ -460,17 +459,27 @@ class KimiMonoDecode:
             "decode_context_parallel_size",
             1,
         ) > 1
+        speculative = getattr(self._atom_config, "speculative_config", None)
+        dspark = getattr(speculative, "method", None) == "dspark"
         packed_layers: set[int] = set()
         workspace_buckets = 0
         for layer in model.layers[model.start_layer : model.end_layer]:
             is_kda = bool(getattr(layer, "is_linear_attn", False))
             if is_kda:
-                buckets = tuple((samples, False) for samples in SAMPLES) + tuple(
-                    (samples, True) for samples in KIMI_AGENTIC_ROWS
-                )
+                buckets = tuple((samples, False) for samples in SAMPLES)
+                if dspark:
+                    buckets += tuple(
+                        (samples, True)
+                        for samples in KIMI_MLA_AGENTIC_ROWS
+                    )
             else:
-                buckets = tuple(
-                    (samples, True) for samples in KIMI_MLA_AGENTIC_ROWS
+                buckets = (
+                    tuple(
+                        (samples, True)
+                        for samples in KIMI_MLA_AGENTIC_ROWS
+                    )
+                    if dspark
+                    else ()
                 )
             for samples, mtp in buckets:
                 route = dict(

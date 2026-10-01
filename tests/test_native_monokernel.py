@@ -2557,15 +2557,37 @@ def test_kimi_failed_prepare_preserves_existing_shared_reductions():
     assert runner._reductions == {(4, "staged"): existing}
 
 
-def test_kimi_memory_reserve_tracks_kda_and_all_mla_graph_buckets():
+@pytest.mark.parametrize(
+    ("mode", "spec_method", "expected"),
+    (
+        ("off", "dspark", 0),
+        ("auto", "dspark", 0),
+        (
+            "mono",
+            "eagle",
+            2 * (256 << 20) + (2 * 2) * (32 << 20),
+        ),
+        (
+            "mono",
+            "dspark",
+            4 * (256 << 20) + (2 * 5 + 2 * 3) * (32 << 20),
+        ),
+    ),
+)
+def test_kimi_memory_reserve_matches_selectable_graph_buckets(
+    mode,
+    spec_method,
+    expected,
+):
     module = _kimi_mono_module()
     runner = object.__new__(module.KimiMonoDecode)
-    runner._enabled = True
-    runner._mode = "mono"
+    runner._enabled = mode != "off"
+    runner._mode = mode
     runner._atom_config = SimpleNamespace(
         tensor_parallel_size=8,
         decode_context_parallel_size=1,
         kv_cache_dtype="fp8",
+        speculative_config=SimpleNamespace(method=spec_method),
     )
     layers = [
         SimpleNamespace(
@@ -2593,15 +2615,7 @@ def test_kimi_memory_reserve_tracks_kda_and_all_mla_graph_buckets():
         model=SimpleNamespace(layers=layers, start_layer=0, end_layer=4)
     )
 
-    expected = (
-        4 * (256 << 20)
-        + (2 * 6 + 2 * 3) * (32 << 20)
-    )
     assert runner.memory_reserve_bytes() == expected
-    assert runner.memory_reserve_bytes() > 0
-
-    runner._mode = "auto"
-    assert runner.memory_reserve_bytes() == 0
 
 
 def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():
