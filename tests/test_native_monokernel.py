@@ -2562,21 +2562,46 @@ def test_kimi_memory_reserve_tracks_kda_and_all_mla_graph_buckets():
     runner = object.__new__(module.KimiMonoDecode)
     runner._enabled = True
     runner._mode = "mono"
-    runner._atom_config = SimpleNamespace(kv_cache_dtype="fp8")
+    runner._atom_config = SimpleNamespace(
+        tensor_parallel_size=8,
+        decode_context_parallel_size=1,
+        kv_cache_dtype="fp8",
+    )
     layers = [
-        SimpleNamespace(is_linear_attn=True, block_sparse_moe=object()),
-        SimpleNamespace(is_linear_attn=True, block_sparse_moe=object()),
-        SimpleNamespace(is_linear_attn=False, block_sparse_moe=object()),
-        SimpleNamespace(is_linear_attn=False, block_sparse_moe=object()),
+        SimpleNamespace(
+            layer_idx=0,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=2,
+            is_linear_attn=False,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=3,
+            is_linear_attn=False,
+            block_sparse_moe=object(),
+        ),
     ]
     runner._lm = SimpleNamespace(
         model=SimpleNamespace(layers=layers, start_layer=0, end_layer=4)
     )
 
-    assert runner.memory_reserve_bytes() == (
+    expected = (
         4 * (256 << 20)
         + (2 * 6 + 2 * 3) * (32 << 20)
     )
+    assert runner.memory_reserve_bytes() == expected
+    assert runner.memory_reserve_bytes() > 0
+
+    runner._mode = "auto"
+    assert runner.memory_reserve_bytes() == 0
 
 
 def test_kimi_s4_s8_share_bucket_independent_packed_artifacts():
@@ -2593,6 +2618,7 @@ def test_kimi_default_off_does_not_inspect_runtime_config():
     runner = KimiMonoDecode(None, object(), "off")
     assert runner._enabled is False
     assert runner._ops == {}
+    assert runner.memory_reserve_bytes() == 0
 
 
 @pytest.mark.parametrize(

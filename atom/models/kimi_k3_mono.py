@@ -27,6 +27,9 @@ from atom.model_ops.monokernel.k3.abi import (
     KimiMlaAgenticRuntime,
 )
 from atom.model_ops.monokernel.dispatch import (
+    KIMI_AGENTIC_ROWS,
+    KIMI_MLA_AGENTIC_ROWS,
+    SAMPLES,
     MonoUnsupported,
     select_backend,
     tp_uniform_local_validation,
@@ -42,8 +45,6 @@ from atom.utils.forward_context import get_forward_context
 
 logger = logging.getLogger("atom")
 
-_KDA_NATIVE_BUCKETS = 6  # ordinary S4/S8 plus Agentic B1/B2/B4/B8 q=8
-_MLA_NATIVE_BUCKETS = 3  # Agentic B1/B2/B4 q=8
 # Immutable projections/MoE weights are shared by S4/S8. Each bucket retains
 # only graph-stable activation/scratch workspaces.
 _PACKED_RESERVE_PER_LAYER = 256 << 20
@@ -449,32 +450,53 @@ class KimiMonoDecode:
             self._reductions.pop(key)
 
     def memory_reserve_bytes(self) -> int:
-        """Reserve KV-budget headroom for every lazy native graph bucket."""
+        """Reserve headroom only for full-layer routes this mode can select."""
 
-        if not self._enabled:
+        if not self._enabled or self._mode != "mono":
             return 0
         model = self._lm.model
-        layers = [
-            layer
-            for layer in model.layers[model.start_layer : model.end_layer]
-            if hasattr(layer, "block_sparse_moe")
-        ]
-        kda_layers = sum(
-            bool(getattr(layer, "is_linear_attn", False)) for layer in layers
-        )
-        mla_layers = (
-            len(layers) - kda_layers
-            if self._mode == "mono"
-            and self._atom_config.kv_cache_dtype == "fp8"
-            else 0
-        )
+        dcp = getattr(
+            self._atom_config,
+            "decode_context_parallel_size",
+            1,
+        ) > 1
+        packed_layers: set[int] = set()
+        workspace_buckets = 0
+        for layer in model.layers[model.start_layer : model.end_layer]:
+            is_kda = bool(getattr(layer, "is_linear_attn", False))
+            if is_kda:
+                buckets = tuple((samples, False) for samples in SAMPLES) + tuple(
+                    (samples, True) for samples in KIMI_AGENTIC_ROWS
+                )
+            else:
+                buckets = tuple(
+                    (samples, True) for samples in KIMI_MLA_AGENTIC_ROWS
+                )
+            for samples, mtp in buckets:
+                route = dict(
+                    samples=samples,
+                    tp_size=self._atom_config.tensor_parallel_size,
+                    kv_cache_dtype=self._atom_config.kv_cache_dtype,
+                    mtp=mtp,
+                    dcp=dcp,
+                    query_len=8 if mtp else 1,
+                    is_kda=is_kda,
+                    has_moe=hasattr(layer, "block_sparse_moe"),
+                )
+                if not is_kda:
+                    route.update(
+                        external_indexer=False,
+                        cache_layout="atom_fp8",
+                        segment="mla_layer",
+                        replay_ssm=False,
+                    )
+                backend = select_backend("kimi_k3", self._mode, **route)
+                if backend in {"mono", "mla_full"}:
+                    packed_layers.add(layer.layer_idx)
+                    workspace_buckets += 1
         return (
-            (kda_layers + mla_layers) * _PACKED_RESERVE_PER_LAYER
-            + (
-                kda_layers * _KDA_NATIVE_BUCKETS
-                + mla_layers * _MLA_NATIVE_BUCKETS
-            )
-            * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
+            len(packed_layers) * _PACKED_RESERVE_PER_LAYER
+            + workspace_buckets * _WORKSPACE_RESERVE_PER_LAYER_BUCKET
         )
 
     def supports(self, input_ids, positions, intermediate_tensors, inputs_embeds) -> bool:
