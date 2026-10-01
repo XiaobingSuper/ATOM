@@ -668,6 +668,64 @@ def test_kimi_full_agentic_dispatch_is_explicit_mono_only(batch_capacity):
     )
 
 
+@pytest.mark.parametrize("rows", (8, 16, 32))
+def test_kimi_mla_full_dispatch_is_index_free_fp8_mono_only(rows):
+    common = dict(
+        samples=rows,
+        query_len=8,
+        tp_size=8,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        dcp=False,
+        replay_ssm=False,
+        is_kda=False,
+        has_moe=True,
+        external_indexer=False,
+        cache_layout="atom_fp8",
+        segment="mla_layer",
+    )
+
+    assert select_backend("kimi_k3", "mono", **common) == "mla_full"
+    assert select_backend("kimi_k3", "auto", **common) is None
+    assert select_backend("kimi_k3", "staged", **common) is None
+
+
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"samples": 64},
+        {"query_len": 4},
+        {"tp_size": 4},
+        {"kv_cache_dtype": "bf16"},
+        {"dcp": True},
+        {"replay_ssm": True},
+        {"is_kda": True},
+        {"has_moe": False},
+        {"external_indexer": True},
+        {"cache_layout": "atom"},
+    ),
+)
+def test_kimi_mla_full_dispatch_rejects_non_recipe_contract(override):
+    args = dict(
+        model="kimi_k3",
+        mode="mono",
+        samples=8,
+        query_len=8,
+        tp_size=8,
+        kv_cache_dtype="fp8",
+        mtp=True,
+        dcp=False,
+        replay_ssm=False,
+        is_kda=False,
+        has_moe=True,
+        external_indexer=False,
+        cache_layout="atom_fp8",
+        segment="mla_layer",
+    )
+    args.update(override)
+    assert select_backend(**args) is None
+
+
 @pytest.mark.parametrize(("rows", "mtp", "dcp"), ((48, True, False), (80, True, True)))
 def test_glm_agentic_selects_moe_stage_for_flattened_rows(rows, mtp, dcp):
     common = dict(

@@ -1528,6 +1528,199 @@ def test_kimi_full_monokernel_rejects_dcp_and_replayssm():
         )
 
 
+@pytest.mark.parametrize("batch_capacity", (1, 2, 4))
+def test_kimi_mla_q8_runtime_binds_graph_stable_dense_metadata(batch_capacity):
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticShape,
+        KimiMlaAgenticRuntime,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=batch_capacity,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    rows = batch_capacity * 8
+    positions = torch.arange(rows, dtype=torch.int64)
+    slots = (positions * 37).remainder(16 * 13)
+    batch_ids = torch.arange(rows, dtype=torch.int32) // 8
+    context_lens = torch.arange(
+        1,
+        batch_capacity + 1,
+        dtype=torch.int32,
+    ) * 17
+    blocks = torch.arange(batch_capacity * 3, dtype=torch.int32).view(
+        batch_capacity,
+        3,
+    ).flip(1)
+
+    runtime = KimiMlaAgenticRuntime.bind(
+        shape,
+        positions,
+        slots,
+        batch_ids,
+        context_lens,
+        blocks,
+    )
+
+    assert runtime.positions.data_ptr() == positions.data_ptr()
+    assert runtime.slot_mapping.data_ptr() == slots.data_ptr()
+    assert runtime.batch_ids.data_ptr() == batch_ids.data_ptr()
+    assert runtime.context_lens.data_ptr() == context_lens.data_ptr()
+    assert runtime.block_tables.data_ptr() == blocks.data_ptr()
+
+
+def test_kimi_mla_dense_visibility_uses_arbitrary_physical_blocks():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticShape,
+        KimiMlaAgenticRuntime,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=2,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    positions = torch.tensor(
+        [7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23],
+        dtype=torch.int64,
+    )
+    block_tables = torch.tensor(
+        [[11, 3], [7, 19]],
+        dtype=torch.int32,
+    )
+    runtime = KimiMlaAgenticRuntime.bind(
+        shape,
+        positions,
+        torch.arange(16, dtype=torch.int64),
+        torch.arange(16, dtype=torch.int32) // 8,
+        torch.tensor([15, 24], dtype=torch.int32),
+        block_tables,
+    )
+
+    assert runtime.visible_physical_slots(0) == [
+        *range(11 * 16, 11 * 16 + 8),
+    ]
+    assert runtime.visible_physical_slots(8) == [
+        *range(7 * 16, 7 * 16 + 16),
+        19 * 16,
+    ]
+
+
+def test_kimi_mla_padding_rows_do_not_write_or_attend():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticShape,
+        KimiMlaAgenticRuntime,
+    )
+
+    shape = KimiAgenticShape.for_graph(
+        batch_capacity=1,
+        query_len=8,
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    batch_ids = torch.tensor([0, 0, 0, -1, -1, -1, -1, -1], dtype=torch.int32)
+    runtime = KimiMlaAgenticRuntime.bind(
+        shape,
+        torch.arange(8, dtype=torch.int64),
+        torch.tensor([17, 18, 19, -1, -1, -1, -1, -1], dtype=torch.int64),
+        batch_ids,
+        torch.tensor([3], dtype=torch.int32),
+        torch.tensor([[5]], dtype=torch.int32),
+    )
+
+    assert runtime.cache_writers().tolist() == [True, True, True, False, False, False, False, False]
+    assert runtime.visible_physical_slots(3) == []
+
+
+def test_kimi_mla_fp8_scatter_uses_physical_slots_and_skips_padding():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.mla_cache import publish_fp8_mla_rows
+
+    cache = torch.zeros(64, 1, 576, dtype=torch.float8_e4m3fn)
+    scale = torch.tensor([0.25], dtype=torch.float32)
+    values = torch.stack(
+        (
+            torch.linspace(-8, 8, 576, dtype=torch.bfloat16),
+            torch.ones(576, dtype=torch.bfloat16),
+            torch.full((576,), 9, dtype=torch.bfloat16),
+        )
+    )
+
+    publish_fp8_mla_rows(
+        cache,
+        scale,
+        slot_mapping=torch.tensor([48, 17, -1], dtype=torch.int64),
+        batch_ids=torch.tensor([0, 1, -1], dtype=torch.int32),
+        values=values,
+    )
+
+    expected0 = (
+        (values[0].float() / scale)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    expected1 = (
+        (values[1].float() / scale)
+        .clamp(-448, 448)
+        .to(torch.float8_e4m3fn)
+        .view(torch.uint8)
+    )
+    storage = cache.view(torch.uint8).view(64, 576)
+    assert torch.equal(storage[48], expected0)
+    assert torch.equal(storage[17], expected1)
+    assert torch.count_nonzero(storage[0]) == 0
+    assert scale.item() == 0.25
+
+
+def test_kimi_mla_fp8_dense_reference_consumes_fresh_same_launch_rows():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.mla_cache import (
+        dense_fp8_paged_mla_reference,
+    )
+
+    cache = torch.zeros(32, 1, 576, dtype=torch.float8_e4m3fn)
+    cache[16, 0, :512] = 4
+    query = torch.zeros(2, 1, 576, dtype=torch.bfloat16)
+    fresh = torch.zeros(1, 576, dtype=torch.bfloat16)
+    fresh[0, :512] = 2
+
+    output, lse = dense_fp8_paged_mla_reference(
+        query=query,
+        main_cache=cache,
+        main_scale=torch.ones(1, dtype=torch.float32),
+        positions=torch.tensor([16, 17], dtype=torch.int64),
+        batch_ids=torch.tensor([0, -1], dtype=torch.int32),
+        context_lens=torch.tensor([17], dtype=torch.int32),
+        block_tables=torch.tensor([[0, 1]], dtype=torch.int32),
+        fresh_slots=torch.tensor([16], dtype=torch.int64),
+        fresh_values=fresh,
+        softmax_scale=1.0,
+    )
+
+    assert torch.equal(output[0], torch.full_like(output[0], 2.0 / 17.0))
+    assert torch.equal(output[1], torch.zeros_like(output[1]))
+    assert torch.isfinite(lse[0]).all()
+    assert torch.isneginf(lse[1]).all()
+
+
+def test_kimi_mla_fp8_cache_rejects_indexer_storage():
+    torch = pytest.importorskip("torch")
+    from atom.model_ops.monokernel.k3.mla_cache import validate_fp8_mla_cache
+
+    cache = torch.empty(32, 1, 576, dtype=torch.float8_e4m3fn)
+    scale = torch.ones(1, dtype=torch.float32)
+    assert validate_fp8_mla_cache(cache, scale) == 32
+    with pytest.raises(TypeError, match="index"):
+        validate_fp8_mla_cache(cache, scale, index_cache=torch.empty(1))
+
+
 @pytest.mark.parametrize("batch_capacity", (1, 2, 4, 8))
 def test_kimi_agentic_q8_uses_fp16_batch_snapshot_abi(batch_capacity):
     torch = pytest.importorskip("torch")

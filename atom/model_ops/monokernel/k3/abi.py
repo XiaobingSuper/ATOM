@@ -141,4 +141,122 @@ class KimiAgenticRuntime:
         return reads, final
 
 
-__all__ = ["KimiAgenticRuntime", "KimiAgenticShape"]
+@dataclass(frozen=True)
+class KimiMlaAgenticRuntime:
+    """Graph-stable dense MLA metadata for one TP8 q=8 layer launch.
+
+    ``batch_ids`` distinguishes live query rows from graph padding. Physical
+    writes use ``slot_mapping`` while reads map each request-local logical
+    position through ``block_tables``. Kimi has no sparse-index input.
+    """
+
+    shape: KimiAgenticShape
+    positions: torch.Tensor
+    slot_mapping: torch.Tensor
+    batch_ids: torch.Tensor
+    context_lens: torch.Tensor
+    block_tables: torch.Tensor
+
+    @classmethod
+    def bind(
+        cls,
+        shape: KimiAgenticShape,
+        positions: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        batch_ids: torch.Tensor,
+        context_lens: torch.Tensor,
+        block_tables: torch.Tensor,
+    ) -> "KimiMlaAgenticRuntime":
+        batch = shape.common.batch_capacity
+        rows = shape.common.row_capacity
+        if batch not in (1, 2, 4):
+            raise ValueError("Kimi MLA graph buckets support B1/B2/B4 q=8")
+        for name, value, dtype in (
+            ("positions", positions, torch.int64),
+            ("slot_mapping", slot_mapping, torch.int64),
+            ("batch_ids", batch_ids, torch.int32),
+        ):
+            if (
+                value.shape != (rows,)
+                or value.dtype is not dtype
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {dtype} [{rows}]"
+                )
+        if (
+            context_lens.shape != (batch,)
+            or context_lens.dtype is not torch.int32
+            or not context_lens.is_contiguous()
+        ):
+            raise ValueError(
+                f"context_lens must be contiguous int32 [{batch}]"
+            )
+        if (
+            block_tables.ndim != 2
+            or block_tables.shape[0] != batch
+            or block_tables.shape[1] <= 0
+            or block_tables.dtype is not torch.int32
+            or not block_tables.is_contiguous()
+        ):
+            raise ValueError(
+                "block_tables must be contiguous int32 "
+                f"[{batch}, physical_blocks]"
+            )
+        tensors = (
+            positions,
+            slot_mapping,
+            batch_ids,
+            context_lens,
+            block_tables,
+        )
+        if any(value.device != positions.device for value in tensors[1:]):
+            raise ValueError("Kimi MLA metadata must use one device")
+        return cls(
+            shape,
+            positions,
+            slot_mapping,
+            batch_ids,
+            context_lens,
+            block_tables,
+        )
+
+    def cache_writers(self) -> torch.Tensor:
+        """Rows that may scatter their newly projected latent to cache."""
+
+        return (self.batch_ids >= 0) & (self.slot_mapping >= 0)
+
+    def visible_physical_slots(self, row: int) -> list[int]:
+        """Reference physical cache rows visible to one causal query."""
+
+        if not 0 <= row < self.shape.common.row_capacity:
+            raise ValueError(f"row {row} is outside the graph bucket")
+        batch_id = int(self.batch_ids[row])
+        if batch_id < 0:
+            return []
+        if batch_id >= self.shape.common.batch_capacity:
+            raise ValueError(f"batch id {batch_id} is outside the graph bucket")
+        position = int(self.positions[row])
+        context = int(self.context_lens[batch_id])
+        if position < 0 or context < 0:
+            raise ValueError("positions and context lengths must be non-negative")
+        visible = min(context, position + 1)
+        from atom.model_ops.monokernel.k3.mla_cache import (
+            logical_to_physical_slot,
+        )
+
+        return [
+            logical_to_physical_slot(
+                self.block_tables,
+                batch_id=batch_id,
+                position=logical,
+            )
+            for logical in range(visible)
+        ]
+
+
+__all__ = [
+    "KimiAgenticRuntime",
+    "KimiAgenticShape",
+    "KimiMlaAgenticRuntime",
+]

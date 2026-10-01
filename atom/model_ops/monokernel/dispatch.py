@@ -9,6 +9,7 @@ MODES = ("off", "auto", "mono", "staged")
 SAMPLES = (4, 8)
 GLM52_AGENTIC_ROWS = (5, 6, 10, 12, 20, 24, 40, 48, 60, 72, 80, 96, 100)
 KIMI_AGENTIC_ROWS = (8, 16, 32, 64)
+KIMI_MLA_AGENTIC_ROWS = (8, 16, 32)
 
 
 class MonoUnsupported(Exception):
@@ -108,6 +109,27 @@ def select_backend(
             and cache_layout == "atom_fp8"
         ):
             return "agentic_full"
+        return None
+    if model == "kimi_k3" and segment == "mla_layer":
+        if (
+            mode == "mono"
+            and native
+            and decode
+            and samples in KIMI_MLA_AGENTIC_ROWS
+            and query_len == 8
+            and tp_size == 8
+            and kv_cache_dtype == "fp8"
+            and mtp
+            and not dpa
+            and not dcp
+            and not plugin
+            and not replay_ssm
+            and not is_kda
+            and has_moe
+            and not external_indexer
+            and cache_layout == "atom_fp8"
+        ):
+            return "mla_full"
         return None
     if model == "kimi_k3" and mtp:
         if (
