@@ -38,6 +38,7 @@ from atom.model_ops.monokernel.config import (
 from atom.model_ops.monokernel.layout import CM_DEV, CM_SYS
 from atom.model_ops.monokernel.ops import (
     exp,
+    fp8_to_bf16x8,
     mxfp4_to_bf16x8,
     mxfp8_to_bf16x8,
     rcp,
@@ -91,6 +92,13 @@ _ROUTED_HIDDEN = 3584
 _INTER = 384
 _SHARED_INTER = 768
 _HIDDEN_SHARD = _HIDDEN // 8
+_MLA_Q_LORA = 1536
+_MLA_KV_LORA = 512
+_MLA_PE = 64
+_MLA_Q_HEAD = 192
+_MLA_CACHE_ROW = _MLA_KV_LORA + _MLA_PE
+_MLA_VALUE_CHUNKS = _MLA_KV_LORA // _WAVE_SIZE
+_MLA_NORM_EPS = 1.0e-6
 
 
 def monokernel_layout(
@@ -99,10 +107,15 @@ def monokernel_layout(
     fuse_attn_res: bool = False,
     fuse_moe: bool = False,
     mtp: bool = False,
+    mla: bool = False,
 ) -> dict[str, int]:
     """Return byte offsets for the MonoKernel's tagged mailboxes."""
 
-    supported = {1, 2, 4, 8, 16, 32, 64} if mtp else {1, 2, 4, 8}
+    supported = (
+        {8, 16, 32}
+        if mla
+        else ({1, 2, 4, 8, 16, 32, 64} if mtp else {1, 2, 4, 8})
+    )
     if samples not in supported:
         raise ValueError(
             f"samples must be one of {sorted(supported)}, got {samples}"
@@ -136,7 +149,7 @@ def monokernel_layout(
     offsets["input"] = offset
     offset += samples * _FUSED_PAD * 4
     offsets["norm"] = offset
-    offset += samples * _PROJECTION * (4 if mtp else 2)
+    offset += samples * _PROJECTION * (4 if (mtp or mla) else 2)
     if mtp:
         offsets["norm_packed"] = offset
         offset += samples * _PROJECTION * 2
@@ -183,6 +196,18 @@ def monokernel_layout(
         offset += (samples // 8) * _HEADS * _HEAD_DIM * _HEAD_DIM * 4
         offsets["mtp_norm_ready"] = offset
         offset += samples * _HEADS * 8
+    if mla:
+        for name, elements, element_bytes in (
+            ("mla_qkv", samples * (_MLA_Q_LORA + _MLA_CACHE_ROW), 4),
+            ("mla_qnorm", samples * _MLA_Q_LORA, 4),
+            ("mla_q", samples * _HEADS * _MLA_Q_HEAD, 4),
+            ("mla_fresh", samples * _MLA_CACHE_ROW, 4),
+            ("mla_qlat", samples * _HEADS * _MLA_KV_LORA, 4),
+            ("mla_dense_acc", samples * _HEADS * _MLA_KV_LORA, 4),
+            ("mla_gate", samples * _PROJECTION, 4),
+        ):
+            offsets[name] = offset
+            offset += elements * element_bytes
     offsets["_bytes"] = offset
     return offsets
 
@@ -193,6 +218,7 @@ def monokernel_scratch_nbytes(
     fuse_attn_res: bool = False,
     fuse_moe: bool = False,
     mtp: bool = False,
+    mla: bool = False,
 ) -> int:
     """Bytes required by tagged BF16-pair projection mailboxes."""
 
@@ -201,6 +227,7 @@ def monokernel_scratch_nbytes(
         fuse_attn_res=fuse_attn_res,
         fuse_moe=fuse_moe,
         mtp=mtp,
+        mla=mla,
     )["_bytes"]
 
 
@@ -217,10 +244,22 @@ def build_kimi_k3_monokernel(
     state_dtype: torch.dtype = torch.float32,
     conv_state_layout: ConvStateLayout = ConvStateLayout.CHANNEL_MAJOR,
     atom_expert_layout: bool = False,
+    mla: bool = False,
 ):
     """Build the fixed-shape single-launch Kimi-K3 decode MonoKernel."""
 
-    if agentic_batch_size:
+    if mla:
+        if (
+            samples not in (8, 16, 32)
+            or agentic_batch_size
+            or mtp
+            or state_dtype is not torch.float32
+        ):
+            raise ValueError(
+                "Kimi dense MLA MonoKernel requires rows in {8,16,32} "
+                "without KDA recurrent state"
+            )
+    elif agentic_batch_size:
         if (
             agentic_batch_size not in (1, 2, 4, 8)
             or not mtp
@@ -292,7 +331,9 @@ def build_kimi_k3_monokernel(
     moe_ready_offset = moe_mailbox_offset + samples * _HIDDEN * 2 if fuse_attn_res else 0
     input_mailbox_offset = moe_ready_offset + samples * _ATTN_RES_CTAS * 8 if fuse_attn_res else 0
     norm_mailbox_offset = input_mailbox_offset + samples * _FUSED_PAD * 4
-    norm_packed_offset = norm_mailbox_offset + samples * _PROJECTION * (4 if mtp else 2)
+    norm_packed_offset = norm_mailbox_offset + samples * _PROJECTION * (
+        4 if (mtp or mla) else 2
+    )
     norm_ready_offset = norm_packed_offset + (samples * _PROJECTION * 2 if mtp else 0)
     attention_mailbox_offset = norm_ready_offset + samples * _HEADS * 8
     pre_stats_offset = attention_mailbox_offset + samples * _HIDDEN * 4
@@ -317,12 +358,20 @@ def build_kimi_k3_monokernel(
         fuse_attn_res=fuse_attn_res,
         fuse_moe=fuse_moe,
         mtp=mtp,
+        mla=mla,
     )
     mtp_qkvg_offset = layout.get("mtp_qkvg", 0)
     mtp_conv_ready_offset = layout.get("mtp_conv_ready", 0)
     mtp_state_ready_offset = layout.get("mtp_state_ready", 0)
     mtp_state_handoff_offset = layout.get("mtp_state_handoff", 0)
     mtp_norm_ready_offset = layout.get("mtp_norm_ready", 0)
+    mla_qkv_offset = layout.get("mla_qkv", 0)
+    mla_qnorm_offset = layout.get("mla_qnorm", 0)
+    mla_q_offset = layout.get("mla_q", 0)
+    mla_fresh_offset = layout.get("mla_fresh", 0)
+    mla_qlat_offset = layout.get("mla_qlat", 0)
+    mla_dense_acc_offset = layout.get("mla_dense_acc", 0)
+    mla_gate_offset = layout.get("mla_gate", 0)
     max_pairs = samples * _HIDDEN // 2
     slot_bytes = npes * max_pairs * 8
 
@@ -403,6 +452,23 @@ def build_kimi_k3_monokernel(
         peers: Int64,
         step: Int64,
         timeline: Int64,
+        mla_positions: Int64,
+        mla_slot_mapping: Int64,
+        mla_batch_ids: Int64,
+        mla_context_lens: Int64,
+        mla_block_tables: Int64,
+        mla_block_table_stride: Int32,
+        mla_cache: Int64,
+        mla_cache_scale: Int64,
+        mla_rope_cos: Int64,
+        mla_rope_sin: Int64,
+        mla_qkv_weight: Int64,
+        mla_q_norm: Int64,
+        mla_kv_norm: Int64,
+        mla_q_b_weight: Int64,
+        mla_uk_weight: Int64,
+        mla_uv_weight: Int64,
+        mla_gate_weight: Int64,
         rank: Int32,
         layer: Int32,
     ):
@@ -482,6 +548,13 @@ def build_kimi_k3_monokernel(
         routed_mailbox_rsrc = rsrc(scratch + fx.Int64(routed_offset))
         routed_stats_rsrc = rsrc(scratch + fx.Int64(routed_stats_offset))
         routed_inv_rsrc = rsrc(scratch + fx.Int64(routed_inv_offset))
+        mla_qkv_rsrc = rsrc(scratch + fx.Int64(mla_qkv_offset))
+        mla_qnorm_rsrc = rsrc(scratch + fx.Int64(mla_qnorm_offset))
+        mla_q_rsrc = rsrc(scratch + fx.Int64(mla_q_offset))
+        mla_fresh_rsrc = rsrc(scratch + fx.Int64(mla_fresh_offset))
+        mla_qlat_rsrc = rsrc(scratch + fx.Int64(mla_qlat_offset))
+        mla_dense_acc_rsrc = rsrc(scratch + fx.Int64(mla_dense_acc_offset))
+        mla_gate_rsrc = rsrc(scratch + fx.Int64(mla_gate_offset))
 
         step_value = uniform(bo.buffer_load(rsrc(step), 0, vec_width=1, dtype=T.i32))
         tag = step_value * launches_per_step + layer + 1
@@ -689,6 +762,17 @@ def build_kimi_k3_monokernel(
                 pair,
                 cache_modifier=CM_DEV,
             )
+
+        def pair_values(mailbox_rsrc, pair):
+            packed = load_pair(mailbox_rsrc, pair)
+            return (
+                (packed << 16).bitcast(fx.Float32),
+                (packed & fx.Int32(-65536)).bitcast(fx.Float32),
+            )
+
+        def tagged_bf16(mailbox_rsrc, index):
+            low, high = pair_values(mailbox_rsrc, index // 2)
+            return (index % 2 == 0).select(low, high)
 
         def load_raw_f32(mailbox_rsrc, index):
             return fx.Int32(
@@ -1230,23 +1314,24 @@ def build_kimi_k3_monokernel(
 
         def stage_norm(sample_base, sample_count):
             ready_count = sample_count * _HEADS
-            for ready_round in range_constexpr((ready_count + _THREADS - 1) // _THREADS):
-                ready = tid + ready_round * _THREADS
-                if ready < ready_count:
-                    if const_expr(mtp):
-                        local_sample = ready // _HEADS
-                        head = ready % _HEADS
-                        load_i32(
-                            mtp_norm_ready_rsrc,
-                            (sample_base + local_sample) * _HEADS + head,
-                        )
-                    else:
-                        local_sample = ready // _HEADS
-                        head = ready % _HEADS
-                        load_i32(
-                            norm_ready_rsrc,
-                            (sample_base + local_sample) * _HEADS + head,
-                        )
+            if const_expr(not mla):
+                for ready_round in range_constexpr((ready_count + _THREADS - 1) // _THREADS):
+                    ready = tid + ready_round * _THREADS
+                    if ready < ready_count:
+                        if const_expr(mtp):
+                            local_sample = ready // _HEADS
+                            head = ready % _HEADS
+                            load_i32(
+                                mtp_norm_ready_rsrc,
+                                (sample_base + local_sample) * _HEADS + head,
+                            )
+                        else:
+                            local_sample = ready // _HEADS
+                            head = ready % _HEADS
+                            load_i32(
+                                norm_ready_rsrc,
+                                (sample_base + local_sample) * _HEADS + head,
+                            )
             gpu.barrier()
             pairs = sample_count * _PROJECTION // 2
             for load_round in range_constexpr((pairs + _THREADS - 1) // _THREADS):
@@ -1255,7 +1340,12 @@ def build_kimi_k3_monokernel(
                     local_sample = pair // (_PROJECTION // 2)
                     pair_in_sample = pair % (_PROJECTION // 2)
                     global_pair = (sample_base + local_sample) * (_PROJECTION // 2) + pair_in_sample
-                    if const_expr(mtp):
+                    if const_expr(mla):
+                        packed = load_pair(
+                            norm_mailbox_rsrc,
+                            global_pair,
+                        )
+                    elif const_expr(mtp):
                         packed = load_raw_pair(norm_packed_rsrc, global_pair)
                     else:
                         packed = load_raw_pair(norm_mailbox_rsrc, global_pair)
@@ -1775,10 +1865,591 @@ def build_kimi_k3_monokernel(
                     False,
                 )
 
+        # Dense Kimi MLA frontend.  The KDA and MLA mixers share Stage 0 and
+        # Stage 3 onward; this branch publishes the same 1536-wide per-head
+        # value mailbox consumed by the common output projection and K3 tail.
+        if const_expr(mla):
+            wait_attn_res_chunks(pre_ready_rsrc, 0, samples)
+
+            def hidden_value(sample, k):
+                return fx.Float32(
+                    fx.BFloat16(
+                        bo.buffer_load(
+                            pre_mailbox_rsrc,
+                            sample * _HIDDEN + k,
+                            vec_width=1,
+                            dtype=T.bf16,
+                            cache_modifier=CM_DEV,
+                        )
+                    )
+                )
+
+            def raw_bf16(resource, index):
+                return fx.Float32(
+                    fx.BFloat16(
+                        bo.buffer_load(
+                            resource,
+                            index,
+                            vec_width=1,
+                            dtype=T.bf16,
+                            cache_modifier=CM_DEV,
+                        )
+                    )
+                )
+
+            def project_hidden(weight_address, output_rsrc, rows):
+                weight = rsrc(weight_address)
+                pair_task = bid * _THREADS + tid
+                pair_count = samples * (rows // 2)
+                while pair_task < pair_count:
+                    sample = pair_task // (rows // 2)
+                    row = (pair_task % (rows // 2)) * 2
+                    low = fx.Float32(0.0)
+                    high = fx.Float32(0.0)
+                    k = fx.Int32(0)
+                    while k < fx.Int32(_HIDDEN):
+                        value = hidden_value(sample, k)
+                        low = low + value * raw_bf16(weight, row * _HIDDEN + k)
+                        high = high + value * raw_bf16(
+                            weight,
+                            (row + 1) * _HIDDEN + k,
+                        )
+                        k = k + 1
+                    store_pair(
+                        output_rsrc,
+                        sample * (rows // 2) + row // 2,
+                        low,
+                        high,
+                    )
+                    pair_task = pair_task + _BLOCKS * _THREADS
+
+            project_hidden(
+                mla_qkv_weight,
+                mla_qkv_rsrc,
+                _MLA_Q_LORA + _MLA_CACHE_ROW,
+            )
+            project_hidden(mla_gate_weight, mla_gate_rsrc, _PROJECTION)
+
+            if bid < samples:
+                sample = bid
+                q_square = fx.Float32(0.0)
+                q_pair = tid
+                while q_pair < _MLA_Q_LORA // 2:
+                    q0, q1 = pair_values(
+                        mla_qkv_rsrc,
+                        sample * ((_MLA_Q_LORA + _MLA_CACHE_ROW) // 2)
+                        + q_pair,
+                    )
+                    q_square = q_square + q0 * q0 + q1 * q1
+                    q_pair = q_pair + _THREADS
+                q_inv = rsq(
+                    block_sum(q_square) * (1.0 / _MLA_Q_LORA)
+                    + _MLA_NORM_EPS
+                )
+                q_pair = tid
+                q_gain_rsrc = rsrc(mla_q_norm)
+                while q_pair < _MLA_Q_LORA // 2:
+                    q0, q1 = pair_values(
+                        mla_qkv_rsrc,
+                        sample * ((_MLA_Q_LORA + _MLA_CACHE_ROW) // 2)
+                        + q_pair,
+                    )
+                    store_pair(
+                        mla_qnorm_rsrc,
+                        sample * (_MLA_Q_LORA // 2) + q_pair,
+                        q0 * q_inv * raw_bf16(q_gain_rsrc, q_pair * 2),
+                        q1 * q_inv
+                        * raw_bf16(q_gain_rsrc, q_pair * 2 + 1),
+                    )
+                    q_pair = q_pair + _THREADS
+
+                kv_square = fx.Float32(0.0)
+                kv_pair = tid
+                qkv_pairs = (_MLA_Q_LORA + _MLA_CACHE_ROW) // 2
+                while kv_pair < _MLA_KV_LORA // 2:
+                    kv0, kv1 = pair_values(
+                        mla_qkv_rsrc,
+                        sample * qkv_pairs + _MLA_Q_LORA // 2 + kv_pair,
+                    )
+                    kv_square = kv_square + kv0 * kv0 + kv1 * kv1
+                    kv_pair = kv_pair + _THREADS
+                kv_inv = rsq(
+                    block_sum(kv_square) * (1.0 / _MLA_KV_LORA)
+                    + _MLA_NORM_EPS
+                )
+                kv_gain_rsrc = rsrc(mla_kv_norm)
+                kv_pair = tid
+                while kv_pair < _MLA_KV_LORA // 2:
+                    kv0, kv1 = pair_values(
+                        mla_qkv_rsrc,
+                        sample * qkv_pairs + _MLA_Q_LORA // 2 + kv_pair,
+                    )
+                    store_pair(
+                        mla_fresh_rsrc,
+                        sample * (_MLA_CACHE_ROW // 2) + kv_pair,
+                        kv0
+                        * kv_inv
+                        * raw_bf16(kv_gain_rsrc, kv_pair * 2),
+                        kv1
+                        * kv_inv
+                        * raw_bf16(kv_gain_rsrc, kv_pair * 2 + 1),
+                    )
+                    kv_pair = kv_pair + _THREADS
+
+                position = uniform(
+                    bo.buffer_load(
+                        rsrc(mla_positions),
+                        sample,
+                        vec_width=1,
+                        dtype=T.i64,
+                    )
+                )
+                pe_pair = tid
+                while pe_pair < _MLA_PE // 2:
+                    pe0, pe1 = pair_values(
+                        mla_qkv_rsrc,
+                        sample * qkv_pairs
+                        + (_MLA_Q_LORA + _MLA_KV_LORA) // 2
+                        + pe_pair,
+                    )
+                    cosine = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(mla_rope_cos),
+                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    sine = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(mla_rope_sin),
+                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    store_pair(
+                        mla_fresh_rsrc,
+                        sample * (_MLA_CACHE_ROW // 2)
+                        + _MLA_KV_LORA // 2
+                        + pe_pair,
+                        pe0 * cosine - pe1 * sine,
+                        pe0 * sine + pe1 * cosine,
+                    )
+                    pe_pair = pe_pair + _THREADS
+                gpu.barrier()
+
+                batch_id = uniform(
+                    bo.buffer_load(
+                        rsrc(mla_batch_ids),
+                        sample,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                physical_slot = uniform(
+                    bo.buffer_load(
+                        rsrc(mla_slot_mapping),
+                        sample,
+                        vec_width=1,
+                        dtype=T.i64,
+                    )
+                )
+                cache_live = (batch_id >= 0) & (physical_slot >= 0)
+                if (tid < _MLA_CACHE_ROW // 4) & cache_live:
+                    d = tid * 4
+                    a0, a1 = pair_values(
+                        mla_fresh_rsrc,
+                        sample * (_MLA_CACHE_ROW // 2) + d // 2,
+                    )
+                    a2, a3 = pair_values(
+                        mla_fresh_rsrc,
+                        sample * (_MLA_CACHE_ROW // 2) + d // 2 + 1,
+                    )
+                    descale = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(mla_cache_scale),
+                            0,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    inverse = rcp(descale)
+                    q0 = fx.max(
+                        fx.Float32(-FP8_MAX),
+                        fx.min(fx.Float32(FP8_MAX), a0 * inverse),
+                    )
+                    q1 = fx.max(
+                        fx.Float32(-FP8_MAX),
+                        fx.min(fx.Float32(FP8_MAX), a1 * inverse),
+                    )
+                    q2 = fx.max(
+                        fx.Float32(-FP8_MAX),
+                        fx.min(fx.Float32(FP8_MAX), a2 * inverse),
+                    )
+                    q3 = fx.max(
+                        fx.Float32(-FP8_MAX),
+                        fx.min(fx.Float32(FP8_MAX), a3 * inverse),
+                    )
+                    low = fx.Int32(
+                        rocdl.cvt_pk_fp8_f32(
+                            T.i32,
+                            q0,
+                            q1,
+                            fx.Int32(0),
+                            False,
+                        )
+                    ) & fx.Int32(0xFFFF)
+                    high = fx.Int32(
+                        rocdl.cvt_pk_fp8_f32(
+                            T.i32,
+                            q2,
+                            q3,
+                            fx.Int32(0),
+                            False,
+                        )
+                    ) & fx.Int32(0xFFFF)
+                    bo.buffer_store(
+                        low | (high << 16),
+                        rsrc(mla_cache),
+                        fx.Int64(physical_slot)
+                        * (_MLA_CACHE_ROW // 4)
+                        + tid,
+                        cache_modifier=CM_DEV,
+                    )
+
+            # q_b: normalized low-rank query -> 12 x (128 no-PE + 64 PE).
+            q_pair_task = bid * _THREADS + tid
+            q_pairs = _HEADS * _MLA_Q_HEAD // 2
+            q_weight_rsrc = rsrc(mla_q_b_weight)
+            while q_pair_task < samples * q_pairs:
+                sample = q_pair_task // q_pairs
+                row = (q_pair_task % q_pairs) * 2
+                low = fx.Float32(0.0)
+                high = fx.Float32(0.0)
+                k = fx.Int32(0)
+                while k < fx.Int32(_MLA_Q_LORA):
+                    value = tagged_bf16(
+                        mla_qnorm_rsrc,
+                        sample * _MLA_Q_LORA + k,
+                    )
+                    low = low + value * raw_bf16(
+                        q_weight_rsrc,
+                        row * _MLA_Q_LORA + k,
+                    )
+                    high = high + value * raw_bf16(
+                        q_weight_rsrc,
+                        (row + 1) * _MLA_Q_LORA + k,
+                    )
+                    k = k + 1
+                row_in_head = row % _MLA_Q_HEAD
+                if row_in_head >= _HEAD_DIM:
+                    position = uniform(
+                        bo.buffer_load(
+                            rsrc(mla_positions),
+                            sample,
+                            vec_width=1,
+                            dtype=T.i64,
+                        )
+                    )
+                    pe_pair = (row_in_head - _HEAD_DIM) // 2
+                    cosine = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(mla_rope_cos),
+                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    sine = fx.Float32(
+                        bo.buffer_load(
+                            rsrc(mla_rope_sin),
+                            fx.Int64(position) * (_MLA_PE // 2) + pe_pair,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
+                    rotated_low = low * cosine - high * sine
+                    high = low * sine + high * cosine
+                    low = rotated_low
+                store_pair(
+                    mla_q_rsrc,
+                    sample * q_pairs + row // 2,
+                    low,
+                    high,
+                )
+                q_pair_task = q_pair_task + _BLOCKS * _THREADS
+
+            # W_UK absorbs the non-positional 128 query dimensions.
+            uk_pair_task = bid * _THREADS + tid
+            uk_pairs = _HEADS * _MLA_KV_LORA // 2
+            uk_weight_rsrc = rsrc(mla_uk_weight)
+            while uk_pair_task < samples * uk_pairs:
+                sample = uk_pair_task // uk_pairs
+                row = (uk_pair_task % uk_pairs) * 2
+                head = row // _MLA_KV_LORA
+                low = fx.Float32(0.0)
+                high = fx.Float32(0.0)
+                k = fx.Int32(0)
+                while k < fx.Int32(_HEAD_DIM):
+                    value = tagged_bf16(
+                        mla_q_rsrc,
+                        sample * (_HEADS * _MLA_Q_HEAD)
+                        + head * _MLA_Q_HEAD
+                        + k,
+                    )
+                    low = low + value * raw_bf16(
+                        uk_weight_rsrc,
+                        row * _HEAD_DIM + k,
+                    )
+                    high = high + value * raw_bf16(
+                        uk_weight_rsrc,
+                        (row + 1) * _HEAD_DIM + k,
+                    )
+                    k = k + 1
+                store_pair(
+                    mla_qlat_rsrc,
+                    sample * uk_pairs + row // 2,
+                    low,
+                    high,
+                )
+                uk_pair_task = uk_pair_task + _BLOCKS * _THREADS
+
+            # Dense paged MLA.  Each CTA owns a 64-value chunk and walks every
+            # visible logical key through the request's physical block table.
+            dense_task = bid
+            dense_tasks = samples * _HEADS * _MLA_VALUE_CHUNKS
+            cache_descale = fx.Float32(
+                bo.buffer_load(
+                    rsrc(mla_cache_scale),
+                    0,
+                    vec_width=1,
+                    dtype=T.f32,
+                )
+            )
+            while dense_task < dense_tasks:
+                sample = dense_task // (_HEADS * _MLA_VALUE_CHUNKS)
+                head_chunk = dense_task % (
+                    _HEADS * _MLA_VALUE_CHUNKS
+                )
+                head = head_chunk // _MLA_VALUE_CHUNKS
+                value_chunk = head_chunk % _MLA_VALUE_CHUNKS
+                batch_id = uniform(
+                    bo.buffer_load(
+                        rsrc(mla_batch_ids),
+                        sample,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                )
+                position = uniform(
+                    bo.buffer_load(
+                        rsrc(mla_positions),
+                        sample,
+                        vec_width=1,
+                        dtype=T.i64,
+                    )
+                )
+                context = (batch_id >= 0).select(
+                    uniform(
+                        bo.buffer_load(
+                            rsrc(mla_context_lens),
+                            fx.max(batch_id, fx.Int32(0)),
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    ),
+                    fx.Int32(0),
+                )
+                visible = fx.min(context, fx.Int32(position + 1))
+                running_max = fx.Float32(-3.402823466e38)
+                running_sum = fx.Float32(0.0)
+                value_acc = fx.Float32(0.0)
+                logical = fx.Int32(0)
+                while logical < visible:
+                    logical_block = logical // 16
+                    block_offset = logical % 16
+                    physical_block = uniform(
+                        bo.buffer_load(
+                            rsrc(mla_block_tables),
+                            batch_id * mla_block_table_stride
+                            + logical_block,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    physical_slot = physical_block * 16 + block_offset
+                    fresh_row = fx.Int32(-1)
+                    fresh_scan = fx.Int32(0)
+                    while fresh_scan < fx.Int32(samples):
+                        fresh_batch = uniform(
+                            bo.buffer_load(
+                                rsrc(mla_batch_ids),
+                                fresh_scan,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        fresh_slot = uniform(
+                            bo.buffer_load(
+                                rsrc(mla_slot_mapping),
+                                fresh_scan,
+                                vec_width=1,
+                                dtype=T.i64,
+                            )
+                        )
+                        matched = (fresh_batch >= 0) & (
+                            fresh_slot == fx.Int64(physical_slot)
+                        )
+                        fresh_row = matched.select(fresh_scan, fresh_row)
+                        fresh_scan = fresh_scan + 1
+
+                    local_score = fx.Float32(0.0)
+                    if tid < _MLA_CACHE_ROW // 8:
+                        d0 = tid * 8
+                        words = fx.Vector(
+                            bo.buffer_load(
+                                rsrc(mla_cache),
+                                physical_slot * (_MLA_CACHE_ROW // 4)
+                                + tid * 2,
+                                vec_width=2,
+                                dtype=T.i32,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                        cached = fp8_to_bf16x8(words[0], words[1]).to(
+                            fx.Float32
+                        )
+                        for j in range_constexpr(8):
+                            d = d0 + j
+                            query = fx.Float32(0.0)
+                            if d < _MLA_KV_LORA:
+                                query = tagged_bf16(
+                                    mla_qlat_rsrc,
+                                    (sample * _HEADS + head)
+                                    * _MLA_KV_LORA
+                                    + d,
+                                )
+                            else:
+                                query = tagged_bf16(
+                                    mla_q_rsrc,
+                                    (sample * _HEADS + head)
+                                    * _MLA_Q_HEAD
+                                    + _HEAD_DIM
+                                    + d
+                                    - _MLA_KV_LORA,
+                                )
+                            key = fx.Float32(cached[j]) * cache_descale
+                            if fresh_row >= 0:
+                                key = tagged_bf16(
+                                    mla_fresh_rsrc,
+                                    fresh_row * _MLA_CACHE_ROW + d,
+                                )
+                            local_score = local_score + query * key
+                    score = block_sum(local_score) * (
+                        _MLA_Q_HEAD**-0.5
+                    )
+
+                    value = fx.Float32(0.0)
+                    if (wave == 0) & (lane < _WAVE_SIZE):
+                        value_d = value_chunk * _WAVE_SIZE + lane
+                        value_words = fx.Vector(
+                            bo.buffer_load(
+                                rsrc(mla_cache),
+                                physical_slot * (_MLA_CACHE_ROW // 4)
+                                + (value_d // 8) * 2,
+                                vec_width=2,
+                                dtype=T.i32,
+                                cache_modifier=CM_DEV,
+                            )
+                        )
+                        cache_values = fp8_to_bf16x8(
+                            value_words[0],
+                            value_words[1],
+                        ).to(fx.Float32)
+                        cached_value = fx.Float32(cache_values[0])
+                        for j in range_constexpr(1, 8):
+                            cached_value = (
+                                value_d % 8 == j
+                            ).select(
+                                fx.Float32(cache_values[j]),
+                                cached_value,
+                            )
+                        value = cached_value * cache_descale
+                        if fresh_row >= 0:
+                            value = tagged_bf16(
+                                mla_fresh_rsrc,
+                                fresh_row * _MLA_CACHE_ROW + value_d,
+                            )
+
+                    next_max = fx.max(running_max, score)
+                    old_scale = exp(running_max - next_max)
+                    new_scale = exp(score - next_max)
+                    value_acc = value_acc * old_scale + value * new_scale
+                    running_sum = running_sum * old_scale + new_scale
+                    running_max = next_max
+                    logical = logical + 1
+                result0 = (running_sum > 0.0).select(
+                    value_acc * rcp(running_sum),
+                    fx.Float32(0.0),
+                )
+                result1 = xshfl(result0, 1)
+                if (wave == 0) & (lane % 2 == 0):
+                    store_pair(
+                        mla_dense_acc_rsrc,
+                        (sample * _HEADS + head)
+                        * (_MLA_KV_LORA // 2)
+                        + value_chunk * (_WAVE_SIZE // 2)
+                        + lane // 2,
+                        result0,
+                        result1,
+                    )
+                dense_task = dense_task + _BLOCKS
+
+            # W_UV and the Kimi attention output gate publish the common
+            # 1536-wide Stage-3 input mailbox.
+            uv_pair_task = bid * _THREADS + tid
+            uv_pairs = _PROJECTION // 2
+            uv_weight_rsrc = rsrc(mla_uv_weight)
+            while uv_pair_task < samples * uv_pairs:
+                sample = uv_pair_task // uv_pairs
+                row = (uv_pair_task % uv_pairs) * 2
+                head = row // _HEAD_DIM
+                low = fx.Float32(0.0)
+                high = fx.Float32(0.0)
+                k = fx.Int32(0)
+                while k < fx.Int32(_MLA_KV_LORA):
+                    value = tagged_bf16(
+                        mla_dense_acc_rsrc,
+                        (sample * _HEADS + head) * _MLA_KV_LORA + k,
+                    )
+                    low = low + value * raw_bf16(
+                        uv_weight_rsrc,
+                        row * _MLA_KV_LORA + k,
+                    )
+                    high = high + value * raw_bf16(
+                        uv_weight_rsrc,
+                        (row + 1) * _MLA_KV_LORA + k,
+                    )
+                    k = k + 1
+                gate0, gate1 = pair_values(
+                    mla_gate_rsrc,
+                    sample * uv_pairs + row // 2,
+                )
+                low = low * rcp(fx.Float32(1.0) + exp(-gate0))
+                high = high * rcp(fx.Float32(1.0) + exp(-gate1))
+                store_pair(
+                    norm_mailbox_rsrc,
+                    sample * uv_pairs + row // 2,
+                    low,
+                    high,
+                )
+                uv_pair_task = uv_pair_task + _BLOCKS * _THREADS
+
         # Stage 1: BF16 7168 -> 6400 input projection.  One wave owns one
         # 16-row group and accumulates the complete K dimension, preserving the
         # non-split-K numerical order needed by the recurrent state update.
-        input_tasks = sample_groups * input_row_tasks
+        input_tasks = 0 if mla else sample_groups * input_row_tasks
         input_task = bid
         while input_task < input_tasks:
             if const_expr(sample_groups == 1):
@@ -2037,7 +2708,7 @@ def build_kimi_k3_monokernel(
         # Stage 2a: ordinary decode uses one CTA per independent (sample, head).
         # Ordered MTP recurrence is handled by the pipeline below.
         recurrence_task = bid
-        recurrence_tasks = 0 if mtp else samples * _HEADS
+        recurrence_tasks = 0 if (mtp or mla) else samples * _HEADS
         if recurrence_task < recurrence_tasks:
             stamp(1)
             sample = recurrence_task // _HEADS
@@ -3697,6 +4368,19 @@ def build_kimi_k3_monokernel(
                         residual_low + value_low,
                         residual_high + value_high,
                     ).bitcast(fx.Int32)
+                    if const_expr(mla):
+                        batch_id = uniform(
+                            bo.buffer_load(
+                                rsrc(mla_batch_ids),
+                                sample,
+                                vec_width=1,
+                                dtype=T.i32,
+                            )
+                        )
+                        final_word = (batch_id >= 0).select(
+                            final_word,
+                            fx.Int32(0),
+                        )
                     bo.buffer_store(
                         final_word,
                         rsrc(final_output),
@@ -3760,6 +4444,23 @@ def build_kimi_k3_monokernel(
         peers: Int64,
         step: Int64,
         timeline: Int64,
+        mla_positions: Int64,
+        mla_slot_mapping: Int64,
+        mla_batch_ids: Int64,
+        mla_context_lens: Int64,
+        mla_block_tables: Int64,
+        mla_block_table_stride: Int32,
+        mla_cache: Int64,
+        mla_cache_scale: Int64,
+        mla_rope_cos: Int64,
+        mla_rope_sin: Int64,
+        mla_qkv_weight: Int64,
+        mla_q_norm: Int64,
+        mla_kv_norm: Int64,
+        mla_q_b_weight: Int64,
+        mla_uk_weight: Int64,
+        mla_uv_weight: Int64,
+        mla_gate_weight: Int64,
         rank: Int32,
         layer: Int32,
         stream: Stream = Stream(None),
@@ -3815,6 +4516,23 @@ def build_kimi_k3_monokernel(
             peers,
             step,
             timeline,
+            mla_positions,
+            mla_slot_mapping,
+            mla_batch_ids,
+            mla_context_lens,
+            mla_block_tables,
+            mla_block_table_stride,
+            mla_cache,
+            mla_cache_scale,
+            mla_rope_cos,
+            mla_rope_sin,
+            mla_qkv_weight,
+            mla_q_norm,
+            mla_kv_norm,
+            mla_q_b_weight,
+            mla_uk_weight,
+            mla_uv_weight,
+            mla_gate_weight,
             rank,
             layer,
         ).launch(grid=(_BLOCKS,), block=(_THREADS,), stream=stream)
@@ -3826,5 +4544,6 @@ def build_kimi_k3_monokernel(
         f"_b{block_tag}_w{write_tag}_f{int(fuse_moe)}_m{int(mtp)}"
         f"_bq{agentic_batch_size}_h{2 if state_fp16 else 4}"
         f"_c{conv_state_layout.value}_a{int(atom_expert_layout)}"
+        f"_mla{int(mla)}"
     )
     return launch

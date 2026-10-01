@@ -24,6 +24,7 @@ from atom.model_ops.monokernel.abi import AgenticDecodeShape
 from atom.model_ops.monokernel.k3.abi import (
     KimiAgenticRuntime,
     KimiAgenticShape,
+    KimiMlaAgenticRuntime,
 )
 from atom.model_ops.monokernel.dispatch import (
     MonoUnsupported,
@@ -85,12 +86,36 @@ def _kda_state_dtype(model, fwd) -> torch.dtype | None:
     return None
 
 
+def _split_kv_b(
+    weight: torch.Tensor,
+    *,
+    heads: int,
+    nope_dim: int,
+    value_dim: int,
+    kv_lora: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert production KV-B rows to absorbed W_UK/W_UV matrices."""
+
+    by_head = weight.view(heads, nope_dim + value_dim, kv_lora)
+    w_uk = (
+        by_head[:, :nope_dim]
+        .transpose(1, 2)
+        .contiguous()
+        .view(heads * kv_lora, nope_dim)
+    )
+    w_uv = (
+        by_head[:, nope_dim:]
+        .contiguous()
+        .view(heads * value_dim, kv_lora)
+    )
+    return w_uk, w_uv
+
+
 def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     attn = layer.self_attn
     moe = layer.block_sparse_moe
     experts = moe.experts
     cfg = KIMI_K3_CONFIG
-    _need(layer.is_linear_attn, f"layer {layer.layer_idx}: not KDA")
     _need(hasattr(layer, "block_sparse_moe"), f"layer {layer.layer_idx}: dense FFN")
     _need(not experts.quant_method.is_guinterleave, "ATOM_MOE_GU_ITLV must be 0")
     _need(experts.global_num_experts == cfg.n_experts, "expert count")
@@ -132,28 +157,6 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
     tensors = {
         "g_in": layer.input_layernorm.weight,
         "g_post": layer.post_attention_layernorm.weight,
-        "w_kda_in": linear_bf16(
-            attn.in_proj,
-            name="in_proj",
-            logical_rows=4 * cfg.local_heads * cfg.v_dim + cfg.local_heads + cfg.v_dim,
-            logical_cols=cfg.hidden,
-        ),
-        "w_kda_fb": linear_bf16(
-            attn.f_b_proj,
-            name="f_b_proj",
-            logical_rows=cfg.local_heads * cfg.v_dim,
-            logical_cols=cfg.v_dim,
-        ),
-        "w_kda_conv": attn.conv_weight,
-        "kda_a_log": attn.A_log.float().contiguous(),
-        "kda_dt_bias": attn.dt_bias.view(cfg.local_heads, cfg.v_dim),
-        "g_kda_out": attn.o_norm.weight,
-        "w_kda_o": linear_bf16(
-            attn.o_proj,
-            name="o_proj",
-            logical_rows=cfg.hidden,
-            logical_cols=cfg.local_heads * cfg.v_dim,
-        ),
         "g_self_res": layer.self_attention_res_norm.weight,
         "w_self_res": linear_bf16(
             layer.self_attention_res_proj,
@@ -207,6 +210,87 @@ def _layer_weights(layer, rank: int, npes: int) -> LayerWeights:
         "w_dn": w_dn,
         "s_dn": s_dn,
     }
+    if layer.is_linear_attn:
+        tensors.update(
+            {
+                "w_kda_in": linear_bf16(
+                    attn.in_proj,
+                    name="in_proj",
+                    logical_rows=(
+                        4 * cfg.local_heads * cfg.v_dim
+                        + cfg.local_heads
+                        + cfg.v_dim
+                    ),
+                    logical_cols=cfg.hidden,
+                ),
+                "w_kda_fb": linear_bf16(
+                    attn.f_b_proj,
+                    name="f_b_proj",
+                    logical_rows=cfg.local_heads * cfg.v_dim,
+                    logical_cols=cfg.v_dim,
+                ),
+                "w_kda_conv": attn.conv_weight,
+                "kda_a_log": attn.A_log.float().contiguous(),
+                "kda_dt_bias": attn.dt_bias.view(
+                    cfg.local_heads,
+                    cfg.v_dim,
+                ),
+                "g_kda_out": attn.o_norm.weight,
+                "w_kda_o": linear_bf16(
+                    attn.o_proj,
+                    name="o_proj",
+                    logical_rows=cfg.hidden,
+                    logical_cols=cfg.local_heads * cfg.v_dim,
+                ),
+            }
+        )
+    else:
+        kv_b = linear_bf16(
+            attn.kv_b_proj,
+            name="kv_b_proj",
+            logical_rows=cfg.local_heads * (cfg.nope_dim + cfg.v_dim),
+            logical_cols=cfg.kv_lora,
+        )
+        w_uk, w_uv = _split_kv_b(
+            kv_b,
+            heads=cfg.local_heads,
+            nope_dim=cfg.nope_dim,
+            value_dim=cfg.v_dim,
+            kv_lora=cfg.kv_lora,
+        )
+        tensors.update(
+            {
+                "w_qkv_a": linear_bf16(
+                    attn.fused_qkv_a_proj,
+                    name="fused_qkv_a_proj",
+                    logical_rows=cfg.q_lora + cfg.kv_lora + cfg.pe_dim,
+                    logical_cols=cfg.hidden,
+                ),
+                "g_q": attn.q_a_layernorm.weight,
+                "g_kv": attn.kv_a_layernorm.weight,
+                "w_q_b": linear_bf16(
+                    attn.q_b_proj,
+                    name="q_b_proj",
+                    logical_rows=cfg.local_heads
+                    * (cfg.nope_dim + cfg.pe_dim),
+                    logical_cols=cfg.q_lora,
+                ),
+                "w_uk": w_uk,
+                "w_uv": w_uv,
+                "w_gate": linear_bf16(
+                    attn.g_proj,
+                    name="g_proj",
+                    logical_rows=cfg.local_heads * cfg.v_dim,
+                    logical_cols=cfg.hidden,
+                ),
+                "w_o": linear_bf16(
+                    attn.o_proj,
+                    name="o_proj",
+                    logical_rows=cfg.hidden,
+                    logical_cols=cfg.local_heads * cfg.v_dim,
+                ),
+            }
+        )
     return LayerWeights(
         cfg.local_heads,
         tensors,
@@ -239,7 +323,18 @@ class _KimiLayerOp:
         rank = get_tensor_model_parallel_rank()
         npes = get_tensor_model_parallel_world_size()
         tp = get_tp_group()
-        op_type = KimiK3MonoKernel if mode == "mono" else _KimiK3KdaStagedPath
+        if mode == "mla_full":
+            from atom.model_ops.monokernel.k3.mla_full import (
+                KimiK3MlaMonoKernel,
+            )
+
+            op_type = KimiK3MlaMonoKernel
+        else:
+            op_type = (
+                KimiK3MonoKernel
+                if mode == "mono"
+                else _KimiK3KdaStagedPath
+            )
         op_kwargs = dict(
             layer_idx=layer.layer_idx,
             rank=rank,
@@ -254,7 +349,14 @@ class _KimiLayerOp:
             defer_collectives=defer_collectives,
             packed_artifacts=packed_artifacts,
         )
-        if agentic_batch_size:
+        if mode == "mla_full":
+            for name in (
+                "mtp",
+                "conv_state_layout",
+                "state_dtype",
+            ):
+                op_kwargs.pop(name)
+        elif agentic_batch_size:
             if mode != "mono":
                 raise ValueError("Kimi Agentic q=8 requires the full MonoKernel")
             op_kwargs["agentic_batch_size"] = agentic_batch_size
@@ -455,9 +557,17 @@ class KimiMonoDecode:
         model = getattr(getattr(self, "_lm", None), "model", None)
         if model is None:
             return True
+        mla_layers = [
+            layer
+            for layer in model.layers[model.start_layer : model.end_layer]
+            if not getattr(layer, "is_linear_attn", True)
+        ]
         state_dtype = None
         for layer in model.layers[model.start_layer : model.end_layer]:
-            if not layer.is_linear_attn or not hasattr(layer, "block_sparse_moe"):
+            if not getattr(layer, "is_linear_attn", True) or not hasattr(
+                layer,
+                "block_sparse_moe",
+            ):
                 continue
             try:
                 cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
@@ -474,6 +584,30 @@ class KimiMonoDecode:
                 return self._fallback("mixed_state_dtype", samples)
         if agentic and state_dtype is not torch.float16:
             return self._fallback("state_dtype", samples)
+        if agentic and mla_layers:
+            attention_metadata = fwd.attn_metadata
+            try:
+                mla_runtime = KimiMlaAgenticRuntime.bind(
+                    shape,
+                    positions,
+                    attention_metadata.slot_mapping[:samples],
+                    attention_metadata.batch_id_per_q_token[:samples],
+                    attention_metadata.context_lens,
+                    attention_metadata.block_tables,
+                )
+                del mla_runtime
+                for layer in mla_layers:
+                    cache = fwd.kv_cache_data[
+                        f"layer_{layer.layer_idx}"
+                    ].k_cache
+                    scale = layer.self_attn.attn._k_scale
+                    from atom.model_ops.monokernel.k3.mla_cache import (
+                        validate_fp8_mla_cache,
+                    )
+
+                    validate_fp8_mla_cache(cache, scale)
+            except (AttributeError, KeyError, TypeError, ValueError):
+                return self._fallback("mla_metadata", samples)
         prepared = False
         if state_dtype is not None:
             prepared = (
@@ -494,17 +628,32 @@ class KimiMonoDecode:
         model = self._lm.model
         specs = []
         for layer in model.layers[model.start_layer : model.end_layer]:
-            backend = select_backend(
-                "kimi_k3",
-                self._mode,
+            route = dict(
                 samples=samples,
                 tp_size=8,
                 kv_cache_dtype=self._atom_config.kv_cache_dtype,
                 mtp=agentic_batch_size > 0,
-                dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
+                dcp=getattr(
+                    self._atom_config,
+                    "decode_context_parallel_size",
+                    1,
+                )
+                > 1,
                 query_len=8 if agentic_batch_size else 1,
                 is_kda=layer.is_linear_attn,
                 has_moe=hasattr(layer, "block_sparse_moe"),
+            )
+            if not getattr(layer, "is_linear_attn", True):
+                route.update(
+                    external_indexer=False,
+                    cache_layout="atom_fp8",
+                    segment="mla_layer",
+                    replay_ssm=False,
+                )
+            backend = select_backend(
+                "kimi_k3",
+                self._mode,
+                **route,
             )
             if backend is not None:
                 specs.append(
@@ -595,7 +744,12 @@ class KimiMonoDecode:
 
             grouped = {}
             for key, backend, owned in pending:
-                grouped.setdefault((samples, backend), []).append((key, owned))
+                family = (
+                    "full"
+                    if backend in {"mono", "mla_full"}
+                    else backend
+                )
+                grouped.setdefault((samples, family), []).append((key, owned))
             for reduction_key, group in grouped.items():
                 shared = self._reductions.get(reduction_key, (None, None))
                 for key, owned in group:
@@ -629,7 +783,13 @@ class KimiMonoDecode:
                     reduction.close()
                     closed.add(id(reduction))
             for reduction_key in {
-                (samples, backend) for _, backend, _ in pending
+                (
+                    samples,
+                    "full"
+                    if backend in {"mono", "mla_full"}
+                    else backend,
+                )
+                for _, backend, _ in pending
             }:
                 self._reductions.pop(reduction_key, None)
             for layer, _, _ in specs:
@@ -652,17 +812,32 @@ class KimiMonoDecode:
         state_dtype: torch.dtype,
         agentic_batch_size: int = 0,
     ) -> _KimiLayerOp:
-        backend = select_backend(
-            "kimi_k3",
-            self._mode,
+        route = dict(
             samples=samples,
             tp_size=8,
             kv_cache_dtype=self._atom_config.kv_cache_dtype,
             mtp=agentic_batch_size > 0,
-            dcp=getattr(self._atom_config, "decode_context_parallel_size", 1) > 1,
+            dcp=getattr(
+                self._atom_config,
+                "decode_context_parallel_size",
+                1,
+            )
+            > 1,
             query_len=8 if agentic_batch_size else 1,
             is_kda=layer.is_linear_attn,
             has_moe=hasattr(layer, "block_sparse_moe"),
+        )
+        if not layer.is_linear_attn:
+            route.update(
+                external_indexer=False,
+                cache_layout="atom_fp8",
+                segment="mla_layer",
+                replay_ssm=False,
+            )
+        backend = select_backend(
+            "kimi_k3",
+            self._mode,
+            **route,
         )
         if backend is None:
             raise MonoUnsupported("layer fallback")
@@ -742,6 +917,36 @@ class KimiMonoDecode:
                 extra = hidden.new_zeros(samples, block_idx + 1 - blocks.shape[1], hidden.shape[-1])
                 blocks = torch.cat((blocks, extra), dim=1)
             cache = fwd.kv_cache_data[f"layer_{layer.layer_idx}"]
+            if not getattr(layer, "is_linear_attn", True):
+                attention_metadata = fwd.attn_metadata
+                runtime = KimiMlaAgenticRuntime.bind(
+                    KimiAgenticShape(
+                        common=AgenticDecodeShape.from_forward_mode(
+                            fwd.context,
+                            batch_capacity=agentic_batch_size,
+                            row_capacity=samples,
+                        ),
+                        dcp_size=1,
+                        replay_ssm=False,
+                    ),
+                    positions,
+                    attention_metadata.slot_mapping[:samples],
+                    attention_metadata.batch_id_per_q_token[:samples],
+                    attention_metadata.context_lens,
+                    attention_metadata.block_tables,
+                )
+                attn = layer.self_attn
+                hidden = owned.op.forward(
+                    hidden,
+                    blocks,
+                    runtime,
+                    cache.k_cache,
+                    attn.attn._k_scale,
+                    attn.rotary_emb.cos_cache,
+                    attn.rotary_emb.sin_cache,
+                    epoch_layer=layer.layer_idx,
+                )
+                continue
             state_indices = (
                 md.spec_state_indices_tensor
                 if agentic_batch_size

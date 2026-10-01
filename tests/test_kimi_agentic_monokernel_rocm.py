@@ -143,6 +143,78 @@ def _deterministic_weights(device, rank):
     )
 
 
+def _deterministic_mla_weights(device, rank):
+    import torch
+
+    from atom.model_ops.monokernel.config import KIMI_K3_CONFIG
+
+    weights = _deterministic_weights(device, rank)
+    config = KIMI_K3_CONFIG
+    hidden = config.hidden
+    projection = config.local_heads * config.v_dim
+
+    def bf16(*shape, value=0):
+        return torch.full(
+            shape,
+            value,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+
+    tensors = weights.t
+    tensors["w_qkv_a"] = bf16(config.qkv_a_rows, hidden)
+    tensors["g_q"] = bf16(config.q_lora, value=1)
+    tensors["g_kv"] = bf16(config.kv_lora, value=1)
+    tensors["w_q_b"] = bf16(
+        config.local_heads * (config.nope_dim + config.pe_dim),
+        config.q_lora,
+    )
+    tensors["w_uk"] = bf16(
+        config.local_heads * config.kv_lora,
+        config.nope_dim,
+    )
+    tensors["w_uv"] = bf16(projection, config.kv_lora)
+    tensors["w_gate"] = bf16(projection, hidden)
+    tensors["w_o"] = bf16(hidden, projection)
+
+    qkv_rows = torch.arange(config.qkv_a_rows, device=device)
+    tensors["w_qkv_a"][
+        qkv_rows,
+        qkv_rows.remainder(32),
+    ] = 0.03125
+    q_rows = torch.arange(
+        config.local_heads * (config.nope_dim + config.pe_dim),
+        device=device,
+    )
+    tensors["w_q_b"][
+        q_rows,
+        q_rows.remainder(config.q_lora),
+    ] = 0.0625
+    uk_rows = torch.arange(
+        config.local_heads * config.kv_lora,
+        device=device,
+    )
+    tensors["w_uk"][
+        uk_rows,
+        uk_rows.remainder(config.nope_dim),
+    ] = 0.0625
+    uv_rows = torch.arange(projection, device=device)
+    tensors["w_uv"][
+        uv_rows,
+        uv_rows.remainder(config.kv_lora),
+    ] = 0.0625
+    tensors["w_gate"][
+        uv_rows,
+        uv_rows.remainder(32),
+    ] = 0.03125
+    output_rows = torch.arange(hidden, device=device)
+    tensors["w_o"][
+        output_rows,
+        output_rows.remainder(projection),
+    ] = (rank + 1) / 1024
+    return weights
+
+
 def _projected_input(prefix, weights):
     import torch
 
@@ -644,6 +716,199 @@ def _tp8_worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _exercise_mla_batch(op, batch, device) -> None:
+    import torch
+    import torch.distributed as dist
+
+    from atom.model_ops.monokernel.abi import AgenticDecodeShape
+    from atom.model_ops.monokernel.k3.abi import (
+        KimiAgenticShape,
+        KimiMlaAgenticRuntime,
+    )
+
+    rows = batch * 8
+    hidden = op.config.hidden
+    torch.manual_seed(917)
+    prefix = torch.randn(
+        rows,
+        hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    blocks = torch.zeros(
+        rows,
+        1,
+        hidden,
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    positions = torch.arange(8, dtype=torch.int64, device=device).repeat(
+        batch
+    )
+    batch_ids = torch.arange(
+        batch,
+        dtype=torch.int32,
+        device=device,
+    ).repeat_interleave(8)
+    physical_blocks = torch.arange(
+        batch - 1,
+        -1,
+        -1,
+        dtype=torch.int32,
+        device=device,
+    )
+    block_tables = physical_blocks.view(batch, 1).contiguous()
+    slot_mapping = (
+        physical_blocks.to(torch.int64).repeat_interleave(8) * 16
+        + positions
+    ).contiguous()
+    context_lens = torch.full(
+        (batch,),
+        8,
+        dtype=torch.int32,
+        device=device,
+    )
+    shape = KimiAgenticShape(
+        common=AgenticDecodeShape(
+            running_bs=batch,
+            query_len=8,
+            batch_capacity=batch,
+            row_capacity=rows,
+        ),
+        dcp_size=1,
+        replay_ssm=False,
+    )
+    runtime = KimiMlaAgenticRuntime.bind(
+        shape,
+        positions,
+        slot_mapping,
+        batch_ids,
+        context_lens,
+        block_tables,
+    )
+    cache = torch.zeros(
+        batch * 16,
+        1,
+        576,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    scale = torch.tensor([0.015625], dtype=torch.float32, device=device)
+    rope_cos = torch.ones(rows, 1, 1, 32, device=device)
+    rope_sin = torch.zeros_like(rope_cos)
+    output = torch.empty_like(prefix)
+
+    op.forward(
+        prefix,
+        blocks,
+        runtime,
+        cache,
+        scale,
+        rope_cos,
+        rope_sin,
+        x_out=output,
+    )
+    torch.cuda.synchronize(device)
+    assert torch.isfinite(output).all() and output.abs().max() > 0
+    written = cache.view(-1, 576)[slot_mapping]
+    assert (written.view(torch.uint8) != 0).any()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op.forward(
+            prefix,
+            blocks,
+            runtime,
+            cache,
+            scale,
+            rope_cos,
+            rope_sin,
+            x_out=output,
+        )
+
+    for replay in range(3):
+        eager_output = torch.empty_like(output)
+        op.forward(
+            prefix,
+            blocks,
+            runtime,
+            cache,
+            scale,
+            rope_cos,
+            rope_sin,
+            x_out=eager_output,
+        )
+        output.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize(device)
+        torch.testing.assert_close(
+            output,
+            eager_output,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        assert torch.isfinite(output).all() and output.abs().max() > 0
+        gathered = [
+            torch.empty_like(output) for _ in range(dist.get_world_size())
+        ]
+        dist.all_gather(gathered, output)
+        for peer in gathered[1:]:
+            torch.testing.assert_close(
+                output,
+                peer,
+                atol=2e-2,
+                rtol=2e-2,
+            )
+        if rows > 8 and int(batch_ids[-1]) < 0:
+            assert torch.count_nonzero(output[-8:]) == 0
+
+        if replay == 1 and rows > 8:
+            batch_ids[-8:].fill_(-1)
+            slot_mapping[-8:].fill_(-1)
+        elif replay == 2 and rows > 8:
+            batch_ids[-8:].fill_(batch - 1)
+            slot_mapping[-8:].copy_(
+                physical_blocks[-1].to(torch.int64) * 16 + positions[-8:]
+            )
+
+
+def _tp8_mla_worker(rank: int, port: int) -> None:
+    import torch
+    import torch.distributed as dist
+
+    from atom.model_ops.monokernel.k3.mla_full import KimiK3MlaMonoKernel
+
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=8,
+    )
+    try:
+        weights = _deterministic_mla_weights(device, rank)
+        packed = None
+        for batch in (1, 2, 4):
+            op = KimiK3MlaMonoKernel(
+                weights,
+                batch * 8,
+                layer_idx=0,
+                rank=rank,
+                npes=8,
+                group=None,
+                reduce_group=dist.group.WORLD,
+                defer_collectives=False,
+                packed_artifacts=packed,
+            )
+            packed = op.packed_artifacts()
+            _exercise_mla_batch(op, batch, device)
+            op.close()
+            dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 def test_kimi_agentic_tp8_q8_eager_and_graph_real_rocm():
     torch = pytest.importorskip("torch")
     pytest.importorskip("flydsl")
@@ -656,3 +921,17 @@ def test_kimi_agentic_tp8_q8_eager_and_graph_real_rocm():
     if str(get_rocm_arch() or "") != "gfx950":
         pytest.skip(f"Kimi Agentic MonoKernel requires gfx950, got {get_rocm_arch()}")
     mp.spawn(_tp8_worker, args=(_free_port(),), nprocs=8, join=True)
+
+
+def test_kimi_mla_tp8_q8_eager_and_graph_real_rocm():
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("flydsl")
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 8:
+        pytest.skip("Kimi MLA device gate requires eight ROCm devices")
+
+    import torch.multiprocessing as mp
+    from flydsl.runtime.device import get_rocm_arch
+
+    if str(get_rocm_arch() or "") != "gfx950":
+        pytest.skip(f"Kimi MLA MonoKernel requires gfx950, got {get_rocm_arch()}")
+    mp.spawn(_tp8_mla_worker, args=(_free_port(),), nprocs=8, join=True)

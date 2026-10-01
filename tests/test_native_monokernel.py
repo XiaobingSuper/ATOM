@@ -2,6 +2,7 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import ast
+import inspect
 import subprocess
 import sys
 import types
@@ -724,6 +725,94 @@ def test_kimi_mla_full_dispatch_rejects_non_recipe_contract(override):
     )
     args.update(override)
     assert select_backend(**args) is None
+
+
+@pytest.mark.parametrize("rows", (8, 16, 32))
+def test_kimi_mla_full_kernel_has_one_index_free_device_launch(rows):
+    from atom.model_ops.monokernel.k3.mla_full_kernel import (
+        build_kimi_k3_mla_full_monokernel,
+        mla_full_layout,
+    )
+
+    layout = mla_full_layout(rows, fuse_moe=True)
+    assert layout["mla_fresh"] + rows * 576 * 4 <= layout["_bytes"]
+    assert (
+        layout["mla_dense_acc"] + rows * 12 * 512 * 4
+        <= layout["_bytes"]
+    )
+
+    source = inspect.getsource(build_kimi_k3_mla_full_monokernel)
+    kernel_source = (
+        Path(__file__).parents[1]
+        / "atom"
+        / "model_ops"
+        / "monokernel"
+        / "k3"
+        / "kernel.py"
+    ).read_text()
+    assert "sparse_indices" not in source
+    assert "index_cache" not in source
+    assert "mla_block_tables" in kernel_source
+    assert "mla_slot_mapping" in kernel_source
+    assert "mla_context_lens" in kernel_source
+    assert kernel_source.count("@flyc.kernel") == 1
+    assert kernel_source.count(").launch(grid=") == 1
+
+
+def test_kimi_mla_full_host_reuses_kda_moe_arena_and_epoch():
+    from atom.model_ops.monokernel.k3.mla_full import KimiK3MlaMonoKernel
+
+    source = inspect.getsource(KimiK3MlaMonoKernel)
+    assert "mla_full_layout" in source
+    assert "self.moe_packed" in source
+    assert "self.step = self.attention.step" in source
+    assert "sparse_indices" not in source
+    assert "index_cache" not in source
+
+
+def test_kimi_model_routes_mla_only_in_explicit_mode():
+    source = (
+        Path(__file__).parents[1] / "atom" / "models" / "kimi_k3_mono.py"
+    ).read_text()
+
+    assert "KimiK3MlaMonoKernel" in source
+    assert '"mla_full"' in source
+    assert "external_indexer=False" in source
+    assert "mode != \"mono\"" in source
+    assert "ReplaySSM" not in source
+
+
+def test_kimi_mixed_agentic_specs_share_explicit_full_route():
+    module = _kimi_mono_module()
+    runner = object.__new__(module.KimiMonoDecode)
+    runner._mode = "mono"
+    runner._atom_config = SimpleNamespace(
+        kv_cache_dtype="fp8",
+        decode_context_parallel_size=1,
+    )
+    layers = [
+        SimpleNamespace(
+            layer_idx=1,
+            is_linear_attn=True,
+            block_sparse_moe=object(),
+        ),
+        SimpleNamespace(
+            layer_idx=2,
+            is_linear_attn=False,
+            block_sparse_moe=object(),
+        ),
+    ]
+    runner._lm = SimpleNamespace(
+        model=SimpleNamespace(layers=layers, start_layer=0, end_layer=2)
+    )
+
+    specs = runner._layer_specs(
+        8,
+        state_dtype=__import__("torch").float16,
+        agentic_batch_size=1,
+    )
+
+    assert [backend for _, backend, _ in specs] == ["mono", "mla_full"]
 
 
 @pytest.mark.parametrize(("rows", "mtp", "dcp"), ((48, True, False), (80, True, True)))
