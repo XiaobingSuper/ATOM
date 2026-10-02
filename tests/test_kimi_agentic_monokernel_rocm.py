@@ -1176,7 +1176,7 @@ def _tp8_worker(rank: int, port: int) -> None:
         assert pack_calls == {
             "quantize": 4,
             "expert": 1,
-            "attention": 0,
+            "attention": 4,
         }
     finally:
         dist.destroy_process_group()

@@ -72,8 +72,25 @@ class KimiK3MonoKernel(_KimiK3KdaStagedPath):
         self.attention.configure_monokernel(
             layer_idx,
             fuse_moe=True,
-            moe_packed=getattr(self, "moe_packed", None),
         )
+        canonical_moe = getattr(self.attention, "moe_packed", None)
+        if canonical_moe is not None:
+            self.moe_packed = canonical_moe
+            self.w_router = canonical_moe["w_r"]
+            self.w_latent_down = canonical_moe["w_latent_down"]
+            self.s_latent_down = canonical_moe["s_latent_down"]
+            self.w_shared_ug = canonical_moe["w_shared_ug"]
+            self.s_shared_ug = canonical_moe["s_shared_ug"]
+            self.w_ug = canonical_moe["w_ug"]
+            self.s_ug = canonical_moe["s_ug"]
+            self.w_dn = canonical_moe["w_dn"]
+            self.s_dn = canonical_moe["s_dn"]
+            self.w_shared_dn = canonical_moe["w_shared_dn"]
+            self.s_shared_dn = canonical_moe["s_shared_dn"]
+            self.w_latent_up = canonical_moe["w_latent_up"]
+            self.s_latent_up = canonical_moe["s_latent_up"]
+            self.latent_projection.weight = self.w_latent_down
+            self.latent_projection.scale = self.s_latent_down
 
     def forward(
         self,

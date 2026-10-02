@@ -77,6 +77,10 @@ _FULL_KDA_PACKED_BYTES = (
     + _HIDDEN * _PROJECTION * 2
     + _FULL_MOE_PACKED_BYTES
 )
+# The first KDA bucket builds the attention-owned canonical MoE pack only
+# after the wrapper's temporary pack exists. Later buckets borrow the
+# canonical owner, so reserve exactly one temporary projection pack.
+_FULL_KDA_BUILD_PEAK_BYTES = _FULL_MOE_PACKED_BYTES
 _FULL_MLA_PACKED_BYTES = (
     _HIDDEN * _PROJECTION * 2 + _FULL_MOE_PACKED_BYTES
 )
@@ -1114,6 +1118,7 @@ class KimiMonoDecode:
                 + sources
                 + workspaces
                 + _FULL_SHARED_BYTES
+                + (_FULL_KDA_BUILD_PEAK_BYTES if kda_layers else 0)
             )
             if self._mode == "mono":
                 reserve += (

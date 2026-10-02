@@ -3323,6 +3323,7 @@ def test_kimi_memory_reserve_matches_selectable_graph_buckets(
                 for rows in module.KIMI_MLA_AGENTIC_ROWS
             )
             + module._FULL_SHARED_BYTES
+            + module._FULL_KDA_BUILD_PEAK_BYTES
         )
         if mode == "mono":
             expected += 2 * module._WORKSPACE_RESERVE_PER_LAYER_BUCKET
@@ -3404,6 +3405,7 @@ def test_kimi_full_plan_reserve_uses_shared_arena_not_phantom_per_layer():
             for rows in module.KIMI_MLA_AGENTIC_ROWS
         )
         + module._FULL_SHARED_BYTES
+        + module._FULL_KDA_BUILD_PEAK_BYTES
     )
 
     assert runner.memory_reserve_bytes() == expected
@@ -3458,6 +3460,7 @@ def test_kimi_full_plan_reserve_includes_exact_bucket_mailboxes():
         + workspaces
         + module._FULL_SHARED_ARENA_BYTES
         + mailboxes
+        + module._FULL_KDA_BUILD_PEAK_BYTES
     )
 
 
@@ -3495,6 +3498,7 @@ def test_kimi_full_reserve_counts_one_moe_artifact_set_per_layer():
             for rows in module.KIMI_MLA_AGENTIC_ROWS
         )
         + module._FULL_SHARED_BYTES
+        + module._FULL_KDA_BUILD_PEAK_BYTES
     )
 
     assert runner.memory_reserve_bytes() - nonpacked == packed
@@ -3598,6 +3602,7 @@ def test_kimi_full_reserve_never_undercounts_aggregate_workspaces():
             for layer in layers
         )
         + module._FULL_SHARED_BYTES
+        + module._FULL_KDA_BUILD_PEAK_BYTES
     )
     undercount = (
         packed_and_shared + enumerated - runner.memory_reserve_bytes()
