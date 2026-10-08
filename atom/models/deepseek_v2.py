@@ -219,7 +219,7 @@ def _install_increment_version_pcp_shim() -> None:
     only surfaces under PCP + torch.compile.
 
     Under Prefill Context Parallel the sparse indexer must run through a
-    Dynamo-opaque custom op (``indexer_with_output``) so its runtime
+    Dynamo-opaque custom op (``sparse_attn_indexer_pcp``) so its runtime
     ``_pcp_active()`` branch is not baked to the warmup value. Inserting that op
     reshapes the pre-attention piecewise submodule, and torch's *inference*
     runtime wrapper (``keep_input_mutations=True``, hard-coded in
@@ -2208,29 +2208,25 @@ class IndexerWkWeightsProjLinear(MergedReplicatedLinear):
         super().process_weights_after_loading()
 
 
-def _indexer_with_output_fake(
+def _sparse_attn_indexer_pcp_fake(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
     qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
-    # Identity-passthrough contract: the op returns a fresh tensor shaped like
-    # `qr` (see `indexer_with_output`). The caller consumes it as the query into
-    # `mla_attn`, which keeps the op alive and ordered even independent of the
-    # declared buffer mutation.
-    return torch.empty_like(qr)
+) -> None:
+    pass
 
 
-def indexer_with_output(
+def sparse_attn_indexer_pcp(
     hidden_states: torch.Tensor,
     qr: torch.Tensor,
     qr_scale: torch.Tensor | None,
     positions: torch.Tensor,
     layer_name: str,
     sparse_kv_indices_buffer: torch.Tensor,
-) -> torch.Tensor:
+) -> None:
     """Dynamo-opaque wrapper around ``Indexer.forward_impl``.
 
     Registered as a REGULAR custom op (like ``sparse_attn_indexer``), NOT a
@@ -2263,8 +2259,6 @@ def indexer_with_output(
     latent AOT-autograd ``increment_version`` bug on graphs with SymInt args,
     which ``_install_increment_version_pcp_shim`` neutralizes.)
 
-    The identity ``qr`` return, fed by the caller as the ``mla_attn`` query, is
-    kept as belt-and-suspenders ordering + DCE protection.
     """
     self = get_current_atom_config().compilation_config.static_forward_context[
         layer_name
@@ -2273,17 +2267,13 @@ def indexer_with_output(
     # sparse_attn_indexer). `self.sparse_kv_indices_buffer` is the same tensor
     # object passed in, so the declared mutation matches the real one.
     self.forward_impl(hidden_states, qr, qr_scale, positions)
-    # Fresh tensor equal to qr; consumed by the caller as the mla_attn query.
-    # Clone (not a bare return of qr) so the runtime output matches the fake's
-    # fresh-tensor contract and never aliases an input.
-    return qr.clone()
 
 
 direct_register_custom_op(
-    op_name="indexer_with_output",
-    op_func=indexer_with_output,
+    op_name="sparse_attn_indexer_pcp",
+    op_func=sparse_attn_indexer_pcp,
     mutates_args=["sparse_kv_indices_buffer"],
-    fake_impl=_indexer_with_output_fake,
+    fake_impl=_sparse_attn_indexer_pcp_fake,
 )
 
 
@@ -2393,7 +2383,7 @@ class Indexer(nn.Module):
         self.dcp_owned_counts_buffer = torch.empty(0, dtype=torch.int32, device="cuda")
         atom_config.compilation_config.static_forward_context[prefix] = self
 
-        # Rope module used by `forward_impl` (and the `indexer_with_output`
+        # Rope module used by `forward_impl` (and the `sparse_attn_indexer_pcp`
         # splitting op, which can't take a module arg). Bound by the owning
         # DeepseekV2MLAAttention right after construction; mirrors V4's
         # `self.indexer.rotary_emb = self.rotary_emb`.
@@ -2408,20 +2398,16 @@ class Indexer(nn.Module):
         qr_scale: torch.Tensor | None,
         positions,
         rotary_emb=None,
-    ) -> torch.Tensor | None:
+    ) -> None:
         # Under PCP, route the whole indexer through the Dynamo-opaque
-        # `indexer_with_output` splitting op so the runtime `_pcp_active()` branch
+        # `sparse_attn_indexer_pcp` op so the runtime `_pcp_active()` branch
         # (round-robin k all-gather + separate q/k rope) evaluates live instead of
         # being baked to its warmup value by torch.compile. `pcp_is_enabled()` is
         # a run-level constant (pcp world size is fixed for the process), so this
         # guard is compile-safe and a no-op — a direct `forward_impl` call, graph
         # unchanged — for non-PCP and plugin (SGLang / vLLM / RTP) backends.
         if pcp_is_enabled():
-            # Returns `qr` (identity); the caller feeds it to mla_attn so the
-            # opaque op stays live and ordered. The top-k result travels the
-            # side-buffer (declared mutated, so its write is ordered before the
-            # sparse-MLA read), not this return value.
-            return torch.ops.aiter.indexer_with_output(
+            torch.ops.aiter.sparse_attn_indexer_pcp(
                 hidden_states,
                 qr,
                 qr_scale,
@@ -2429,6 +2415,7 @@ class Indexer(nn.Module):
                 self.prefix,
                 self.sparse_kv_indices_buffer,
             )
+            return
         self.forward_impl(hidden_states, qr, qr_scale, positions, rotary_emb)
 
     def forward_impl(
@@ -2439,7 +2426,7 @@ class Indexer(nn.Module):
         positions,
         rotary_emb=None,
     ) -> None:
-        # The opaque `indexer_with_output` op can't pass a module, so it relies on
+        # The opaque PCP op can't pass a module, so it relies on
         # the bound `self.rotary_emb`; direct callers (non-PCP / plugins) may still
         # pass their own rope explicitly, which takes precedence.
         if rotary_emb is None:
@@ -2775,7 +2762,7 @@ class DeepseekV2MLAAttention(nn.Module):
                     f"{prefix}.indexer",
                 )
                 # Bind the indexer's rope so forward_impl (and the opaque
-                # indexer_with_output splitting op) can rope without receiving a
+                # sparse_attn_indexer_pcp op) can rope without receiving a
                 # module argument. Mirrors deepseek_v4.Attention.__init__.
                 self.indexer.rotary_emb = self.indexer_rope_emb
         else:
@@ -2941,29 +2928,13 @@ class DeepseekV2MLAAttention(nn.Module):
             # The indexer's wk/weights_proj GEMMs run in BF16. When input_layernorm
             # fused the quant it emits a bf16 mirror (indexer_hidden); otherwise
             # hidden_states is already the bf16 normed activation.
-            if pcp_is_enabled():
-                # Under PCP the indexer runs through the opaque `indexer_with_output`
-                # split op, which returns `hidden_states_or_q_c` unchanged
-                # (identity). Feeding it forward as the mla_attn query is what keeps
-                # the op live under torch.compile — its real result (top-k) is a
-                # hidden write to the sparse buffer that mla_attn reads via `self` —
-                # and orders the write before that read. `pcp_is_enabled()` is a
-                # run-level constant, so baking this branch at trace time is correct.
-                hidden_states_or_q_c = self.indexer(
-                    indexer_hidden if indexer_hidden is not None else hidden_states,
-                    hidden_states_or_q_c,
-                    hidden_states_or_q_c_scale,
-                    positions,
-                    self.indexer_rope_emb,
-                )
-            else:
-                self.indexer(
-                    indexer_hidden if indexer_hidden is not None else hidden_states,
-                    hidden_states_or_q_c,
-                    hidden_states_or_q_c_scale,
-                    positions,
-                    self.indexer_rope_emb,
-                )
+            self.indexer(
+                indexer_hidden if indexer_hidden is not None else hidden_states,
+                hidden_states_or_q_c,
+                hidden_states_or_q_c_scale,
+                positions,
+                self.indexer_rope_emb,
+            )
 
         return self.mla_attn(
             hidden_states_or_q_c,

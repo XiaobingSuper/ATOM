@@ -265,7 +265,7 @@ def sparse_attn_indexer_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     topk_indices = torch.full(
         (hidden_states.shape[0], topk_tokens),
         -1,
@@ -289,12 +289,12 @@ def sparse_attn_indexer_plugin_mode(
     # During profile/dummy run the metadata dict may not contain
     # our layer or may be None.
     if attn_metadata_dict is None:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     if k_cache_prefix not in attn_metadata_dict:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
     layer_meta = attn_metadata_dict[k_cache_prefix]
     if layer_meta is None:
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
 
     # vLLM sparse indexer builders return AiterMlaSparseIndexerMetadataForVllm directly
     indexer_meta = layer_meta
@@ -518,7 +518,7 @@ def sparse_attn_indexer_plugin_mode(
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
 
-    return weights
+    return
 
 
 def sparse_attn_indexer_fake(
@@ -547,7 +547,7 @@ def sparse_attn_indexer_fake(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
     # profile_run can get correct memory usage.
@@ -556,13 +556,13 @@ def sparse_attn_indexer_fake(
     )
     _k_fp8 = _flattened_kv[..., :head_dim].view(torch.float8_e4m3fn).contiguous()
     _k_scale = _flattened_kv[..., head_dim:].view(torch.float32).contiguous()
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
     op_name="sparse_attn_indexer_plugin_mode",
     op_func=sparse_attn_indexer_plugin_mode,
     mutates_args=[
+        "kv_cache",
         "sparse_kv_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",

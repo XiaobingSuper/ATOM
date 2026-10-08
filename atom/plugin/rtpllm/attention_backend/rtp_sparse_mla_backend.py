@@ -1576,7 +1576,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     stable_topk: bool,
     context: Any,
     attn_metadata: Any,
-) -> torch.Tensor:
+) -> None:
     from aiter import (
         cp_gather_indexer_k_quant_cache,
         dtypes,
@@ -1602,11 +1602,11 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         )
 
     if bool(getattr(context, "is_dummy_run", False)):
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
 
     num_tokens = int(hidden_states.shape[0])
     if num_tokens <= 0:
-        return weights
+        return
     topk_indices = topk_indices_buffer[:num_tokens, :topk_tokens]
     if topk_indices.dtype != torch.int32:
         raise _SparseUnavailable(
@@ -1657,7 +1657,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
     is_prefill = bool(getattr(context, "is_prefill", False))
     max_seqlen_k = int(getattr(attn_metadata, "max_seqlen_k", 0) or 0)
     if is_prefill and max_seqlen_k <= int(topk_tokens):
-        return weights
+        return
 
     if is_prefill:
         total_seq_lens = int(hidden_states.shape[0])
@@ -1716,7 +1716,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
             stride1=logits.stride(1),
             stable=stable_topk,
         )
-        return weights
+        return
 
     max_seqlen_q = int(getattr(attn_metadata, "max_seqlen_q", 1) or 1)
     num_decode_tokens = int(context.scheduled_bs) * max_seqlen_q
@@ -1757,7 +1757,7 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         logits.stride(1),
         stable=stable_topk,
     )
-    return weights
+    return
 
 
 def rtp_sparse_attn_indexer(
@@ -1786,7 +1786,7 @@ def rtp_sparse_attn_indexer(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     try:
         from atom.utils.forward_context import get_forward_context
 
@@ -1832,12 +1832,12 @@ def rtp_sparse_attn_indexer(
                     ),
                 )
                 topk_indices_buffer[:num_tokens, :topk_tokens].copy_(causal_topk)
-            return weights
+            return
 
     if context is not None and attn_metadata is not None:
         # rtp-llm never runs DCP, so the compact offsets/counts buffers stay
         # empty placeholders and this top-k-only path leaves them untouched.
-        return _run_rtp_sparse_attn_indexer_topk_only(
+        _run_rtp_sparse_attn_indexer_topk_only(
             hidden_states,
             kv_cache,
             q_input,
@@ -1863,6 +1863,7 @@ def rtp_sparse_attn_indexer(
             context,
             attn_metadata,
         )
+        return
 
     from atom.models.deepseek_v2 import sparse_attn_indexer
 
@@ -1893,7 +1894,6 @@ def rtp_sparse_attn_indexer(
         use_qk_rope_cache_fusion,
         stable_topk,
     )
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 def rtp_sparse_attn_indexer_fake(
@@ -1922,14 +1922,15 @@ def rtp_sparse_attn_indexer_fake(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
+) -> None:
+    pass
 
 
 direct_register_custom_op(
     op_name="rtp_sparse_attn_indexer",
     op_func=rtp_sparse_attn_indexer,
     mutates_args=[
+        "kv_cache",
         "topk_indices_buffer",
         "dcp_sparse_kv_indptr_buffer",
         "dcp_owned_counts_buffer",

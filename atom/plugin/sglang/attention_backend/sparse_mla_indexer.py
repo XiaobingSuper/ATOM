@@ -1288,13 +1288,13 @@ def sparse_attn_indexer_sglang_plugin_mode(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     from atom.plugin.sglang.models.base_model_wrapper import get_current_forward_batch
 
     del kv_cache, total_seq_lens
     forward_batch = get_current_forward_batch()
     if forward_batch is None or forward_batch.forward_mode.is_idle():
-        return torch.zeros_like(weights, dtype=torch.float32)
+        return
 
     token_to_kv_pool, _ = _resolve_sglang_pools(forward_batch)
     if token_to_kv_pool is None or not hasattr(
@@ -1401,7 +1401,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
             logits.stride(1),
             stable=stable_topk,
         )
-        return weights
+        return
 
     if indexer_graph_buffers is None:
         cu_starts, cu_ends = _build_sglang_query_ranges(forward_batch)
@@ -1453,7 +1453,7 @@ def sparse_attn_indexer_sglang_plugin_mode(
     topk_indices.copy_(
         torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
     )
-    return weights
+    return
 
 
 def sparse_attn_indexer_sglang_fake(
@@ -1480,13 +1480,14 @@ def sparse_attn_indexer_sglang_fake(
     is_neox_style: bool,
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
-) -> torch.Tensor:
+) -> None:
     del (
         hidden_states,
         k_cache_prefix,
         kv_cache,
         q_input,
         k,
+        weights,
         quant_block_size,
         scale_fmt,
         topk_tokens,
@@ -1505,7 +1506,6 @@ def sparse_attn_indexer_sglang_fake(
         use_qk_rope_cache_fusion,
         stable_topk,
     )
-    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(
