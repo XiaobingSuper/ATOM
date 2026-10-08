@@ -1661,12 +1661,13 @@ def sparse_attn_indexer(
             device=q_bf16.device,
             dtype=torch.uint8,
         )
-        # Zeroed, not empty: this call leaves `compute_all_q_rope` default, so
-        # the op skips `slot < 0` rows outright, while the decode scorer reads
-        # the full `batch_size * next_n`. A sequence short of the speculation
-        # width would otherwise weight its pad rows with whatever the allocator
-        # held. Zero is also the right weight for a row whose logits go unread.
-        weights_mqa = torch.zeros_like(weights)
+        # AITER requires contiguous [rows, heads] output. Non-DCP skips
+        # slot<0 rows, whose scorer bounds are empty; DCP computes every row.
+        weights_mqa = torch.empty(
+            weights.shape,
+            dtype=weights.dtype,
+            device=weights.device,
+        )
         indexer_qk_rope_quant_and_cache(
             q_bf16,
             q_quant,
@@ -1688,13 +1689,9 @@ def sparse_attn_indexer(
             q_scale_out=q_fp4_scale,
             kv_cache_scale=indexer_module.k_cache.kv_cache_scale,
         )
-        # Only this op's fp32 *return* is synthesised. The kernel's `weights_out`
-        # must stay `q.dtype` under FP4 (`aiter/ops/cache.py`), so `weights_mqa`
-        # cannot simply be allocated fp32; converting it instead would put a copy
-        # kernel in all 21 captured layers. Zeroed rather than empty: what makes
-        # it unread is a refusal three files away in `Indexer.__init__`, while
-        # `sparse_attn_indexer_fake` promises torch.compile a real tensor.
-        weights = torch.zeros(weights.shape, device=weights.device, dtype=torch.float32)
+        # This synthetic fp32 return satisfies the custom-op schema. Non-PCP
+        # callers discard it, and FP4 refuses PCP, its only value consumer.
+        weights = torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
     elif use_qk_rope_cache_fusion:
         q_bf16 = q_input
         q_quant = torch.empty_like(q_bf16, dtype=dtypes.fp8)
