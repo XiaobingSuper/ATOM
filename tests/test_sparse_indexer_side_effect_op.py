@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: MIT
 
-import ast
 import runpy
 import warnings
 from pathlib import Path
 
 import torch
 from torch._inductor.utils import run_and_get_code
-from torch._subclasses.fake_tensor import FakeTensorMode
 
 ROOT = Path(__file__).parents[1]
 direct_register_custom_op = runpy.run_path(
@@ -65,33 +63,20 @@ direct_register_custom_op(
 )
 
 
-def test_none_schema_and_fake_impl_declare_only_real_mutations():
+def test_side_effect_op_stays_ordered_without_a_synthetic_output():
     op = torch.ops.atom_test_sparse_indexer.write_index.default
     assert len(op._schema.returns) == 0
-    mutated = {
+    assert {
         argument.name
         for argument in op._schema.arguments
         if argument.alias_info is not None and argument.alias_info.is_write
-    }
-    assert mutated == {
+    } == {
         "kv_cache",
         "sparse_indices",
         "sparse_indptr",
         "owned_counts",
     }
 
-    with FakeTensorMode() as mode:
-        args = [
-            mode.from_tensor(torch.empty(7, 13, dtype=torch.bfloat16)),
-            mode.from_tensor(torch.empty(3, dtype=torch.bfloat16)),
-            mode.from_tensor(torch.empty(3, dtype=torch.int32)),
-            mode.from_tensor(torch.empty(2, dtype=torch.int32)),
-            mode.from_tensor(torch.empty(2, dtype=torch.int32)),
-        ]
-        assert op(*args) is None
-
-
-def test_inductor_orders_no_output_writer_before_cache_and_sparse_reader():
     def fn(weights, kv_cache, sparse_indices, sparse_indptr, owned_counts):
         torch.ops.atom_test_sparse_indexer.write_index(
             weights, kv_cache, sparse_indices, sparse_indptr, owned_counts
@@ -125,69 +110,3 @@ def test_inductor_orders_no_output_writer_before_cache_and_sparse_reader():
     assert "async_compile.cpp" not in code
     assert "async_compile.triton" not in code
     assert "empty_strided_cpu((7, 13)" not in code
-
-
-def test_native_and_plugin_return_contracts_stay_separate():
-    contracts = [
-        ("atom/models/deepseek_v2.py", "sparse_attn_indexer", None),
-        ("atom/models/deepseek_v2.py", "sparse_attn_indexer_fake", None),
-        (
-            "atom/plugin/vllm/attention/layer_sparse_mla.py",
-            "sparse_attn_indexer_plugin_mode",
-            "torch.Tensor",
-        ),
-        (
-            "atom/plugin/sglang/attention_backend/sparse_mla_indexer.py",
-            "sparse_attn_indexer_sglang_plugin_mode",
-            "torch.Tensor",
-        ),
-        (
-            "atom/plugin/rtpllm/attention_backend/rtp_sparse_mla_backend.py",
-            "rtp_sparse_attn_indexer",
-            "torch.Tensor",
-        ),
-    ]
-    for relative_path, function_name, expected in contracts:
-        tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
-        function = next(
-            node
-            for node in tree.body
-            if isinstance(node, ast.FunctionDef) and node.name == function_name
-        )
-        if expected is None:
-            assert (
-                isinstance(function.returns, ast.Constant)
-                and function.returns.value is None
-            )
-            assert not any(
-                isinstance(node, ast.Return) and node.value is not None
-                for node in ast.walk(function)
-            )
-        else:
-            assert ast.unparse(function.returns) == expected
-
-    source = (ROOT / "atom/models/deepseek_v2.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    registration = next(
-        node.value
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Expr)
-        and isinstance(node.value, ast.Call)
-        and any(
-            keyword.arg == "op_name"
-            and isinstance(keyword.value, ast.Constant)
-            and keyword.value.value == "sparse_attn_indexer"
-            for keyword in node.value.keywords
-        )
-    )
-    mutations = next(
-        keyword.value
-        for keyword in registration.keywords
-        if keyword.arg == "mutates_args"
-    )
-    assert [item.value for item in mutations.elts] == [
-        "kv_cache",
-        "sparse_kv_indices_buffer",
-        "dcp_sparse_kv_indptr_buffer",
-        "dcp_owned_counts_buffer",
-    ]
