@@ -1866,7 +1866,7 @@ def rtp_sparse_attn_indexer(
 
     from atom.models.deepseek_v2 import sparse_attn_indexer
 
-    return sparse_attn_indexer(
+    sparse_attn_indexer(
         hidden_states,
         k_cache_prefix,
         kv_cache,
@@ -1893,6 +1893,7 @@ def rtp_sparse_attn_indexer(
         use_qk_rope_cache_fusion,
         stable_topk,
     )
+    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 def rtp_sparse_attn_indexer_fake(
@@ -1922,35 +1923,7 @@ def rtp_sparse_attn_indexer_fake(
     use_qk_rope_cache_fusion: bool,
     stable_topk: bool,
 ) -> torch.Tensor:
-    from atom.models.deepseek_v2 import sparse_attn_indexer_fake
-
-    return sparse_attn_indexer_fake(
-        hidden_states,
-        k_cache_prefix,
-        kv_cache,
-        q_input,
-        k,
-        weights,
-        quant_block_size,
-        scale_fmt,
-        topk_tokens,
-        head_dim,
-        max_model_len,
-        total_seq_lens,
-        topk_indices_buffer,
-        dcp_sparse_kv_indptr_buffer,
-        dcp_owned_counts_buffer,
-        k_norm_weight,
-        k_norm_bias,
-        k_norm_eps,
-        positions,
-        cos_cache,
-        sin_cache,
-        weights_scale,
-        is_neox_style,
-        use_qk_rope_cache_fusion,
-        stable_topk,
-    )
+    return torch.empty(weights.shape, device=weights.device, dtype=torch.float32)
 
 
 direct_register_custom_op(

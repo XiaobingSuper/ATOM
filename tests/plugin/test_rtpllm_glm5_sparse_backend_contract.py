@@ -49,11 +49,9 @@ def _forward_context_module():
 def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
     calls = []
-    expected = torch.empty(1)
 
     def fake_sparse_attn_indexer(*args):
         calls.append(args)
-        return expected
 
     fake_deepseek = type(sys)("atom.models.deepseek_v2")
     fake_deepseek.sparse_attn_indexer = fake_sparse_attn_indexer
@@ -90,7 +88,9 @@ def test_rtp_sparse_attn_indexer_bridge_forwards_to_main_indexer(monkeypatch):
         False,
     )
 
-    assert output is expected
+    assert output.shape == tensor.shape
+    assert output.dtype == torch.float32
+    assert output.device == tensor.device
     assert len(calls) == 1
     assert calls[0][0] is tensor
     assert calls[0][1] == "indexer.prefix"
@@ -168,20 +168,17 @@ def test_rtp_sparse_attn_indexer_uses_rtp_topk_path_when_context_exists(monkeypa
     )
 
 
-def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
+def test_rtp_sparse_attn_indexer_fake_keeps_plugin_output_contract(monkeypatch):
     module = importlib.import_module(_SPARSE_BACKEND_MODULE)
-    calls = []
-    expected = torch.empty(1)
 
-    def fake_sparse_attn_indexer_fake(*args):
-        calls.append(args)
-        return expected
+    def unexpected_native_fake(*args):
+        raise AssertionError("RTP fake must not inherit the native None schema")
 
     fake_deepseek = type(sys)("atom.models.deepseek_v2")
-    fake_deepseek.sparse_attn_indexer_fake = fake_sparse_attn_indexer_fake
+    fake_deepseek.sparse_attn_indexer_fake = unexpected_native_fake
     monkeypatch.setitem(sys.modules, "atom.models.deepseek_v2", fake_deepseek)
 
-    tensor = torch.empty(1)
+    tensor = torch.empty(2, 3, dtype=torch.bfloat16)
     dcp_indptr = torch.empty(0, dtype=torch.int32)
     dcp_counts = torch.empty(0, dtype=torch.int32)
     output = module.rtp_sparse_attn_indexer_fake(
@@ -212,13 +209,9 @@ def test_rtp_sparse_attn_indexer_fake_bridge_forwards_to_main_fake(monkeypatch):
         False,
     )
 
-    assert output is expected
-    assert len(calls) == 1
-    assert calls[0][0] is tensor
-    assert calls[0][1] == "indexer.prefix"
-    assert calls[0][6:12] == (128, None, 2048, 64, 4096, 1)
-    assert calls[0][13] is dcp_indptr
-    assert calls[0][14] is dcp_counts
+    assert output.shape == tensor.shape
+    assert output.dtype == torch.float32
+    assert output.device == tensor.device
 
 
 def test_rtp_sparse_attn_indexer_short_prefill_fills_causal_topk(monkeypatch):

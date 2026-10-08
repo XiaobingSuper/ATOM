@@ -125,8 +125,8 @@ def test_unsupported_fp4_requests_name_the_knob_that_blocked_them():
     check()
     with pytest.raises(ValueError, match="fused QK/RoPE/cache"):
         check(fused_writer=False)
-    # PCP's candidate exchange is the only reader of the indexer op's return, so
-    # the FP4 path may leave that tensor unwritten only while this refusal holds.
+    # PCP's candidate exchange needs fp32 weights that the FP4 writer does not
+    # produce, independently of the native custom op's side-effect-only ABI.
     with pytest.raises(ValueError, match="does not support PCP"):
         check(prefill_context_parallel=True)
     # Decode micro-batching is supported; only the prefill split is not, because
