@@ -2023,7 +2023,6 @@ def sparse_attn_indexer(
                 NUM_TOPK_TOKENS=topk_tokens,
                 out=sparse_kv_indices_buffer,
             )
-    return
 
 
 def sparse_attn_indexer_fake(

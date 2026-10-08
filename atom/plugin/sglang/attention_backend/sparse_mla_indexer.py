@@ -1453,7 +1453,6 @@ def sparse_attn_indexer_sglang_plugin_mode(
     topk_indices.copy_(
         torch.where(topk_indices >= 0, topk_indices - cu_starts[:, None], topk_indices)
     )
-    return
 
 
 def sparse_attn_indexer_sglang_fake(

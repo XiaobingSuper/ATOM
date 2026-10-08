@@ -518,8 +518,6 @@ def sparse_attn_indexer_plugin_mode(
         NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
     )
 
-    return
-
 
 def sparse_attn_indexer_fake(
     hidden_states: torch.Tensor,

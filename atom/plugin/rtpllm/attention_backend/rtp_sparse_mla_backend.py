@@ -1757,7 +1757,6 @@ def _run_rtp_sparse_attn_indexer_topk_only(
         logits.stride(1),
         stable=stable_topk,
     )
-    return
 
 
 def rtp_sparse_attn_indexer(
