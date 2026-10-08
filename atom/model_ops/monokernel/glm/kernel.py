@@ -73,6 +73,7 @@ from atom.model_ops.monokernel.config import (
     V_DIM,
     as_kv_cache_layout,
 )
+from atom.model_ops.monokernel.glm.abi import GLM5_ABI
 from atom.model_ops.monokernel.glm.layout import (
     BLOCKS,
     DCP_SUMMARY_PAIRS,
@@ -188,6 +189,8 @@ def build_glm5_monokernel(
     uv_scale_rows: int = 128,
     native_fp4_mfma: bool = False,
     timeline: bool = False,
+    jit_key: tuple = (),
+    internal_indices: bool = False,
 ):
     """Return the ``@flyc.jit`` launcher for one rank's whole layer.
 
@@ -210,7 +213,7 @@ def build_glm5_monokernel(
     assert not native_fp4_mfma or atom_experts
     attention_k_chunks_per_unit = 1 if attention_bf16 else 2
     SPLIT_KEYS = sparse_keys_per_task(S, heads)
-    assert topk % SPLIT_KEYS == 0 and 1 <= S <= 12
+    assert topk % SPLIT_KEYS == 0 and 1 <= S <= 16
     assert 1 <= launches_per_step <= LAYER_SLOTS
     assert not with_indexer or (
         topk == 2048 and index_max_seq % INDEX_KEYS_PER_TASK == 0
@@ -378,6 +381,7 @@ def build_glm5_monokernel(
         rank: Int32,
         layer: Int32,
     ):
+        _ = jit_key
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % 64
@@ -2448,9 +2452,15 @@ def build_glm5_monokernel(
         def split_keys(t, s):
             """(nkeys, sparse) of sample s; wave 0 writes this split's cache rows to LDS."""
             if const_expr(use_atom_kv_cache):
-                index_base, index_end = row_index_bounds(s)
-                nkeys = index_end - index_base
-                sparse = index_end > index_base
+                if const_expr(internal_indices):
+                    context = row_position(s) + 1
+                    index_base = s * topk
+                    nkeys = fx.min(context, topk)
+                    sparse = context > topk
+                else:
+                    index_base, index_end = row_index_bounds(s)
+                    nkeys = index_end - index_base
+                    sparse = index_end > index_base
             else:
                 index_base = s * topk
                 kv_len = pos0 + s + 1
@@ -3929,6 +3939,7 @@ def build_glm5_monokernel(
         layer: Int32,
         stream: fx.Stream = fx.Stream(None),
     ):
+        _ = jit_key
         glm5_monokernel(
             h_in,
             x_out,
@@ -3970,4 +3981,5 @@ def build_glm5_monokernel(
             layer,
         ).launch(grid=(G,), block=(THREADS,), stream=stream)
 
+    GLM5_ABI.check(glm5_monokernel, launch)
     return launch
