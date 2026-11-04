@@ -96,6 +96,22 @@ def test_decode_topk_block_size_policy(monkeypatch, arch, max_block, want):
     assert m._decode_topk_block_size_k(max_block) == want
 
 
+@pytest.mark.parametrize(
+    "arch,batch,max_block,want",
+    [
+        ("gfx950", 128, 2000, 4),
+        ("gfx1250", 1, 2000, 4),
+        ("gfx1250", 2, 2000, 4),
+        ("gfx1250", 4, 512, 4),
+        ("gfx1250", 4, 513, 2),
+        ("gfx1250", 128, 2000, 2),
+    ],
+)
+def test_decode_score_num_warps(monkeypatch, arch, batch, max_block, want):
+    monkeypatch.setattr(m, "get_gfx", lambda: arch)
+    assert m._decode_score_num_warps(batch, max_block) == want
+
+
 class TestPrefillTileWidth:
     """clamp(next_pow2(max_block), MIN, MAX), and the two ends of the clamp."""
 
