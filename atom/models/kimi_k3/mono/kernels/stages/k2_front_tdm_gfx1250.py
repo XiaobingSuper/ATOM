@@ -115,10 +115,12 @@ def _front_tasks(
     on_slab=None,
     token_buffers=2,
     prefetch=None,
+    store_cm=0,
 ):
     """CTA ``pair``'s two projection tasks of ``x`` and their epilogue. The
     accumulators are reduced in the weight slabs' LDS, consumed by then (not
-    the token slabs', which a cluster peer's multicast may still be filling)."""
+    the token slabs', which a cluster peer's multicast may still be filling).
+    ``store_cm``: the outputs' stores' cache policy."""
     red = lds.gemv.ptr + tdm_lds_words(rows, 2, token_buffers=token_buffers)[0]
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router_logits, latent_fp4, latent_scales, shared_hidden = outputs
@@ -237,8 +239,18 @@ def _front_tasks(
         )
         if local_token < tile_rows:
             if router:
-                bo.buffer_store(low, rsrc(router_logits), token * EXPERTS + row)
-                bo.buffer_store(high, rsrc(router_logits), token * EXPERTS + row + 1)
+                bo.buffer_store(
+                    low,
+                    rsrc(router_logits),
+                    token * EXPERTS + row,
+                    cache_modifier=store_cm,
+                )
+                bo.buffer_store(
+                    high,
+                    rsrc(router_logits),
+                    token * EXPERTS + row + 1,
+                    cache_modifier=store_cm,
+                )
             else:
                 fx.ptr_store(packed, lds.group.ptr + token * 16 + task * 8 + row_pair)
     gpu.barrier()
@@ -258,6 +270,7 @@ def _front_tasks(
                     .bitcast(fx.Int32)[0],
                     rsrc(shared_hidden),
                     (token * SHARED_COLUMNS + shared_column0) // 2 + column_pair,
+                    cache_modifier=store_cm,
                 )
     if latent & (tid < rows * 4):
         token = tid // 4
@@ -279,12 +292,14 @@ def _front_tasks(
             moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
             rsrc(latent_fp4),
             token * (LATENT // 8) + group * 4 + packed_word,
+            cache_modifier=store_cm,
         )
         if packed_word == 0:
             bo.buffer_store(
                 fx.Int8(code),
                 rsrc(latent_scales),
                 token * (LATENT // 32) + group,
+                cache_modifier=store_cm,
             )
 
 

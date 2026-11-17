@@ -950,7 +950,9 @@ def build_moe(
         """The kernel on ``smem`` (an ``Lds``). ``fused``: the launch's part
         after the lite finish (``k2_fused_gfx1250``): ``epoch`` its tag's,
         ``wait_routes()`` until ``ids`` are in, ``down_done(tag)`` once the
-        CTA's ``grouped`` rows are stored at device scope and drained."""
+        CTA's ``grouped`` rows are stored at device scope and drained; with
+        ``wait_latent()`` (a launch whose front stores the latent) the
+        latent's copy waits on it and reads at device scope."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -982,6 +984,10 @@ def build_moe(
         def publish(word):
             st_dev(tag, flags, word)
 
+        latent_cm = (
+            CM_DEV if fused is not None and "wait_latent" in fused else 0
+        )
+
         def issue_latent():
             if wave == WEIGHT_ISSUER:
                 gemv_tdm.load_rows(
@@ -994,6 +1000,7 @@ def build_moe(
                     whole=True,
                     width=LATENT // 4,
                     pad_every=LATENT_PAD_EVERY,
+                    cache_policy=latent_cm,
                 )
             if wave == SCALE_ISSUER:
                 gemv_tdm.load_rows(
@@ -1005,9 +1012,12 @@ def build_moe(
                     padded=False,
                     whole=True,
                     width=LATENT_SCALES // 2,
+                    cache_policy=latent_cm,
                 )
 
         if const_expr(fused is not None):
+            if const_expr("wait_latent" in fused):
+                fused["wait_latent"]()
             # The latent is the front's: in flight while the routes come in.
             issue_latent()
             fused["wait_routes"]()

@@ -94,6 +94,13 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_fused_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
     build_finalize_local,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_one_gfx1250 import (
+    FLAGS as K2_ONE_FLAGS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_one_gfx1250 import (
+    K2OneKernel,
+    build_k2_one,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
     build_oproj_allreduce,
     oproj_peer_bytes,
@@ -316,6 +323,10 @@ class Gfx1250WidthBuild:
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
 _SEAM_FRONTS: dict[tuple, K2SeamFrontKernel | None] = {}
 _OPROJ_SEAM_FRONTS: dict[tuple, K2OprojSeamFrontKernel | None] = {}
+_K2_ONES: dict[tuple, K2OneKernel | None] = {}
+# the finish arguments (``_finish_args``) the one-launch K2's seam supplies:
+# the gathered logits, the shared hidden rows, the latent and its scales
+_SEAM_OUTPUTS = frozenset((0, 9, 16, 17))
 
 
 @dataclass(frozen=True)
@@ -760,7 +771,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     tail_flag_words(), dtype=torch.int32, device=self.device
                 )
         fused = None
-        if envs.ATOM_KIMI_MONO_K2_FUSED and fused_moe is not None:
+        if (
+            envs.ATOM_KIMI_MONO_K2_FUSED or envs.ATOM_KIMI_MONO_K2_ONE
+        ) and fused_moe is not None:
             fused = build_k2_fused(
                 plan,
                 herd=herd,
@@ -894,7 +907,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 core = self._k1(build, plan, normed, None, blocks, metadata)
             pending = None
             if build.oproj is not None and plan.layer_id in self.oproj_weights:
-                if envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT:
+                if envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT or envs.ATOM_KIMI_MONO_K2_ONE:
                     # landed by the fused launch, or by _oproj where it fails
                     attn_out = core.new_empty(core.size(0), HIDDEN)
                     pending = core
@@ -954,7 +967,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         seam = (None if reset else prefix, blocks[:, : weight.blocks + reset], attn_out)
         prefix_out = None
         if core is not None:
-            if local.grouped_experts:
+            if local.grouped_experts and envs.ATOM_KIMI_MONO_K2_ONE:
+                prefix_out = self._k2_one(
+                    local,
+                    weight,
+                    site,
+                    seam,
+                    core,
+                    plan.layer_id,
+                    self.inner.layers[plan.layer_id].block_sparse_moe,
+                    stream,
+                )
+                if prefix_out is not None:
+                    return prefix_out, buffers["final"]
+            if local.grouped_experts and envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT:
                 prefix_out = self._oproj_seam_front(
                     local, weight, site, seam, core, plan.layer_id, stream
                 )
@@ -1168,9 +1194,19 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             self.oproj_seam_front_sync = torch.zeros(
                 OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
             )
+        _OPROJ_SEAM_FRONTS[key].launcher(
+            *self._seam_args(
+                local, weight, seam, core, layer_id, mix, self.oproj_seam_front_sync
+            ),
+            stream=stream,
+        )
+        return mix.prefix_out
+
+    def _seam_args(self, local, weight, seam, core, layer_id, mix, sync):
+        """``k2_oproj_seam_front_gfx1250``'s arguments."""
         o_weight, o_scale = self.oproj_weights[layer_id]
         buffers = local.buffers
-        _OPROJ_SEAM_FRONTS[key].launcher(
+        return (
             core.data_ptr(),
             o_weight.data_ptr(),
             o_scale.data_ptr(),
@@ -1185,7 +1221,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             mix.out.data_ptr(),
             mix.prefix_out.data_ptr(),
             mix.blocks.stride(0),
-            self.oproj_seam_front_sync.data_ptr(),
+            sync.data_ptr(),
             weight.w_gate.data_ptr(),
             weight.w_ld.data_ptr(),
             weight.w_sgu.data_ptr(),
@@ -1194,6 +1230,84 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["latent_fp4"].data_ptr(),
             buffers["latent_scales"].data_ptr(),
             buffers["shared_hidden"].data_ptr(),
+        )
+
+    def _k2_one(self, local, weight, site, seam, core, layer_id, moe, stream):
+        """The whole K2 -- o_proj and its all-reduce, the MLP-side AttnRes
+        mix, the front, the lite finish, the fused MoE and the K2 tail into
+        ``final`` -- as one launch (``k2_one_gfx1250``, the separate
+        launches' bits); the mix's ``prefix_out``, or None where the fused
+        K2 has no tail, the mix takes more than its attention row or the
+        launch cannot hold it. Its flags and sync words are one set for every
+        layer and width: launches never overlap."""
+        fused = local.fused
+        if fused is None or not fused.tail:
+            return None
+        mix = _mono_mix_args(site, *seam, None)
+        if mix is None or mix.key[1] > 1:
+            return None
+        fp8 = weight.w_sgu_scale is not None
+        fp8_down = weight.w_sd_scale is not None
+        key = (
+            local.plan.tokens,
+            fp8,
+            fp8_down,
+            local.herd,
+            self.tp,
+            self.dims.proj,
+            weight.ln_eps,
+            *mix.key,
+        )
+        if key not in _K2_ONES:
+            try:
+                _K2_ONES[key] = build_k2_one(
+                    local.plan,
+                    self.tp,
+                    self.dims.proj,
+                    *mix.key,
+                    herd=local.herd,
+                    fp8_shared=fp8,
+                    fp8_shared_down=fp8_down,
+                    tail_eps=weight.ln_eps,
+                )
+            except ValueError as e:
+                logger.info("Kimi-K3 mono: K2 keeps separate launches (%s)", e)
+                _K2_ONES[key] = None
+        if _K2_ONES[key] is None:
+            return None
+        if "k2_one_sync" not in self.__dict__:
+            self.k2_one_sync = torch.zeros(
+                OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
+            )
+            self.k2_one_flags = torch.zeros(
+                K2_ONE_FLAGS, dtype=torch.int32, device=self.device
+            )
+        buffers = local.buffers
+        weights, ids = self._fused_moe_routes(local)
+        flags, state = self.fused_moe_sync
+        finish = self._finish_args(weight, local, buffers["router_logits"])
+        _K2_ONES[key].launcher(
+            *self._seam_args(
+                local, weight, seam, core, layer_id, mix, self.k2_one_sync
+            ),
+            # the finish's past the seam's: its gathered logits, shared hidden
+            # rows and latent are the seam's outputs
+            *(arg for i, arg in enumerate(finish) if i not in _SEAM_OUTPUTS),
+            ids.data_ptr(),
+            moe.experts.w13_weight_scale.data_ptr(),
+            moe.experts.w2_weight_scale.data_ptr(),
+            buffers["fused_inter"].data_ptr(),
+            buffers["fused_grouped"].data_ptr(),
+            flags.data_ptr(),
+            state.data_ptr(),
+            self.k2_one_flags.data_ptr(),
+            buffers["reduce"].data_ptr(),
+            weights.data_ptr(),
+            weight.ln_w.data_ptr(),
+            weight.w_up_full.data_ptr(),
+            buffers["final"].data_ptr(),
+            self.k2_tail_flags.data_ptr(),
+            self.k2_peers.peers.data_ptr(),
             stream=stream,
         )
         return mix.prefix_out

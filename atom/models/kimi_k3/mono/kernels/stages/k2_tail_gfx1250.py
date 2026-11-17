@@ -537,7 +537,8 @@ def build_k2_tail(
         """The kernel on ``storage`` (an ``Lds``). ``fused``: the launch's
         last part (``k2_fused_gfx1250``): ``wait_inputs()`` before the
         all-reduce reads ``data``, ``grouped`` and ``route_weights``, then
-        at device scope."""
+        at device scope; with ``epoch`` the launch's all-reduce epoch, whose
+        counters the launch stores itself."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -546,9 +547,14 @@ def build_k2_tail(
         floats = storage.floats.peek().ptr
         if const_expr(profile):
             _stamp(flags, bid, tid, 0)
-        epoch = (
-            fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
-        )
+        own_epoch = fused is None or "epoch" not in fused
+        if const_expr(own_epoch):
+            epoch = (
+                fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32))
+                + 1
+            )
+        else:
+            epoch = fused["epoch"]
         row0 = bid * (2 * ROWS)
         owner = bid < PAIRS
         # Threads [0, 128) finish a tile's first task, the rest its second.
@@ -601,7 +607,8 @@ def build_k2_tail(
             if const_expr(fused is not None):
                 fused["wait_inputs"]()
             _ar_finish(c, _ar_push(c))
-            _store_epochs(epochs, bid, tid, grid, epoch)
+            if const_expr(own_epoch):
+                _store_epochs(epochs, bid, tid, grid, epoch)
             if const_expr(profile):
                 _stamp(flags, bid, tid, 1)
             # Every reader of what the flags publish reads at device scope:

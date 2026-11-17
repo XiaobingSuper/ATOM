@@ -666,6 +666,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_SEAM_FRONT": lambda: (
         os.getenv("ATOM_KIMI_MONO_SEAM_FRONT", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: a KDA layer's whole K2 -- o_proj and its
+    # all-reduce, the MLP-side AttnRes mix, the replicated front, the lite
+    # finish, the fused MoE and the K2 tail -- as one launch (k2_one_gfx1250,
+    # bit-identical to the separate launches) where the fused K2 has its tail
+    # (ATOM_KIMI_MONO_TAIL); 0 keeps the separate launches.
+    "ATOM_KIMI_MONO_K2_ONE": lambda: os.getenv("ATOM_KIMI_MONO_K2_ONE", "0") == "1",
     # Kimi-K3 gfx1250 mono: o_proj, its all-reduce, the MLP-side AttnRes mix
     # and the replicated K2 front in one launch (k2_oproj_seam_front_gfx1250,
     # bit-identical to the o_proj all-reduce then the seam front), where the

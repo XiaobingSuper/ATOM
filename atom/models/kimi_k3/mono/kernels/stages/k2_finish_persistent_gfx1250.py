@@ -416,7 +416,12 @@ def build_packed_finish(
         first part (``k2_fused_gfx1250``), its outputs at device scope:
         ``put`` a route's store, ``route_done(token)`` once a token's routes
         are stored, ``herd_done()`` once HERD's are, ``shared_done()`` once
-        the CTA's shared down is (each its stores drained first)."""
+        the CTA's shared down is (each its stores drained first). A launch
+        whose front is its own part too adds ``wait_router()`` before a
+        token's routing reads ``front_gathered``, ``wait_shared()`` before
+        the shared down reads ``shared_hidden`` (its weights already in
+        flight) and ``poll``, the routing's loads, both read at device
+        scope."""
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
         lane = tid % GFX1250.wave_size
@@ -500,6 +505,8 @@ def build_packed_finish(
             bo.buffer_load(rsrc(scratch), launch_word, vec_width=1, dtype=T.i32)
         )
         if (route_token >= 0) & (route_token < rows):
+            if const_expr(fused is not None and "wait_router" in fused):
+                fused["wait_router"]()
             herd_candidates = (
                 {"herd_candidates": (candidates, moe_gfx1250.herd_tag(launch))}
                 if precompute_herd
@@ -511,7 +518,11 @@ def build_packed_finish(
                 "lane": lane,
                 "wave": wave,
                 "red": route_role.red.ptr,
-                "poll": _direct_poll,
+                "poll": (
+                    fused["poll"]
+                    if fused is not None and "poll" in fused
+                    else _direct_poll
+                ),
                 "put": _direct_put if fused is None else fused["put"],
                 "peer": {"rlog_own": front_gathered},
                 "args": {"bias": router_bias},
@@ -710,6 +721,9 @@ def build_packed_finish(
                     "threads": THREADS,
                     "tail": {"gemv_rows": shared_down.rows.ptr},
                 }
+                if const_expr(fused is not None and "wait_shared" in fused):
+                    fused["wait_shared"]()
+                    staging["load_cm"] = CM_DEV
                 if const_expr(replicated_front):
                     # The replicated front already activated the shared columns.
                     moe_tail_gfx1250.stage_hidden_rows(staging, shared_hidden)

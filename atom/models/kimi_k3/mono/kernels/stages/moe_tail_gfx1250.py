@@ -50,6 +50,7 @@ def _rows_to_lds(c, source, columns, row_stride):
     # Every 16-byte load is issued before the first store: a load guarded by
     # its own bound waits out the previous one, a round trip per round.
     tokens, tid, threads = c["S"], c["tid"], c["threads"]
+    load_cm = c.get("load_cm", 0)
     packs = tokens * columns // PACK
     rounds = (packs + threads - 1) // threads
     words = [
@@ -58,6 +59,7 @@ def _rows_to_lds(c, source, columns, row_stride):
             fx.min(tid + threads * index, packs - 1) * (PACK // 2),
             vec_width=PACK // 2,
             dtype=T.i32,
+            cache_modifier=load_cm,
         )
         for index in range_constexpr(rounds)
     ]

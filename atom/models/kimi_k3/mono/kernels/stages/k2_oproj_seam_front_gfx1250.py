@@ -120,6 +120,9 @@ class K2OprojSeamFrontKernel:
     token_buffers: int
     abi: KernelAbi = OPROJ_SEAM_FRONT_ABI
     launch_count: int = 1
+    # its LDS struct and kernel body, for a launch that runs it as a part
+    lds: object = None
+    body: object = None
 
 
 def oproj_lds_words(rows: int) -> int:
@@ -456,41 +459,49 @@ def build_oproj_seam_front(
     flags = rows * split
     sources = SOURCES
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        core: Int64,
-        w_o: Int64,
-        w_o_scale: Int64,
-        attn_out: Int64,
-        peers: Int64,
-        epochs: Int64,
-        rank: Int32,
-        blocks: Int64,
-        prefix: Int64,
-        score_weight: Int64,
-        out_weight: Int64,
-        x: Int64,
-        prefix_out: Int64,
-        token_stride: Int32,
-        sync: Int64,
-        router_weight: Int64,
-        latent_weight: Int64,
-        shared_weight: Int64,
-        shared_scale: Int64,
-        router_logits: Int64,
-        latent_fp4: Int64,
-        latent_scales: Int64,
-        shared_hidden: Int64,
+    @traced
+    def body(
+        lds,
+        core,
+        w_o,
+        w_o_scale,
+        attn_out,
+        peers,
+        epochs,
+        rank,
+        blocks,
+        prefix,
+        score_weight,
+        out_weight,
+        x,
+        prefix_out,
+        token_stride,
+        sync,
+        router_weight,
+        latent_weight,
+        shared_weight,
+        shared_scale,
+        router_logits,
+        latent_fp4,
+        latent_scales,
+        shared_hidden,
+        fused=None,
     ):
-        _ = sources
+        """The kernel on ``lds`` (an ``Lds``). ``fused``: the launch's first
+        part (``k2_one_gfx1250``): ``epoch`` the launch's all-reduce epoch,
+        whose counters the launch stores itself; the front's outputs stored
+        at device scope, then ``front_done()`` on each projection CTA."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
         wave = tid // GFX1250.wave_size
-        lds = fx.SharedAllocator().allocate(Lds).peek()
-        epoch = (
-            fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32)) + 1
-        )
+        if const_expr(fused is None):
+            epoch = (
+                fx.Int32(bo.buffer_load(rsrc(epochs), bid, vec_width=1, dtype=T.i32))
+                + 1
+            )
+        else:
+            epoch = fused["epoch"]
         mine = load_ptr64(peers, rank)
         reduce = _Reduce(
             rows,
@@ -601,15 +612,73 @@ def build_oproj_seam_front(
                 on_slab=on_slab if profile else None,
                 token_buffers=token_buffers,
                 prefetch=prefetch,
+                store_cm=0 if fused is None else CM_DEV,
             )
             stamp(3)
+            if const_expr(fused is not None):
+                fused["front_done"]()
         if bid >= projections:
             _sum_duty(reduce, bid, tid)
             _land_duty(reduce, bid, tid)
-        gpu.barrier()
-        counter = bid + tid * grid
-        if counter < ar.MAX_CTAS:
-            bo.buffer_store(epoch, rsrc(epochs), counter)
+        if const_expr(fused is None):
+            gpu.barrier()
+            counter = bid + tid * grid
+            if counter < ar.MAX_CTAS:
+                bo.buffer_store(epoch, rsrc(epochs), counter)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        core: Int64,
+        w_o: Int64,
+        w_o_scale: Int64,
+        attn_out: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        blocks: Int64,
+        prefix: Int64,
+        score_weight: Int64,
+        out_weight: Int64,
+        x: Int64,
+        prefix_out: Int64,
+        token_stride: Int32,
+        sync: Int64,
+        router_weight: Int64,
+        latent_weight: Int64,
+        shared_weight: Int64,
+        shared_scale: Int64,
+        router_logits: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        shared_hidden: Int64,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(Lds).peek(),
+            core,
+            w_o,
+            w_o_scale,
+            attn_out,
+            peers,
+            epochs,
+            rank,
+            blocks,
+            prefix,
+            score_weight,
+            out_weight,
+            x,
+            prefix_out,
+            token_stride,
+            sync,
+            router_weight,
+            latent_weight,
+            shared_weight,
+            shared_scale,
+            router_logits,
+            latent_fp4,
+            latent_scales,
+            shared_hidden,
+        )
 
     @flyc.jit
     def launch(
@@ -673,5 +742,5 @@ def build_oproj_seam_front(
 
     OPROJ_SEAM_FRONT_ABI.check(kernel, launch)
     return K2OprojSeamFrontKernel(
-        name, launch, (grid,), (THREADS,), split, token_buffers
+        name, launch, (grid,), (THREADS,), split, token_buffers, lds=Lds, body=body
     )
