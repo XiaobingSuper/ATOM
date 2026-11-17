@@ -85,6 +85,10 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_tdm_gfx1250 import (
     build_replicated_front,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_head_gfx1250 import (
+    K2HeadKernel,
+    build_k2_head,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
     build_finalize_local,
 )
@@ -304,6 +308,7 @@ class Gfx1250WidthBuild:
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
 _SEAM_FRONTS: dict[tuple, K2SeamFrontKernel | None] = {}
 _OPROJ_SEAM_FRONTS: dict[tuple, K2OprojSeamFrontKernel | None] = {}
+_K2_HEADS: dict[tuple, K2HeadKernel | None] = {}
 
 
 @dataclass(frozen=True)
@@ -867,7 +872,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 core = self._k1(build, plan, normed, None, blocks, metadata)
             pending = None
             if build.oproj is not None and plan.layer_id in self.oproj_weights:
-                if envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT:
+                if envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT or envs.ATOM_KIMI_MONO_K2_HEAD:
                     # landed by the fused launch, or by _oproj where it fails
                     attn_out = core.new_empty(core.size(0), HIDDEN)
                     pending = core
@@ -927,7 +932,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         seam = (None if reset else prefix, blocks[:, : weight.blocks + reset], attn_out)
         prefix_out = None
         if core is not None:
-            if local.grouped_experts:
+            if local.grouped_experts and envs.ATOM_KIMI_MONO_K2_HEAD:
+                prefix_out = self._k2_head(
+                    local, weight, site, seam, core, plan.layer_id, stream
+                )
+            if prefix_out is None and local.grouped_experts:
                 prefix_out = self._oproj_seam_front(
                     local, weight, site, seam, core, plan.layer_id, stream
                 )
@@ -1134,9 +1143,50 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             self.oproj_seam_front_sync = torch.zeros(
                 OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
             )
+        _OPROJ_SEAM_FRONTS[key].launcher(
+            *self._oproj_seam_args(
+                local, weight, seam, core, layer_id, mix, self.oproj_seam_front_sync
+            ),
+            stream=stream,
+        )
+        return mix.prefix_out
+
+    def _k2_head(self, local, weight, site, seam, core, layer_id, stream):
+        """``_oproj_seam_front`` with the split-K front (``k2_head_gfx1250``):
+        the mix's ``prefix_out``, or None where the head cannot hold it. Its
+        sync words are one set for every layer and width."""
+        mix = _mono_mix_args(site, *seam, None)
+        if mix is None or mix.key[1] > 1:
+            return None
+        fp8 = weight.w_sgu_scale is not None
+        key = (local.plan.tokens, fp8, self.tp, self.dims.proj, *mix.key)
+        if key not in _K2_HEADS:
+            try:
+                _K2_HEADS[key] = build_k2_head(
+                    local.plan, self.tp, self.dims.proj, *mix.key, fp8_shared=fp8
+                )
+            except ValueError as e:
+                logger.info("Kimi-K3 mono: the K2 head keeps its full-K front (%s)", e)
+                _K2_HEADS[key] = None
+        if _K2_HEADS[key] is None:
+            return None
+        if "k2_head_sync" not in self.__dict__:
+            self.k2_head_sync = torch.zeros(
+                OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
+            )
+        _K2_HEADS[key].launcher(
+            *self._oproj_seam_args(
+                local, weight, seam, core, layer_id, mix, self.k2_head_sync
+            ),
+            stream=stream,
+        )
+        return mix.prefix_out
+
+    def _oproj_seam_args(self, local, weight, seam, core, layer_id, mix, sync):
+        """``OPROJ_SEAM_FRONT_ABI``'s arguments, ``sync`` its words."""
         o_weight, o_scale = self.oproj_weights[layer_id]
         buffers = local.buffers
-        _OPROJ_SEAM_FRONTS[key].launcher(
+        return (
             core.data_ptr(),
             o_weight.data_ptr(),
             o_scale.data_ptr(),
@@ -1151,7 +1201,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             mix.out.data_ptr(),
             mix.prefix_out.data_ptr(),
             mix.blocks.stride(0),
-            self.oproj_seam_front_sync.data_ptr(),
+            sync.data_ptr(),
             weight.w_gate.data_ptr(),
             weight.w_ld.data_ptr(),
             weight.w_sgu.data_ptr(),
@@ -1160,9 +1210,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["latent_fp4"].data_ptr(),
             buffers["latent_scales"].data_ptr(),
             buffers["shared_hidden"].data_ptr(),
-            stream=stream,
         )
-        return mix.prefix_out
 
     def _sharded_front(self, plan, weight, local, attn_out, prefix, blocks, x):
         """This rank's router/latent rows and the packed all-gather of them."""

@@ -687,6 +687,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_OPROJ_SEAM_FRONT": lambda: (
         os.getenv("ATOM_KIMI_MONO_OPROJ_SEAM_FRONT", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: the o_proj seam front with its front split over K
+    # (k2_head_gfx1250): each front CTA's weights in flight before the
+    # all-reduce lands, then only its quarter of x; its outputs differ from
+    # the separate launches' in the last bits. Tried before
+    # ATOM_KIMI_MONO_OPROJ_SEAM_FRONT; 0 keeps that.
+    "ATOM_KIMI_MONO_K2_HEAD": lambda: (
+        os.getenv("ATOM_KIMI_MONO_K2_HEAD", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the

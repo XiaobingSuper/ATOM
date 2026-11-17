@@ -828,6 +828,107 @@ def test_oproj_seam_front_takes_oproj_its_all_reduce_and_the_seam_in_one_launch(
     )
 
 
+@pytest.mark.parametrize("fits", (True, False))
+def test_k2_head_is_tried_before_the_oproj_seam_front(monkeypatch, fits):
+    rows, layer_id = 2, 3
+    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        w_gate=tensor(4, 4),
+        w_ld=tensor(4, 4),
+        w_sgu=tensor(4, 4),
+        w_sgu_scale=None,
+    )
+    buffers = {
+        name: tensor(rows, 4)
+        for name in ("router_logits", "latent_fp4", "latent_scales", "shared_hidden")
+    }
+    calls = {}
+
+    def recorder(name):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+        )
+
+    local = SimpleNamespace(
+        plan=SimpleNamespace(tokens=rows),
+        front=recorder("front"),
+        buffers=buffers,
+        grouped_experts=True,
+    )
+    blocks = tensor(rows, 3, 4)
+    mix = runner_module._MixArgs(
+        (2, 1, 1e-6, 1e-5),
+        blocks[:, :2],
+        *(tensor(rows, 4) for _ in range(3)),
+        tensor(4),
+        tensor(4),
+        tensor(rows, 4),
+        tensor(rows, 4),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.device = torch.device("cpu")
+    runner.tp, runner.rank = 4, 1
+    runner.dims = SimpleNamespace(proj=3072)
+    runner.routed = {layer_id: weight}
+    runner.oproj_weights = {layer_id: (tensor(4, 4), tensor(4))}
+    runner.oproj_peers = tensor(4, dtype=torch.int64)
+    runner.k2_peers = SimpleNamespace(epochs=tensor(256, dtype=torch.int32))
+    runner.inner = SimpleNamespace(
+        layers={layer_id: SimpleNamespace(mlp_attn_res=object())}
+    )
+    monkeypatch.setenv("ATOM_KIMI_MONO_SEAM_FRONT", "0")
+    monkeypatch.setenv("ATOM_KIMI_MONO_K2_HEAD", "1")
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(runner_module, "_OPROJ_SEAM_FRONTS", {})
+    monkeypatch.setattr(runner_module, "_K2_HEADS", {})
+    monkeypatch.setattr(runner_module, "_mono_mix_args", lambda *_args: mix)
+
+    def build_k2_head(plan, tp, proj, *key, fp8_shared):
+        assert (plan, tp, proj, key, fp8_shared) == (
+            local.plan, 4, 3072, mix.key, False
+        )
+        if not fits:
+            raise ValueError("no LDS")
+        return recorder("head")
+
+    monkeypatch.setattr(runner_module, "build_k2_head", build_k2_head)
+    monkeypatch.setattr(
+        runner_module,
+        "build_oproj_seam_front",
+        lambda *_args, **_kwargs: recorder("fused"),
+    )
+
+    class Finished(Exception):
+        pass
+
+    def finish(_self, _weight, _local, gathered, _stream):
+        calls["finish"] = gathered
+        raise Finished
+
+    monkeypatch.setattr(K3Gfx1250MonoDecodeRunner, "_finish", finish)
+    build = SimpleNamespace(k2={layer_id: local}, oproj=recorder("oproj"))
+    plan = SimpleNamespace(layer_id=layer_id)
+    attn_out, core = tensor(rows, 4), tensor(rows, 6)
+
+    with pytest.raises(Finished):
+        runner._routed_k2(build, plan, attn_out, tensor(rows, 4), blocks, core)
+
+    assert "oproj" not in calls and "front" not in calls
+    assert ("head" in calls) is fits and ("fused" in calls) is not fits
+    args = calls["head" if fits else "fused"]
+    assert args[:4] == (
+        core.data_ptr(),
+        runner.oproj_weights[layer_id][0].data_ptr(),
+        runner.oproj_weights[layer_id][1].data_ptr(),
+        attn_out.data_ptr(),
+    )
+    sync = runner.k2_head_sync if fits else runner.oproj_seam_front_sync
+    assert args[14] == sync.data_ptr()
+    assert args[18] == 0
+
+
 @pytest.mark.parametrize("all_reduce", ("collective", "kernel", "gather"))
 def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, all_reduce):
     rows, layer_id, latent, hidden = 2, 3, 3584, 7168
