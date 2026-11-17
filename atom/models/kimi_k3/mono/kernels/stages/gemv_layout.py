@@ -58,12 +58,16 @@ def tdm_task_words(fp8: bool = False) -> int:
 
 
 def tdm_lds_words(
-    rows: int, tasks: int, fp8: bool = False, depth: int = TDM_DEPTH
+    rows: int,
+    tasks: int,
+    fp8: bool = False,
+    depth: int = TDM_DEPTH,
+    token_buffers: int = 2,
 ) -> tuple[int, int]:
     """``(token, weight)`` i32 LDS words of the TDM GEMV for one CTA."""
 
     return (
-        2 * rows * TDM_ROW_STRIDE // 2,
+        token_buffers * rows * TDM_ROW_STRIDE // 2,
         (depth + 1) * tasks * tdm_task_words(fp8) + (TDM_FP8_SCALE_WORDS if fp8 else 0),
     )
 

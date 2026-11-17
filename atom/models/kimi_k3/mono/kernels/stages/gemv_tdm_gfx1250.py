@@ -99,9 +99,11 @@ def load_rows(
     width: int = SLAB,
     pad_every: int = 0,
     uniform: bool = False,
+    store: bool = False,
 ):
     """Issue this wave's TDM copy of ``rows_per_wave`` of a [rows, width] BF16
     tile starting at ``address`` into ``lds``; rows past ``rows`` are skipped.
+    ``store``: the copy the other way, ``lds`` to ``address``.
     ``mask`` is the cluster multicast mask of identical loads to merge.
     ``padded``: LDS rows ``ROW_STRIDE`` apart, else packed ``width`` apart.
     ``pad_every``: with ``padded`` off, one pad dword after every ``pad_every``
@@ -164,7 +166,12 @@ def load_rows(
     )
     zero4 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(_i32(0))] * 4)
     zero8 = vector.from_elements(T.vec(8, T.i32), [as_ir_value(_i32(0))] * 8)
-    rocdl_dialect.tensor_load_to_lds(
+    copy = (
+        rocdl_dialect.tensor_store_from_lds
+        if store
+        else rocdl_dialect.tensor_load_to_lds
+    )
+    copy(
         group0,
         group1,
         zero4,
@@ -249,6 +256,7 @@ def project(
     prologue=None,
     x_cache_policy: int = 0,
     wide: bool = True,
+    on_slab=None,
     token_buffers: int = 2,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
@@ -268,6 +276,9 @@ def project(
     keeps at most three tensor copies in flight, so small copies cap the bytes
     a CU has in flight.
 
+    ``on_slab(slab)``: emitted once a slab's operands have landed (a profile
+    build's stamps); it keeps the slab loop unrolled.
+
     ``token_buffers``: token slabs resident in LDS (``x_words`` grows with
     it), so that many are in flight once ``x`` is first read."""
 
@@ -278,7 +289,13 @@ def project(
     if fp8 and slabs > GFX1250.wave_size:
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
-    if _ROLLED_UNROLL and wide and token_buffers == 2 and 1 + 2 * tasks <= WAVES:
+    if (
+        _ROLLED_UNROLL
+        and wide
+        and on_slab is None
+        and token_buffers == 2
+        and 1 + 2 * tasks <= WAVES
+    ):
         return _project_rolled(
             lds,
             x,
@@ -427,6 +444,8 @@ def project(
             last = max(index for index, tag in enumerate(issued) if tag == slab)
             rocdl.s_wait_tensorcnt(len(issued) - 1 - last)
         gpu.barrier()
+        if on_slab is not None:
+            on_slab(slab)
         weights = [
             (
                 _fp8_operand(

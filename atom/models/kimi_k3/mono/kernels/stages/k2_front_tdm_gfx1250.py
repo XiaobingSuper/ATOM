@@ -112,11 +112,13 @@ def _front_tasks(
     x_cache_policy=0,
     wide=False,
     depth=gemv_tdm.DEPTH,
+    on_slab=None,
+    token_buffers=2,
 ):
     """CTA ``pair``'s two projection tasks of ``x`` and their epilogue. The
     accumulators are reduced in the weight slabs' LDS, consumed by then (not
     the token slabs', which a cluster peer's multicast may still be filling)."""
-    red = lds.gemv.ptr + tdm_lds_words(rows, 2)[0]
+    red = lds.gemv.ptr + tdm_lds_words(rows, 2, token_buffers=token_buffers)[0]
     router_weight, latent_weight, shared_weight, shared_scale = weights
     router_logits, latent_fp4, latent_scales, shared_hidden = outputs
     router = pair < LATENT_PAIR0
@@ -153,6 +155,8 @@ def _front_tasks(
                     prologue=prologue,
                     x_cache_policy=x_cache_policy,
                     wide=wide,
+                    on_slab=on_slab,
+                    token_buffers=token_buffers,
                 ),
                 red,
                 tiles,
@@ -175,6 +179,8 @@ def _front_tasks(
                     prologue=prologue,
                     x_cache_policy=x_cache_policy,
                     wide=wide,
+                    on_slab=on_slab,
+                    token_buffers=token_buffers,
                     depth=depth,
                 ),
                 red,
@@ -198,6 +204,8 @@ def _front_tasks(
                 prologue=prologue,
                 x_cache_policy=x_cache_policy,
                 wide=wide,
+                on_slab=on_slab,
+                token_buffers=token_buffers,
                 depth=depth,
             ),
             red,
