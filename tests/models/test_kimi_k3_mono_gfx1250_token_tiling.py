@@ -8,6 +8,7 @@ from atom.models.kimi_k3.mono.kernels import execution_plan as ep
 from atom.models.kimi_k3.mono.kernels.attention import layout as attention
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     PROJECTION_TASKS_PER_CTA,
+    SEAM_TOKEN_BUFFERS,
     declare_local,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import K1Protocol
@@ -156,4 +157,11 @@ def test_s48_lds_unions_are_tile_local_aligned_and_bounded(tokens):
     assert k1.lds.variant("projection").fields[0].bytes == max(
         min(tokens, 16) * k1.xrow * 2,
         gemv_layout.tdm_lds_bytes(tokens, PROJECTION_TASKS_PER_CTA),
+        gemv_layout.tdm_lds_bytes(
+            tokens,
+            PROJECTION_TASKS_PER_CTA,
+            True,
+            gemv_layout.TDM_FP8_DEPTH,
+            SEAM_TOKEN_BUFFERS,
+        ),
     )

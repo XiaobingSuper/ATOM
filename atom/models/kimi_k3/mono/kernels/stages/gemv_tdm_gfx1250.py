@@ -232,6 +232,7 @@ def project(
     prologue=None,
     x_cache_policy: int = 0,
     wide: bool = True,
+    token_buffers: int = 2,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -248,7 +249,10 @@ def project(
     ``wide``: each slab's tokens and each task's weight slab move in one TDM
     copy, by a wave of its own in turn, not as every wave's few rows: a wave
     keeps at most three tensor copies in flight, so small copies cap the bytes
-    a CU has in flight."""
+    a CU has in flight.
+
+    ``token_buffers``: token slabs resident at once, so ``token_buffers - 1``
+    are in flight ahead of the one being multiplied."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -258,7 +262,8 @@ def project(
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
     tiles = (rows + ROWS - 1) // ROWS
-    x_words, _ = tdm_lds_words(rows, tasks, fp8)
+    x_words, _ = tdm_lds_words(rows, tasks, fp8, token_buffers=token_buffers)
+    ahead = token_buffers - 1
     token_words = rows * ROW_STRIDE // 2
     task_words = tdm_task_words(fp8)
     stages = depth + 1
@@ -299,7 +304,7 @@ def project(
             load_rows(
                 x + fx.Int64(slab * SLAB * 2),
                 x_stride,
-                lds + (slab % 2) * token_words,
+                lds + (slab % token_buffers) * token_words,
                 rows,
                 rows if whole else rows_per_wave,
                 _CLUSTER_MASK,
@@ -370,10 +375,11 @@ def project(
                 cluster.cluster_barrier()
             else:
                 gpu.barrier()
-            if slab + 1 < slabs:
-                issue_tokens(slab + 1)
-        elif slabs > 1:
-            issue_tokens(1)
+            if slab + ahead < slabs:
+                issue_tokens(slab + ahead)
+        else:
+            for later in range(1, min(ahead + 1, slabs)):
+                issue_tokens(later)
         if slab + depth < slabs:
             issue_weights(slab + depth)
         if wide:
@@ -404,7 +410,7 @@ def project(
             )
             for task in range(tasks)
         ]
-        tokens = lds + (slab % 2) * token_words
+        tokens = lds + (slab % token_buffers) * token_words
         for tile in range(tiles):
             activations = _operand(
                 tokens,

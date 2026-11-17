@@ -16,7 +16,9 @@ and the finish runs the routed experts too.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
+from types import MappingProxyType
 
 import torch
 from aiter import ActivationType, QuantType, dtypes
@@ -330,6 +332,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
     oproj_weights: dict[int, tuple[torch.Tensor, torch.Tensor]] | None = None
     # full-attention layers running o_proj and K2 here (``_bind``)
     ffn_layers: frozenset[int] = frozenset()
+    # KDA layers whose AttnRes seam K1 runs: whether it adds a delta (``_bind``)
+    k1_seams: Mapping[int, bool] = MappingProxyType({})
 
     def __init__(self, model, drafter=None, metadata_builder=None) -> None:
         group = get_tp_group().cpu_group
@@ -443,6 +447,34 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 logger.info(
                     "Kimi-K3 mono: layer %d keeps AITER's o_proj (%s)", layer_id, e
                 )
+        self.k1_seams = self._k1_seams() if envs.ATOM_KIMI_MONO_K1_SEAM else {}
+        if self.k1_seams:
+            logger.info(
+                "Kimi-K3 gfx1250 mono: %d KDA layers run their AttnRes seam in K1",
+                len(self.k1_seams),
+            )
+
+    def _k1_seams(self) -> dict[int, bool]:
+        """The routed KDA layers whose attention-side seam K1 runs, and whether
+        it adds a residual delta: those that mix one to fifteen blocks and are
+        handed a residual row with at most one addend -- the first layer
+        (none) or one after a routed layer (its FFN output). Behind a fallback
+        layer (a second addend, or no residual row once it closes a block)
+        the separate mix stays."""
+        seams = {}
+        for index, plan in enumerate(self.plans):
+            before, _ = layer_block(plan.layer_id)
+            if (
+                plan.kda is None
+                or plan.layer_id not in self.routed
+                or not 1 <= before <= 15
+            ):
+                continue
+            if index == 0:
+                seams[plan.layer_id] = False
+            elif self.plans[index - 1].layer_id in self.routed:
+                seams[plan.layer_id] = True
+        return seams
 
     def _allocate(self) -> None:
         self.ones = torch.ones(self.max_rows, dtype=torch.int32, device=self.device)
@@ -476,24 +508,28 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         for layer in self.plans:
             if layer.kda is not None:
                 weight = layer.kda
+                seam = self.k1_seams.get(layer.layer_id)
+                before, write_idx = layer_block(layer.layer_id)
                 spec = K1LocalBuildSpec(
                     qlen=qlen,
-                    delta=False,
+                    delta=bool(seam),
                     state_len=self.state_len,
                     eps=weight.seam.eps,
                     out_eps=weight.seam.out_eps,
                     onorm_eps=weight.onorm_eps,
                     lower_bound=weight.lower_bound,
-                    write_idx=-1,
+                    write_idx=-1 if seam is None else write_idx,
                     quant_core=_fuse_ptpc_core(self.inner.layers[layer.layer_id], rows),
-                    external_seam=True,
+                    external_seam=seam is None,
                     fp8_projection=weight.w_in_scale is not None,
                 )
-                cache_key = spec
+                # an in-kernel seam mixes the layer's own blocks
+                nblocks = 1 if seam is None else before
+                cache_key = (spec, nblocks)
                 local = k1_cache.get(cache_key)
                 if local is None:
                     local = (
-                        self._plan(rows, 1)
+                        self._plan(rows, nblocks)
                         .make_k1_local_runner(spec)
                         .prepare(self.device)
                     )
@@ -751,6 +787,16 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     plan, positions, prefix, blocks, add, add2
                 )
                 core = core[: prefix.size(0)]
+            elif plan.layer_id in self.k1_seams:
+                # K1 mixes, adds ``add`` to ``prefix`` in place and banks it.
+                layer = self.inner.layers[plan.layer_id]
+                delta = self.k1_seams[plan.layer_id]
+                if prefix is None or add2 is not None or (add is not None) != delta:
+                    raise MonoUnsupported(
+                        f"layer {plan.layer_id}: K1's seam was built for "
+                        f"{'one addend' if delta else 'none'}"
+                    )
+                core = self._k1(build, plan, prefix, add, blocks, metadata)
             else:
                 layer, normed, prefix, _, write_idx = self._seam(
                     plan, prefix, blocks, add, add2, bf16=True

@@ -224,6 +224,122 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     assert all(tensor is None or tensor.shape == prefix.shape for tensor in out)
 
 
+def test_k1_seams_are_the_kda_layers_behind_routed_ones():
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    kda, attention = object(), None
+    runner.plans = [
+        SimpleNamespace(layer_id=0, kda=kda),
+        SimpleNamespace(layer_id=1, kda=kda),
+        SimpleNamespace(layer_id=2, kda=kda),
+        SimpleNamespace(layer_id=3, kda=attention),
+        SimpleNamespace(layer_id=4, kda=kda),
+        SimpleNamespace(layer_id=5, kda=kda),
+        SimpleNamespace(layer_id=6, kda=kda),
+    ]
+    # layer 4 falls back to production: neither it nor the layer after it
+    # (a second addend) runs K1's seam
+    runner.routed = {0: object(), 1: object(), 2: object(), 3: object(), 5: object()}
+    runner.routed[6] = object()
+    # layer 0 mixes no block yet; layer 1 adds no delta only when it leads
+    assert runner._k1_seams() == {1: True, 2: True, 6: True}
+    runner.plans = runner.plans[1:]
+    assert runner._k1_seams() == {1: False, 2: True, 6: True}
+
+
+@pytest.mark.parametrize("delta", (False, True))
+def test_k1_runs_the_seam_itself_where_built_for_it(delta):
+    rows, hidden = 2, 4
+    prefix = torch.zeros(rows, hidden)
+    add = torch.ones_like(prefix) if delta else None
+    blocks = torch.zeros(rows, 3, hidden)
+    core = torch.full((rows, hidden), 2.0)
+    calls = {}
+
+    def seam(*_args):
+        raise AssertionError("the separate AttnRes mix ran")
+
+    def k1(_build, _plan, residual, addend, visible, _metadata):
+        calls["k1"] = (residual, addend, visible)
+        return core
+
+    layer = SimpleNamespace(
+        self_attention_attn_res=seam,
+        self_attn=SimpleNamespace(o_proj=lambda value: value + 1),
+    )
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.inner = SimpleNamespace(layers={13: layer})
+    runner.routed = {13: object()}
+    runner.k1_seams = {13: delta}
+    runner._k1 = k1
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+        calls.update(routed=(attn, value)) or value,
+        attn,
+    )
+    runner._write_aux = lambda *_args: None
+    plan = SimpleNamespace(layer_id=13, mono=True, kda=object())
+    build = SimpleNamespace(oproj=None)
+
+    runner._layer(build, plan, None, prefix, blocks, add, None, None)
+
+    residual, addend, visible = calls["k1"]
+    assert residual is prefix and addend is add and visible is blocks
+    attn_out, routed_prefix = calls["routed"]
+    torch.testing.assert_close(attn_out, core + 1)
+    # K1 updated the residual row in place
+    assert routed_prefix is prefix
+    with pytest.raises(MonoUnsupported, match="K1's seam was built"):
+        runner._layer(build, plan, None, prefix, blocks, prefix, prefix, None)
+
+
+def test_width_build_gives_seam_layers_an_in_kernel_seam_k1():
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    weight = SimpleNamespace(
+        seam=SimpleNamespace(eps=1e-6, out_eps=1e-5),
+        onorm_eps=1e-5,
+        lower_bound=-5.0,
+        w_in_scale=object(),
+    )
+    runner.plans = [
+        SimpleNamespace(layer_id=layer_id, kda=weight) for layer_id in (12, 13, 14)
+    ]
+    runner.inner = SimpleNamespace(
+        layers={
+            layer_id: SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    o_proj=SimpleNamespace(quant_type=QuantType.No, params_dtype=None)
+                )
+            )
+            for layer_id in (12, 13, 14)
+        }
+    )
+    runner.k1_seams = {12: True, 13: True}
+    runner.routed = {}
+    runner.oproj_peers = None
+    runner.state_len = 3
+    runner.device = torch.device("cpu")
+    built = []
+
+    class Plan:
+        def __init__(self, rows, nblocks):
+            self.nblocks = nblocks
+
+        def make_k1_local_runner(self, spec):
+            built.append((spec, self.nblocks))
+            return SimpleNamespace(prepare=lambda _device: (spec, self.nblocks))
+
+    runner._plan = Plan
+    width = runner._build_width(runner_module.width_key(8, 1))
+
+    seam, plain, external = (width.k1[layer_id] for layer_id in (12, 13, 14))
+    assert len(built) == 3
+    assert seam[0].delta and not seam[0].external_seam
+    # layer 12 mixes block 0 and banks block 1
+    assert seam[1] == 1 and seam[0].write_idx == 1
+    assert plain[1] == 2 and plain[0].write_idx == -1
+    assert external[0].external_seam and external[1] == 1
+    assert not external[0].delta and external[0].write_idx == -1
+
+
 def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
     rows, hidden = 2, 4
     prefix = torch.zeros(rows, hidden)

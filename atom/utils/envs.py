@@ -639,6 +639,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Kimi-K3 gfx1250 mono: the AttnRes seams' mix on the gfx1250 FlyDSL kernel
     # (a CTA a token, the reductions in another order); 0 keeps Triton's.
     "ATOM_KIMI_MONO_ATTN_RES": lambda: os.getenv("ATOM_KIMI_MONO_ATTN_RES", "1") == "1",
+    # Kimi-K3 gfx1250 mono: a KDA layer's attention-side AttnRes seam (the mix,
+    # the residual add and the block bank) inside K1, a seam token a CTA,
+    # instead of the AttnRes mix launched before it; 0 keeps the separate mix.
+    "ATOM_KIMI_MONO_K1_SEAM": lambda: os.getenv("ATOM_KIMI_MONO_K1_SEAM", "0") == "1",
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the

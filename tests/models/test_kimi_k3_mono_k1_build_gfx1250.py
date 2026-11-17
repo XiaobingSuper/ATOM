@@ -123,7 +123,7 @@ def test_resident_launch_pins_one_eight_wave_cta_per_cu():
     assert kept < barrier < read
 
     projection = source.index("if bid >= ATTENTION_CTAS:")
-    ready = source.index("mailbox_poll_device(", projection)
+    ready = source.index("_await_tokens(", projection)
     weights = source.index('compute["kda_gemv_loads"](', ready)
     assert projection < ready < weights
     declaration = builder.declare_local(_plan(), qlen=16)

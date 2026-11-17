@@ -47,6 +47,10 @@ HEADS = 12
 STATE_CHUNKS = HEAD_DIM // VALUE_CHUNK
 ATTENTION_REDUCTION_GROUPS = 8
 LDS_PAD = 8
+X_ALIGNMENT = 4096
+# The in-kernel seam's projection: its weights' first slabs land while the
+# seam runs, so its token slabs set the pace and run two ahead.
+SEAM_TOKEN_BUFFERS = 3
 # The local resident pipeline is intentionally independent of gfx950's
 # persistent-kernel transport arguments (ReplaySSM and peer-memory buffers).
 K1_ABI_NAMES = (
@@ -209,10 +213,7 @@ COMPUTE_BINDINGS = (
     ("kda_recur", "kda_recur"),
     ("kda_norm", "kda_norm"),
     ("attention_reduce32", "attention_reduce32"),
-    ("attention_gate", "attention_gate"),
-    ("attention_gate_tile", "attention_gate_tile"),
-    ("attention_mix", "attention_mix"),
-    ("attention_mix_tile", "attention_mix_tile"),
+    ("attention_token", "attention_token"),
 )
 
 DEVICE_PROTOCOL_BINDINGS = (
@@ -452,6 +453,11 @@ def role_lds_plan(
     tile_rows = plan.token_tiling.lds_rows
     plan.attention_seam_lds_bytes(sources)
     red_elements = plan.kda_accumulator_lds_elements
+    # A seam token's per-wave group partials, softmax weights and mean squares.
+    if ATTENTION_REDUCTION_GROUPS * (2 * sources + 1) + sources + 1 > red_elements:
+        raise ValueError(
+            f"gfx1250 K1 seam reductions outgrow red for {sources} sources"
+        )
     smem_fields = _fields(
         ("red", red_elements * 4),
         ("tls", TIMELINE_POINTS * 8),
@@ -468,6 +474,13 @@ def role_lds_plan(
     projection_bytes = max(
         tile_rows * xrow * 2,
         tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA),
+        tdm_lds_bytes(
+            plan.tokens,
+            PROJECTION_TASKS_PER_CTA,
+            True,
+            TDM_FP8_DEPTH,
+            SEAM_TOKEN_BUFFERS,
+        ),
     )
     # Every task's and tile's accumulator, so one barrier ends the projection.
     accumulator_bytes = (
@@ -480,10 +493,18 @@ def role_lds_plan(
             f"candidate has {plan.lds_bytes}"
         )
 
+    # A seam token's BF16 rows: its blocks, residual row and delta, and the
+    # three norm/score weights.
+    token_vals_bytes = HIDDEN * 2 * (plan.nblocks + 5)
     attention = RoleLdsVariant(
         "attention",
-        _fields(("vals", tile_rows * sources * HEAD_DIM * 4)),
+        _fields(("vals", max(tile_rows * sources * HEAD_DIM * 4, token_vals_bytes))),
     )
+    if smem_bytes + attention.bytes > plan.lds_bytes:
+        raise ValueError(
+            f"gfx1250 K1 seam needs {smem_bytes + attention.bytes} LDS bytes, "
+            f"candidate has {plan.lds_bytes}"
+        )
     projection = RoleLdsVariant(
         "projection",
         _fields(("xl", projection_bytes), ("acc", accumulator_bytes)),
@@ -636,7 +657,12 @@ def local_scratch_layout(
     end = max(offset + size for offset, size in layout.values())
     layout["sync"] = (_align(end), 8)
     end = layout["sync"][0] + layout["sync"][1]
-    layout["x"] = (_align(end), declaration.tokens * HIDDEN * 2)
+    # Page-aligned: the projection's TDM copies of rows that straddle cache
+    # lines are far slower.
+    layout["x"] = (
+        -(-end // X_ALIGNMENT) * X_ALIGNMENT,
+        declaration.tokens * HIDDEN * 2,
+    )
     return layout
 
 

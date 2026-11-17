@@ -21,6 +21,7 @@ from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     HIDDEN,
     K1_ABI_NAMES,
     PROJECTION_TASKS_PER_CTA,
+    SEAM_TOKEN_BUFFERS,
     K1KernelDeclaration,
     K1LocalBuildSpec,
     local_scratch_layout,
@@ -53,7 +54,6 @@ from atom.mono.runtime.abi import KernelAbi
 FUSED_ROWS = 6284
 ROWS = 16
 PROJECTION_ROWS_PER_CTA = PROJECTION_TASKS_PER_CTA
-SEAM_COLUMNS = 128
 VALUE_CHUNK = 16
 PROJ = HEADS * HEAD_DIM
 PTPC_FP8_MAX = 448.0
@@ -146,11 +146,29 @@ def _arrive(sync, slots, blocks):
 
 
 @traced
+def _arrive_unless_seam(sync, slots, blocks, block, tokens):
+    if block >= tokens:
+        _arrive(sync, slots, blocks)
+
+
+@traced
 def _generation(slots):
     """The generation ``_arrive`` kept, once its thread has."""
 
     gpu.barrier()
     return fx.Int32(fx.ptr_load(slots))
+
+
+@traced
+def _await_tokens(x_ready, tokens, tag):
+    """Every seam token's ``x`` row published under ``tag``. No acquire
+    fence: on gfx1250 it invalidates the XCD's L2, which every projection CTA
+    would do in turn (and the threads past ``tokens`` at once, under the
+    seam's loads); ``x`` is read at device scope instead."""
+
+    if fx.thread_idx.x < tokens:
+        gfx_backend.mailbox_poll_device(x_ready, fx.thread_idx.x, tag)
+    gpu.barrier()
 
 
 def _task_start(block, first, blocks):
@@ -186,6 +204,8 @@ def build_resident_k1(
     slabs = declaration.lds.arena.gemv_slabs[0]
     tile_starts = tuple(tile.row_start for tile in declaration.token_tiles)
     tile_rows = tuple(tile.rows for tile in declaration.token_tiles)
+    if not spec.external_seam and declaration.tokens > ATTENTION_CTAS:
+        raise ValueError("resident K1's seam tokens outnumber its attention CTAs")
     group_columns = plan.kda_matrix_contract().group_columns
     s = declaration.tokens
     qlen = declaration.qlen
@@ -389,20 +409,14 @@ def build_resident_k1(
                 )
         device["wait_vector_stores"]()
 
-    def open_generation(sync, slots):
-        """The arrival, and without an external seam the generation the seam
-        publishes under from the start; with one (``x`` is the previous
-        launch's output), only what the launch publishes carries it, read once
-        a CTA needs it, so no barrier holds the first copies back."""
-        _arrive(sync, slots, declaration.blocks)
-        if spec.external_seam:
-            return None
-        return _generation(slots)
-
-    def collect_generation(slots, generation):
-        if spec.external_seam:
-            return _generation(slots)
-        return generation
+    def open_generation(sync, slots, block):
+        """The arrival of every CTA but a seam token's, which arrives once its
+        loads are in flight; the generation is read once a CTA needs it, so no
+        barrier holds the first copies back."""
+        if const_expr(spec.external_seam):
+            _arrive(sync, slots, declaration.blocks)
+        else:
+            _arrive_unless_seam(sync, slots, declaration.blocks, block, s)
 
     @flyc.kernel(name=name, known_block_size=[declaration.threads, 1, 1])
     def resident(
@@ -446,10 +460,8 @@ def build_resident_k1(
         projection = role.gemv.peek()
         recurrence = role.kda.peek()
         sync = scratch + fx.Int64(layout["sync"][0])
-        generation = open_generation(sync, smem.tls.ptr)
+        open_generation(sync, smem.tls.ptr, bid)
         part = scratch + fx.Int64(layout["part"][0])
-        weights = scratch + fx.Int64(layout["wgt"][0])
-        mean_squares = scratch + fx.Int64(layout["msq"][0])
         x_ready = scratch + fx.Int64(layout["xrdy"][0])
         x = prefix if spec.external_seam else scratch + fx.Int64(layout["x"][0])
         projected = scratch + fx.Int64(layout["proj"][0])
@@ -459,176 +471,53 @@ def build_resident_k1(
         # kernel.
         core_ready = part
 
-        if const_expr(not spec.external_seam):
-            if bid < ATTENTION_CTAS:
-                for tile in range_constexpr(len(tile_starts)):
-                    token0 = tile_starts[tile]
-                    rows = tile_rows[tile]
-                    work_items = rows * sources * (SEAM_COLUMNS // 4)
-                    for iteration in range_constexpr(
-                        (work_items + declaration.threads - 1) // declaration.threads
-                    ):
-                        work = tid + declaration.threads * iteration
-                        live = work < work_items
-                        item = fx.min(work, work_items - 1)
-                        local_token = item // (sources * (SEAM_COLUMNS // 4))
-                        source = (item // (SEAM_COLUMNS // 4)) % sources
-                        column = bid * SEAM_COLUMNS + (item % (SEAM_COLUMNS // 4)) * 4
-                        global_token = token0 + local_token
-                        is_prefix = source == declaration.nblocks
-                        block_values = base.ld_bf4(
-                            blocks,
-                            global_token * blk_sm
-                            + fx.min(source, declaration.nblocks - 1) * blk_sr
-                            + column,
-                        )
-                        prefix_values = base.ld_bf4(
-                            prefix,
-                            global_token * HIDDEN + column,
-                        )
-                        if const_expr(spec.delta):
-                            delta_values = base.ld_bf4(
-                                delta,
-                                global_token * HIDDEN + column,
-                            )
-                            prefix_values = [
-                                prefix_values[element] + delta_values[element]
-                                for element in range(4)
-                            ]
-                        selected = [
-                            live.select(
-                                is_prefix.select(
-                                    prefix_values[element],
-                                    block_values[element],
-                                ),
-                                fx.Float32(0.0),
-                            )
-                            for element in range(4)
-                        ]
-                        if live:
-                            fx.ptr_store(
-                                fx.Vector.from_elements(selected, fx.Float32),
-                                attention.vals.ptr
-                                + (
-                                    (local_token * sources + source) * SEAM_COLUMNS
-                                    + column % SEAM_COLUMNS
-                                ),
-                            )
-                        norm_weight = base.ld_bf4(ares_nw, column)
-                        query = base.ld_bf4(ares_qk, column)
-                        square_sum = sum(value * value for value in selected)
-                        dot = sum(
-                            selected[element] * (norm_weight[element] * query[element])
-                            for element in range(4)
-                        )
-                        square_sum = compute["attention_reduce32"](square_sum)
-                        dot = compute["attention_reduce32"](dot)
-                        if live & (lane == 0):
-                            index = ((bid * s + global_token) * sources + source) * 2
-                            gfx_backend.mailbox_store_device(
-                                part,
-                                index,
-                                square_sum,
-                                generation,
-                            )
-                            gfx_backend.mailbox_store_device(
-                                part,
-                                index + 1,
-                                dot,
-                                generation,
-                            )
-                    gpu.barrier()
-                    if const_expr(spec.delta or spec.write_idx >= 0):
-                        copy_items = rows * (SEAM_COLUMNS // 4)
-                        for iteration in range_constexpr(
-                            (copy_items + declaration.threads - 1) // declaration.threads
-                        ):
-                            work = tid + declaration.threads * iteration
-                            if work < copy_items:
-                                local_token = work // (SEAM_COLUMNS // 4)
-                                local_column = (work % (SEAM_COLUMNS // 4)) * 4
-                                global_token = token0 + local_token
-                                column = bid * SEAM_COLUMNS + local_column
-                                at = (
-                                    local_token * sources + declaration.nblocks
-                                ) * SEAM_COLUMNS + local_column
-                                value = [
-                                    fx.ptr_load(attention.vals.ptr + at + element)
-                                    for element in range(4)
-                                ]
-                                packed = base.bf4_words(value)
-                                if const_expr(spec.delta):
-                                    bo.buffer_store(
-                                        packed,
-                                        rsrc(prefix),
-                                        (global_token * HIDDEN + column) // 2,
-                                    )
-                                if const_expr(spec.write_idx >= 0):
-                                    bo.buffer_store(
-                                        packed,
-                                        rsrc(blocks),
-                                        (
-                                            global_token * blk_sm
-                                            + spec.write_idx * blk_sr
-                                            + column
-                                        )
-                                        // 2,
-                                    )
-                    device["wait_vector_stores"]()
-                    if bid < rows:
-                        gate_context = {
-                            "S": rows,
-                            "total_S": s,
-                            "token0": token0,
-                            "NS": sources,
-                            "tid": tid,
-                            "lane": lane,
-                            "wave": wave,
-                            "red": smem.red.ptr,
-                            "eps": spec.eps,
-                            "part": part,
-                            "wgt": weights,
-                            "tag": generation,
-                        }
-                        compute["attention_gate_tile"](gate_context, bid)
-                        device["wait_vector_stores"]()
-                    mix_context = {
-                        "S": rows,
-                        "total_S": s,
-                        "token0": token0,
-                        "tile": tile,
+        if const_expr(not spec.external_seam):  # noqa: SIM102
+            # Token t's whole seam on CTA t, which no projection task owns.
+            if bid < s:
+                compute["attention_token"](
+                    {
                         "NS": sources,
                         "tid": tid,
                         "lane": lane,
                         "wave": wave,
-                        "matrix_waves": declaration.waves,
                         "matrix_threads": declaration.threads,
                         "red": smem.red.ptr,
                         "vals": attention.vals.ptr,
+                        "eps": spec.eps,
                         "out_eps": spec.out_eps,
-                        "debug": False,
-                        "mix_lds_handoff": False,
-                        "wgt": weights,
-                        "msq": mean_squares,
-                        "xrdy": x_ready,
+                        "delta": spec.delta,
+                        "write_idx": spec.write_idx,
                         "xbuf": x,
-                        "tag": generation,
-                        "args": {"in_nw": in_nw},
-                    }
-                    compute["attention_mix_tile"](mix_context, bid)
+                        "xrdy": x_ready,
+                        "arrive": lambda: _arrive(
+                            sync, smem.tls.ptr, declaration.blocks
+                        ),
+                        "tag": lambda: _generation(smem.tls.ptr),
+                        "args": {
+                            "blocks": blocks,
+                            "blk_sm": blk_sm,
+                            "blk_sr": blk_sr,
+                            "prefix": prefix,
+                            "delta": delta,
+                            "ares_nw": ares_nw,
+                            "ares_qk": ares_qk,
+                            "in_nw": in_nw,
+                        },
+                    },
+                    bid,
+                )
 
         if bid >= ATTENTION_CTAS:
-            # Observe every tile before issuing weights: a gfx buffer poll
-            # retires behind prior vmcnt loads, so prefetching weights first
-            # would serialize every spin iteration behind those loads.
-            for tile in range_constexpr(0 if spec.external_seam else len(tile_starts)):
-                gfx_backend.mailbox_poll_device(
-                    x_ready,
-                    tile * ATTENTION_CTAS + tid % ATTENTION_CTAS,
-                    generation,
-                )
-                device["device_fence_acquire"]()
-                gpu.barrier()
+            # Every token's x before the first token copy: on the TDM path once
+            # the first weight slabs are in flight (their copies count on the
+            # tensor counter, not the loads a poll retires behind), else before
+            # any weights, which a buffer poll would wait behind every spin.
+            def await_x():
+                if const_expr(not spec.external_seam):
+                    _await_tokens(x_ready, s, _generation(smem.tls.ptr))
+
+            if const_expr(not spec.tdm_projection):
+                await_x()
             first_task = (bid - ATTENTION_CTAS) * PROJECTION_ROWS_PER_CTA
             if const_expr(spec.tdm_projection):
                 accumulators0, accumulators1 = gemv_tdm.project(
@@ -649,6 +538,13 @@ def build_resident_k1(
                         {"w_scale": w_in_scale, "depth": gemv_tdm.FP8_DEPTH}
                         if spec.fp8_projection
                         else {}
+                    ),
+                    prologue=None if spec.external_seam else await_x,
+                    x_cache_policy=0 if spec.external_seam else CM_DEV,
+                    token_buffers=(
+                        SEAM_TOKEN_BUFFERS
+                        if spec.fp8_projection and not spec.external_seam
+                        else 2
                     ),
                 )
                 gpu.barrier()
@@ -719,7 +615,7 @@ def build_resident_k1(
                         lane,
                     )
             gpu.barrier()
-            projected_tag = collect_generation(smem.tls.ptr, generation)
+            projected_tag = _generation(smem.tls.ptr)
             for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
@@ -751,7 +647,7 @@ def build_resident_k1(
             gpu.barrier()
             device["wait_vector_stores"]()
 
-        generation = collect_generation(smem.tls.ptr, generation)
+        generation = _generation(smem.tls.ptr)
 
         recurrence_context = {
             "S": s,

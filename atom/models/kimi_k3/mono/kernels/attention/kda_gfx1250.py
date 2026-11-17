@@ -13,8 +13,10 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T
+from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
     GATE_K,
@@ -35,7 +37,10 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
+    bf_hi,
+    bf_lo,
     butterfly,
+    div_rn,
     hw_exp2,
     hw_rsq,
     lane_all_gather,
@@ -60,6 +65,7 @@ SEAM_COLUMNS = 128
 SEAM_COLUMN_GROUPS = 32
 SEAM_SLICE_GROUPS = 8
 SEAM_SLICES_PER_GROUP = 7
+SEAM_ROW_WORDS = HIDDEN // 2
 PROJ = HEADS * HEAD_DIM
 G2_0 = 3 * PROJ
 BETA_0 = G2_0 + PROJ
@@ -1218,60 +1224,200 @@ def _sum_polled(values):
     return total
 
 
-def _load_bf4(pointer, index):
-    words = fx.Vector(
-        bo.buffer_load(rsrc(pointer), index // 2, vec_width=2, dtype=T.i32)
-    )
-    packed = words.bitcast(fx.BFloat16)
-    return [fx.Float32(packed[element]) for element in range(4)]
-
-
 def _bf4_words(values):
     return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
 
 
-@traced
-def _attention_gate(c, token, token0, total_tokens, resident):
-    """Wave32 softmax over one tile's at most 32 AttnRes sources."""
+def _async_copy_b64(address, lds_byte):
+    """Eight bytes a lane from global ``address`` to LDS byte ``lds_byte``,
+    counted on ASYNCcnt rather than through a register."""
+    llvm.call_intrinsic(
+        None,
+        "llvm.amdgcn.global.load.async.to.lds.b64",
+        [
+            llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(address))
+            ).result,
+            llvm.IntToPtrOp(
+                ir.Type.parse("!llvm.ptr<3>"), as_ir_value(fx.Int32(lds_byte))
+            ).result,
+            as_ir_value(fx.Int32(0)),
+            as_ir_value(fx.Int32(0)),
+        ],
+        [],
+        [],
+    )
 
-    sources, tid, lane, wave, red = (
+
+def _words_f32(words):
+    return [bf_lo(words[0]), bf_hi(words[0]), bf_lo(words[1]), bf_hi(words[1])]
+
+
+def _staged_words(vals, row, at):
+    """A lane's two staged words of LDS row ``row`` at f32 offset ``at``."""
+    return fx.Vector(
+        fx.ptr_load(
+            vals + row * SEAM_ROW_WORDS + at,
+            result_type=fx.Vector.make_type(2, fx.Float32),
+        )
+    ).bitcast(fx.Int32)
+
+
+def _runs(count):
+    """``(first, size)`` power-of-two runs of ``count`` values, each at most a
+    wave."""
+    runs = []
+    first = 0
+    while first < count:
+        size = 1 << min(count - first, GFX1250.wave_size).bit_length() - 1
+        runs.append((first, size))
+        first += size
+    return runs
+
+
+def _scatter_row(lane, size):
+    """The index of the sum ``lane_reduce_scatter`` of ``size`` values leaves
+    on ``lane``."""
+    row = fx.Int32(0)
+    for step, offset in enumerate(GFX1250.reduction_offsets[: size.bit_length() - 1]):
+        row = row + ((lane & offset) != 0).select(
+            fx.Int32(size >> step + 1), fx.Int32(0)
+        )
+    return row
+
+
+@traced
+def attention_token(c, token):
+    """One token's whole AttnRes seam on one CTA, in ``_attention_gate`` and
+    ``_attention_mix``'s arithmetic and order: wave w owns slice group w, a
+    lane four columns of each of the group's seven 128-column slices, so each
+    slice's 32-lane partials and each group's seven-slice sums (taken in
+    slice order) are the tile path's bits, and none of them leaves the CTA.
+    Writes ``x[token]`` and publishes ``xrdy[token]``, and the residual row
+    (``delta``) and its bank (``write_idx``).
+
+    Every candidate row lands in LDS first, so each phase is one short loop
+    over the slices: a launch runs this code instruction-cache cold.
+    ``c["arrive"]()`` runs once the copies are in flight, ``c["tag"]()`` (a
+    barrier) is the generation the publication carries."""
+
+    sources, tid, lane, wave, red, vals = (
         c["NS"],
         c["tid"],
         c["lane"],
         c["wave"],
         c["red"],
+        c["vals"],
     )
-    global_token = token0 + token
-    pairs = sources * 2
-    if tid < SEAM_SLICE_GROUPS * pairs:
-        group = tid // pairs
-        pair = tid % pairs
-        values = []
-        for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
-            index = (
-                (
-                    (group * SEAM_SLICES_PER_GROUP + slice_index)
-                    * total_tokens
-                    + global_token
-                )
-                * sources
-                * 2
-                + pair
+    args = c["args"]
+    threads = c["matrix_threads"]
+    nblocks = sources - 1
+    slices = SEAM_SLICES_PER_GROUP
+    delta = c["delta"]
+    prefix_row = nblocks
+    norm_row = prefix_row + 1 + int(delta)
+    query_row = norm_row + 1
+    out_row = query_row + 1
+    # The mixed values overwrite the two dead score-weight rows.
+    mixed_at = norm_row * SEAM_ROW_WORDS
+    row = token * HIDDEN
+    vals_byte = fx.Int32(fx.ptrtoint(vals))
+    first_column = wave * (slices * SEAM_COLUMNS) + lane * 4
+
+    for index in range(slices):
+        column = first_column + index * SEAM_COLUMNS
+        at = vals_byte + column * 2
+        for block in range_constexpr(nblocks):
+            _async_copy_b64(
+                args["blocks"]
+                + fx.Int64(token * args["blk_sm"] + block * args["blk_sr"] + column)
+                * 2,
+                at + block * SEAM_ROW_WORDS * 4,
             )
-            if const_expr(resident):
-                word = mailbox_poll_device(c["part"], index, c["tag"])
-            else:
-                word = c["poll"]([(c["part"], index, 1)])[0][0]
-            values.append(word.bitcast(fx.Float32))
-        fx.ptr_store(sum(values), red + group * pairs + pair)
+        _async_copy_b64(
+            args["prefix"] + fx.Int64(row + column) * 2,
+            at + prefix_row * SEAM_ROW_WORDS * 4,
+        )
+        if const_expr(delta):
+            _async_copy_b64(
+                args["delta"] + fx.Int64(row + column) * 2,
+                at + (prefix_row + 1) * SEAM_ROW_WORDS * 4,
+            )
+        for weight, weight_row in (
+            ("ares_nw", norm_row),
+            ("ares_qk", query_row),
+            ("in_nw", out_row),
+        ):
+            _async_copy_b64(
+                args[weight] + fx.Int64(column) * 2,
+                at + weight_row * SEAM_ROW_WORDS * 4,
+            )
+    c["arrive"]()
+    rocdl.s_wait_asynccnt(0)
+
+    def candidates(at):
+        values = [
+            _words_f32(_staged_words(vals, block, at))
+            for block in range_constexpr(nblocks)
+        ]
+        residual = _words_f32(_staged_words(vals, prefix_row, at))
+        if const_expr(delta):
+            addend = _words_f32(_staged_words(vals, prefix_row + 1, at))
+            residual = [
+                value + addend[element] for element, value in enumerate(residual)
+            ]
+        return values + [residual]
+
+    count = 2 * sources
+    runs = _runs(count)
+    groups = [fx.Float32(0.0) for _ in runs]
+    for index in range(slices):
+        at = first_column // 2 + index * (SEAM_COLUMNS // 2)
+        selected_sources = candidates(at)
+        # The residual row and its bank: their stores drain long before x's.
+        column = first_column + index * SEAM_COLUMNS
+        if const_expr(delta or c["write_idx"] >= 0):
+            packed = _bf4_words(selected_sources[nblocks])
+            if const_expr(delta):
+                bo.buffer_store(packed, rsrc(args["prefix"]), (row + column) // 2)
+            if const_expr(c["write_idx"] >= 0):
+                bo.buffer_store(
+                    packed,
+                    rsrc(args["blocks"]),
+                    (token * args["blk_sm"] + c["write_idx"] * args["blk_sr"] + column)
+                    // 2,
+                )
+        norm_weight = _words_f32(_staged_words(vals, norm_row, at))
+        query = _words_f32(_staged_words(vals, query_row, at))
+        partials = []
+        for selected in selected_sources:
+            partials.append(sum(value * value for value in selected))
+            partials.append(
+                sum(
+                    selected[element] * (norm_weight[element] * query[element])
+                    for element in range(4)
+                )
+            )
+        groups = [
+            group
+            + lane_reduce_scatter(
+                partials[first : first + size], GFX1250.reduction_offsets, lane, GFX1250
+            )[0]
+            for group, (first, size) in zip(groups, runs)
+        ]
+    for group, (first, size) in zip(groups, runs):
+        if (lane & (GFX1250.wave_size // size - 1)) == 0:
+            fx.ptr_store(group, red + wave * count + first + _scatter_row(lane, size))
     gpu.barrier()
+
+    weights_at = SEAM_SLICE_GROUPS * count
     if wave == 0:
         source = fx.min(lane, sources - 1)
         square_sum = fx.ptr_load(red + source * 2)
         dot = fx.ptr_load(red + source * 2 + 1)
-        for group in range_constexpr(1, SEAM_SLICE_GROUPS):
-            square_sum = square_sum + fx.ptr_load(red + group * pairs + source * 2)
-            dot = dot + fx.ptr_load(red + group * pairs + source * 2 + 1)
+        for other in range_constexpr(1, SEAM_SLICE_GROUPS):
+            square_sum = square_sum + fx.ptr_load(red + other * count + source * 2)
+            dot = dot + fx.ptr_load(red + other * count + source * 2 + 1)
         inverse_norm = hw_rsq(
             square_sum * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["eps"])
         )
@@ -1285,182 +1431,68 @@ def _attention_gate(c, token, token0, total_tokens, resident):
             architecture=GFX1250,
         )
         if lane < sources:
-            index = global_token * (sources + 1) + lane
-            if const_expr(resident):
-                mailbox_store_device(c["wgt"], index, exponential, c["tag"])
-            else:
-                c["put"](c["wgt"], index, exponential)
+            fx.ptr_store(exponential, red + weights_at + lane)
         if lane == 0:
-            index = global_token * (sources + 1) + sources
-            if const_expr(resident):
-                mailbox_store_device(c["wgt"], index, denominator, c["tag"])
-            else:
-                c["put"](c["wgt"], index, denominator)
+            fx.ptr_store(denominator, red + weights_at + sources)
     gpu.barrier()
 
-
-@traced
-def attention_gate(c, token):
-    _attention_gate(c, token, 0, c["S"], False)
-
-
-@traced
-def attention_gate_tile(c, token):
-    _attention_gate(c, token, c["token0"], c["total_S"], True)
-
-
-@traced
-def _attention_mix(c, task, token0, total_tokens, tile, resident):
-    """Mix one tile's values with token-global mailbox and output indices."""
-
-    s, sources, tid, lane, wave, waves, red = (
-        c["S"],
-        c["NS"],
-        c["tid"],
-        c["lane"],
-        c["wave"],
-        c["matrix_waves"],
-        c["red"],
-    )
-    args = c["args"]
-    column0 = task * SEAM_COLUMNS
-    threads = c["matrix_threads"]
-    weight_count = s * (sources + 1)
-    for iteration in range_constexpr((weight_count + threads - 1) // threads):
-        item = tid + threads * iteration
-        if item < weight_count:
-            local_token = item // (sources + 1)
-            pair = item % (sources + 1)
-            index = (token0 + local_token) * (sources + 1) + pair
-            if const_expr(resident):
-                value = mailbox_poll_device(c["wgt"], index, c["tag"])
-            else:
-                value = c["poll"]([(c["wgt"], index, 1)])[0][0]
-            fx.ptr_store(_f32_of(value), red + item)
-    gpu.barrier()
-
-    rounds = (s + waves - 1) // waves
-    tokens = []
-    lives = []
-    mixed_rounds = []
-    for round_index in range_constexpr(rounds):
-        token = fx.min(wave + waves * round_index, s - 1)
-        live = wave + waves * round_index < s
-        column = lane * 4
+    weights = [fx.ptr_load(red + weights_at + source) for source in range(sources)]
+    denominator = fx.ptr_load(red + weights_at + sources)
+    reciprocal = fx.Float32(1.0) / denominator
+    mean_square = fx.Float32(0.0)
+    for index in range(slices):
+        at = first_column // 2 + index * (SEAM_COLUMNS // 2)
+        selected_sources = candidates(at)
         mixed = []
         for element in range_constexpr(4):
             total = fx.Float32(0.0)
             for source in range_constexpr(sources):
-                total = total + fx.ptr_load(
-                    red + token * (sources + 1) + source
-                ) * fx.ptr_load(
-                    c["vals"]
-                    + (token * sources + source) * SEAM_COLUMNS
-                    + column
-                    + element
-                )
-            mixed.append(total / fx.ptr_load(red + token * (sources + 1) + sources))
-        square_sum = (
+                total = total + weights[source] * selected_sources[source][element]
+            mixed.append(div_rn(total, denominator, reciprocal))
+        mean_square = mean_square + attention_reduce32(
             mixed[0] * mixed[0]
             + mixed[1] * mixed[1]
             + mixed[2] * mixed[2]
             + mixed[3] * mixed[3]
         )
-        square_sum = attention_reduce32(square_sum)
-        if live & (lane == 0):
-            index = task * total_tokens + token0 + token
-            if const_expr(resident):
-                mailbox_store_device(c["msq"], index, square_sum, c["tag"])
-            else:
-                c["put"](c["msq"], index, square_sum)
-        if const_expr(c["mix_lds_handoff"]):
-            for element in range_constexpr(4):
-                fx.ptr_store(
-                    mixed[element],
-                    c["vals"] + (token * sources) * SEAM_COLUMNS + lane * 4 + element,
-                )
-        else:
-            tokens.append(token)
-            lives.append(live)
-            mixed_rounds.append(mixed)
-    gpu.barrier()
-
-    group_work = SEAM_SLICE_GROUPS * s
-    for iteration in range_constexpr((group_work + threads - 1) // threads):
-        item = tid + threads * iteration
-        if item < group_work:
-            group = item // s
-            token = item % s
-            values = []
-            for slice_index in range_constexpr(SEAM_SLICES_PER_GROUP):
-                index = (
-                    (group * SEAM_SLICES_PER_GROUP + slice_index)
-                    * total_tokens
-                    + token0
-                    + token
-                )
-                if const_expr(resident):
-                    word = mailbox_poll_device(c["msq"], index, c["tag"])
-                else:
-                    word = c["poll"]([(c["msq"], index, 1)])[0][0]
-                values.append(word.bitcast(fx.Float32))
-            fx.ptr_store(
-                sum(values),
-                red + 128 + group * s + token,
-            )
-    gpu.barrier()
-
-    for round_index in range_constexpr(rounds):
-        if const_expr(c["mix_lds_handoff"]):
-            token = fx.min(wave + waves * round_index, s - 1)
-            live = wave + waves * round_index < s
-            mixed = [
-                fx.ptr_load(
-                    c["vals"] + (token * sources) * SEAM_COLUMNS + lane * 4 + element
-                )
-                for element in range_constexpr(4)
-            ]
-        else:
-            token = tokens[round_index]
-            live = lives[round_index]
-            mixed = mixed_rounds[round_index]
-        total = fx.ptr_load(red + 128 + token)
-        for group in range_constexpr(1, SEAM_SLICE_GROUPS):
-            total = total + fx.ptr_load(red + 128 + group * s + token)
-        inverse_norm = hw_rsq(
-            total * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"])
+        fx.ptr_store(
+            fx.Vector.from_elements(mixed, fx.Float32),
+            vals + mixed_at + (index * threads + tid) * 4,
         )
-        norm_weight = _load_bf4(args["in_nw"], column0 + lane * 4)
+    mean_at = weights_at + sources + 1
+    if lane == 0:
+        fx.ptr_store(mean_square, red + mean_at + wave)
+    gpu.barrier()
+
+    total = fx.ptr_load(red + mean_at)
+    for other in range_constexpr(1, SEAM_SLICE_GROUPS):
+        total = total + fx.ptr_load(red + mean_at + other)
+    inverse_norm = hw_rsq(total * fx.Float32(1.0 / HIDDEN) + fx.Float32(c["out_eps"]))
+    for index in range(slices):
+        at = first_column // 2 + index * (SEAM_COLUMNS // 2)
+        mixed = fx.Vector(
+            fx.ptr_load(
+                vals + mixed_at + (index * threads + tid) * 4,
+                result_type=fx.Vector.make_type(4, fx.Float32),
+            )
+        )
+        norm = _words_f32(_staged_words(vals, out_row, at))
         output = _bf4_words(
             [
-                mixed[element] * inverse_norm * norm_weight[element]
+                fx.Float32(mixed[element]) * inverse_norm * norm[element]
                 for element in range(4)
             ]
         )
-        if live:
-            at = ((token0 + token) * HIDDEN + column0 + lane * 4) // 2
-            bo.buffer_store(output, rsrc(c["xbuf"]), at, cache_modifier=CM_DEV)
-            if const_expr(c["debug"]):
-                bo.buffer_store(output, rsrc(args["x_dbg"]), at)
+        bo.buffer_store(
+            output,
+            rsrc(c["xbuf"]),
+            (row + first_column + index * SEAM_COLUMNS) // 2,
+            cache_modifier=CM_DEV,
+        )
     wait_vector_stores()
-    workgroup_barrier()
+    tag = c["tag"]()
     if tid == 0:
-        index = tile * ATTENTION_CTAS + task
-        if const_expr(resident):
-            mailbox_store_device(c["xrdy"], index, fx.Int32(1), c["tag"])
-        else:
-            c["put"](c["xrdy"], index, fx.Int32(1))
-    gpu.barrier()
-
-
-@traced
-def attention_mix(c, task):
-    _attention_mix(c, task, 0, c["S"], 0, False)
-
-
-@traced
-def attention_mix_tile(c, task):
-    _attention_mix(c, task, c["token0"], c["total_S"], c["tile"], True)
+        mailbox_store_device(c["xrdy"], token, fx.Int32(1), tag)
 
 
 @dataclass(frozen=True)
@@ -1543,20 +1575,8 @@ class StageBackend:
         return attention_reduce32(value)
 
     @staticmethod
-    def attention_gate(c, token):
-        attention_gate(c, token)
-
-    @staticmethod
-    def attention_gate_tile(c, token):
-        attention_gate_tile(c, token)
-
-    @staticmethod
-    def attention_mix(c, task):
-        attention_mix(c, task)
-
-    @staticmethod
-    def attention_mix_tile(c, task):
-        attention_mix_tile(c, task)
+    def attention_token(c, token):
+        attention_token(c, token)
 
     @staticmethod
     def workgroup_barrier():
