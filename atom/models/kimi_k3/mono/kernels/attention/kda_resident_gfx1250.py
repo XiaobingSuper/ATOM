@@ -39,6 +39,8 @@ from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
     CM_DEV,
+    bf_hi,
+    bf_lo,
     fp8_pack4,
     hw_rcp,
     ld_i32,
@@ -126,21 +128,22 @@ _ARRIVER = 7 * GFX1250.wave_size
 @traced
 def _arrive(sync, slots, blocks):
     """The launch's rendezvous without a wait: one thread counts its CTA in
-    and keeps the generation past the one it found in ``slots[1]``, and the
-    last arrival opens that one for the next launch. Every CTA reads before it
-    arrives and the last arrival writes after all have, so all find the same
+    and keeps the generation past the one it found, and the last arrival
+    opens that one for the next launch. ``sync`` is the 64-bit word
+    {arrivals, generation}, so one fetch-and-add both counts the CTA in and
+    finds the generation, and the last arrival's reset follows every other
     one; the previous launch, stream-ordered, reads no pair any more, so the
-    launch may publish under its generation at once."""
+    launch may publish under its generation at once. Nothing is acquired or
+    released: kernel boundaries order the launches, and on gfx1250 either
+    would invalidate or write back the caches under every CTA's first loads."""
 
     tid = fx.thread_idx.x
     if tid == _ARRIVER:
-        previous = gfx_backend.epoch_load_system_acquire(sync + fx.Int64(4))
-        arrival = gfx_backend.epoch_arrive_system_atomic(sync, fx.Int32(1))
-        if arrival == fx.Int32(blocks - 1):
-            gfx_backend.epoch_store_system_release(sync, fx.Int32(0))
-            gfx_backend.epoch_store_system_release(
-                sync + fx.Int64(4),
-                previous + fx.Int32(1),
+        found = gfx_backend.epoch_arrive_device_atomic(sync, fx.Int64(1))
+        previous = fx.Int32(found >> fx.Int64(32))
+        if fx.Int32(found) == fx.Int32(blocks - 1):
+            gfx_backend.mailbox_store_device(
+                sync, 0, fx.Int32(0), previous + fx.Int32(1)
             )
         fx.ptr_store(fx.Int64(previous + fx.Int32(1)), slots)
 
@@ -362,10 +365,22 @@ def build_resident_k1(
         ):
             element = (iteration * declaration.threads + tid) * 4
             live = element < PROJ
-            loaded = base.ld_bf4(
-                core_out,
-                token * PROJ + fx.min(element, PROJ - 4),
+            # Other CTAs' device-scope stores, read at device scope: no fence.
+            words = fx.Vector(
+                bo.buffer_load(
+                    rsrc(core_out),
+                    (token * PROJ + fx.min(element, PROJ - 4)) // 2,
+                    vec_width=2,
+                    dtype=T.i32,
+                    cache_modifier=CM_DEV,
+                )
             )
+            loaded = [
+                bf_lo(words[0]),
+                bf_hi(words[0]),
+                bf_lo(words[1]),
+                bf_hi(words[1]),
+            ]
             loaded = [live.select(value, fx.Float32(0.0)) for value in loaded]
             values.extend(loaded)
             for value in loaded:
@@ -795,7 +810,6 @@ def build_resident_k1(
                         generation + fx.Int32(1),
                     )
                 gpu.barrier()
-                device["device_fence_acquire"]()
                 quantize_core(
                     token,
                     tid,

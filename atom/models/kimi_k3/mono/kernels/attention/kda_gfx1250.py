@@ -13,10 +13,8 @@ from dataclasses import dataclass
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
 from aiter.ops.flydsl.kernels import communication_ops_utils as comm_ops
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
     GATE_K,
@@ -34,6 +32,7 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     K_PER_CHUNK,
     PACK_ELEMENTS,
 )
+from atom.models.kimi_k3.mono.kernels.stages.gemv_tdm_gfx1250 import load_rows
 from atom.mono.device.ops import (
     CM_DEV,
     CM_NT,
@@ -66,6 +65,8 @@ SEAM_COLUMN_GROUPS = 32
 SEAM_SLICE_GROUPS = 8
 SEAM_SLICES_PER_GROUP = 7
 SEAM_ROW_WORDS = HIDDEN // 2
+# A seam row's TDM copy: HIDDEN / SEAM_COPY_WIDTH packed rows of this width.
+SEAM_COPY_WIDTH = 512
 PROJ = HEADS * HEAD_DIM
 G2_0 = 3 * PROJ
 BETA_0 = G2_0 + PROJ
@@ -486,6 +487,7 @@ def kda_head_norm(c, request, head):
                 output.to(fx.BFloat16),
                 rsrc(c["args"]["core_out"]),
                 (request * L + token) * PROJ + head * HEAD_DIM + row,
+                cache_modifier=CM_DEV,
             )
     gpu.barrier()
 
@@ -967,6 +969,7 @@ def _kda_norm_row(c, request, head, chunk, token, element):
         output.to(fx.BFloat16),
         rsrc(c["args"]["core_out"]),
         (request * L + token) * PROJ + head * HEAD_DIM + row,
+        cache_modifier=CM_DEV,
     )
 
 
@@ -1133,6 +1136,13 @@ def epoch_arrive_system_atomic(address, value):
     return comm_ops.atomic_add_system(address, value)
 
 
+def epoch_arrive_device_atomic(address, value):
+    """Device-scope fetch-and-add without ordering, returning the old value;
+    an Int64 ``value`` adds to the 64-bit word."""
+
+    return comm_ops.atomic_add_agent(address, value)
+
+
 @dataclass(frozen=True)
 class RoleLdsTypes:
     """FlyDSL classes emitted from a host-validated K1 LDS type spec."""
@@ -1228,27 +1238,6 @@ def _bf4_words(values):
     return fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
 
 
-def _async_copy_b64(address, lds_byte):
-    """Eight bytes a lane from global ``address`` to LDS byte ``lds_byte``,
-    counted on ASYNCcnt rather than through a register."""
-    llvm.call_intrinsic(
-        None,
-        "llvm.amdgcn.global.load.async.to.lds.b64",
-        [
-            llvm.IntToPtrOp(
-                ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(address))
-            ).result,
-            llvm.IntToPtrOp(
-                ir.Type.parse("!llvm.ptr<3>"), as_ir_value(fx.Int32(lds_byte))
-            ).result,
-            as_ir_value(fx.Int32(0)),
-            as_ir_value(fx.Int32(0)),
-        ],
-        [],
-        [],
-    )
-
-
 def _words_f32(words):
     return [bf_lo(words[0]), bf_hi(words[0]), bf_lo(words[1]), bf_hi(words[1])]
 
@@ -1321,39 +1310,41 @@ def attention_token(c, token):
     # The mixed values overwrite the two dead score-weight rows.
     mixed_at = norm_row * SEAM_ROW_WORDS
     row = token * HIDDEN
-    vals_byte = fx.Int32(fx.ptrtoint(vals))
     first_column = wave * (slices * SEAM_COLUMNS) + lane * 4
 
-    for index in range(slices):
-        column = first_column + index * SEAM_COLUMNS
-        at = vals_byte + column * 2
-        for block in range_constexpr(nblocks):
-            _async_copy_b64(
-                args["blocks"]
-                + fx.Int64(token * args["blk_sm"] + block * args["blk_sr"] + column)
-                * 2,
-                at + block * SEAM_ROW_WORDS * 4,
-            )
-        _async_copy_b64(
-            args["prefix"] + fx.Int64(row + column) * 2,
-            at + prefix_row * SEAM_ROW_WORDS * 4,
+    copies = [
+        (
+            args["blocks"]
+            + fx.Int64(token * args["blk_sm"] + block * args["blk_sr"]) * 2,
+            block,
         )
-        if const_expr(delta):
-            _async_copy_b64(
-                args["delta"] + fx.Int64(row + column) * 2,
-                at + (prefix_row + 1) * SEAM_ROW_WORDS * 4,
-            )
-        for weight, weight_row in (
-            ("ares_nw", norm_row),
-            ("ares_qk", query_row),
-            ("in_nw", out_row),
-        ):
-            _async_copy_b64(
-                args[weight] + fx.Int64(column) * 2,
-                at + weight_row * SEAM_ROW_WORDS * 4,
+        for block in range_constexpr(nblocks)
+    ]
+    copies.append((args["prefix"] + fx.Int64(row) * 2, prefix_row))
+    if const_expr(delta):
+        copies.append((args["delta"] + fx.Int64(row) * 2, prefix_row + 1))
+    copies += [
+        (args["ares_nw"], norm_row),
+        (args["ares_qk"], query_row),
+        (args["in_nw"], out_row),
+    ]
+    # A whole row a TDM copy, round-robin over the waves: per-lane copies
+    # would queue hundreds of vector memory instructions a CU.
+    for index, (address, lds_row) in enumerate(copies):
+        if wave == index % SEAM_SLICE_GROUPS:
+            load_rows(
+                address,
+                SEAM_COPY_WIDTH,
+                vals + lds_row * SEAM_ROW_WORDS,
+                HIDDEN // SEAM_COPY_WIDTH,
+                HIDDEN // SEAM_COPY_WIDTH,
+                padded=False,
+                whole=True,
+                width=SEAM_COPY_WIDTH,
             )
     c["arrive"]()
-    rocdl.s_wait_asynccnt(0)
+    rocdl.s_wait_tensorcnt(0)
+    gpu.barrier()
 
     def candidates(at):
         values = [
