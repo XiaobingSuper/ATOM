@@ -672,6 +672,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
     # three launches.
     "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "0") == "1",
+    # Kimi-K3 gfx1250 mono: the lite finish and the fused MoE (with
+    # ATOM_KIMI_MONO_TAIL, the K2 tail too) as one resident launch
+    # (k2_fused_gfx1250, the same bits), their rolled code; 0 keeps the
+    # separate launches.
+    "ATOM_KIMI_MONO_K2_FUSED": lambda: (
+        os.getenv("ATOM_KIMI_MONO_K2_FUSED", "0") == "1"
+    ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
     # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
