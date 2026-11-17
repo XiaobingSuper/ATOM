@@ -34,6 +34,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
+from atom.models.kimi_k3.mono.kernels.stages import prefetch_gfx1250 as pf
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_words
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
@@ -65,6 +66,9 @@ assert THREADS == 2 * ROWS * 8
 assert CTAS <= ar.MAX_CTAS
 
 OPROJ_AR_ABI = KernelAbi(("core", "w_o", "w_o_scale", "out", "peers", "epochs", "rank"))
+# with prefetch: the front's router, latent, shared gate/up and its scales
+PREFETCH_RANGES = 4
+OPROJ_AR_PREFETCH_ABI = KernelAbi(OPROJ_AR_ABI.names + pf.range_names(PREFETCH_RANGES))
 
 
 def own_pairs(tp: int) -> int:
@@ -99,6 +103,8 @@ class K2OprojAllReduceKernel:
     block: tuple[int]
     abi: KernelAbi = OPROJ_AR_ABI
     launch_count: int = 1
+    # ranges the launch prefetches after ``rank`` (``pf.prefetch_args``)
+    prefetch_ranges: int = 0
 
 
 def _load_lines(mine, words):
@@ -289,8 +295,11 @@ def _store_stage(live, address, word):
 
 
 def build_oproj_allreduce(
-    plan: Gfx1250KimiBuildPlan, tp: int, proj: int
+    plan: Gfx1250KimiBuildPlan, tp: int, proj: int, prefetch: bool | None = None
 ) -> K2OprojAllReduceKernel:
+    """``prefetch`` (ATOM_KIMI_MONO_PREFETCH where None): every CTA prefetches
+    its share of PREFETCH_RANGES ranges once its partials are pushed, before
+    it polls."""
     if plan.architecture is not GFX1250:
         raise ValueError("the o_proj all-reduce requires gfx1250")
     if plan.threads != THREADS or plan.waves != WAVES:
@@ -317,20 +326,12 @@ def build_oproj_allreduce(
         # the CTA's pairs ``[token][pair]``, cut into lines once all are in
         stage: fx.Array[fx.Int32, triples(rows) * LINE_TOKENS * CTA_PAIRS, 16]
 
-    name = f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}"
+    prefetch = pf.enabled(prefetch)
+    name = f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}" + ("_pf" if prefetch else "")
     sources = SOURCES
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        core: Int64,
-        w_o: Int64,
-        w_o_scale: Int64,
-        out: Int64,
-        peers: Int64,
-        epochs: Int64,
-        rank: Int32,
-    ):
-        _ = sources
+    @traced
+    def body(core, w_o, w_o_scale, out, peers, epochs, rank, ranges):
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -417,6 +418,7 @@ def build_oproj_allreduce(
             ar._store_line_sys(
                 owner_base + at, fx.Vector.from_elements([*words, epoch], fx.Int32)
             )
+        pf.prefetch_all(ranges, bid, CTAS, tid, THREADS)
         if const_expr(rows > SPREAD_ROWS):
             _split_waves(mine, bases, out, rank, rows, tp, own, bank, epoch, bid, tid)
         else:
@@ -426,8 +428,48 @@ def build_oproj_allreduce(
         if counter < ar.MAX_CTAS:
             bo.buffer_store(epoch, rsrc(epochs), counter)
 
-    @flyc.jit
-    def launch(
+    def run(kernel, args, stream):
+        kernel(*args, value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"]).launch(
+            grid=(CTAS,),
+            block=(THREADS,),
+            stream=stream,
+            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+        )
+
+    if not prefetch:
+
+        @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+        def kernel(
+            core: Int64,
+            w_o: Int64,
+            w_o_scale: Int64,
+            out: Int64,
+            peers: Int64,
+            epochs: Int64,
+            rank: Int32,
+        ):
+            _ = sources
+            body(core, w_o, w_o_scale, out, peers, epochs, rank, [])
+
+        @flyc.jit
+        def launch(
+            core: Int64,
+            w_o: Int64,
+            w_o_scale: Int64,
+            out: Int64,
+            peers: Int64,
+            epochs: Int64,
+            rank: Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            _ = sources
+            run(kernel, (core, w_o, w_o_scale, out, peers, epochs, rank), stream)
+
+        OPROJ_AR_ABI.check(kernel, launch)
+        return K2OprojAllReduceKernel(name, launch, (CTAS,), (THREADS,))
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def prefetch_kernel(
         core: Int64,
         w_o: Int64,
         w_o_scale: Int64,
@@ -435,10 +477,17 @@ def build_oproj_allreduce(
         peers: Int64,
         epochs: Int64,
         rank: Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        prefetch0: Int64,
+        prefetch0_bytes: Int64,
+        prefetch1: Int64,
+        prefetch1_bytes: Int64,
+        prefetch2: Int64,
+        prefetch2_bytes: Int64,
+        prefetch3: Int64,
+        prefetch3_bytes: Int64,
     ):
         _ = sources
-        kernel(
+        body(
             core,
             w_o,
             w_o_scale,
@@ -446,13 +495,62 @@ def build_oproj_allreduce(
             peers,
             epochs,
             rank,
-            value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
-        ).launch(
-            grid=(CTAS,),
-            block=(THREADS,),
-            stream=stream,
-            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+            [
+                (prefetch0, prefetch0_bytes),
+                (prefetch1, prefetch1_bytes),
+                (prefetch2, prefetch2_bytes),
+                (prefetch3, prefetch3_bytes),
+            ],
         )
 
-    OPROJ_AR_ABI.check(kernel, launch)
-    return K2OprojAllReduceKernel(name, launch, (CTAS,), (THREADS,))
+    @flyc.jit
+    def prefetch_launch(
+        core: Int64,
+        w_o: Int64,
+        w_o_scale: Int64,
+        out: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        prefetch0: Int64,
+        prefetch0_bytes: Int64,
+        prefetch1: Int64,
+        prefetch1_bytes: Int64,
+        prefetch2: Int64,
+        prefetch2_bytes: Int64,
+        prefetch3: Int64,
+        prefetch3_bytes: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = sources
+        run(
+            prefetch_kernel,
+            (
+                core,
+                w_o,
+                w_o_scale,
+                out,
+                peers,
+                epochs,
+                rank,
+                prefetch0,
+                prefetch0_bytes,
+                prefetch1,
+                prefetch1_bytes,
+                prefetch2,
+                prefetch2_bytes,
+                prefetch3,
+                prefetch3_bytes,
+            ),
+            stream,
+        )
+
+    OPROJ_AR_PREFETCH_ABI.check(prefetch_kernel, prefetch_launch)
+    return K2OprojAllReduceKernel(
+        name,
+        prefetch_launch,
+        (CTAS,),
+        (THREADS,),
+        OPROJ_AR_PREFETCH_ABI,
+        prefetch_ranges=PREFETCH_RANGES,
+    )

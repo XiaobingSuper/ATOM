@@ -657,6 +657,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
     # three launches.
     "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "0") == "1",
+    # Kimi-K3 gfx1250 mono: while the o_proj all-reduce and the K2 tail wait on
+    # their peers, their waves prefetch the next compute kernel's weights (the
+    # front's; the next layer's K1 in-projection) into the MALL
+    # (prefetch_gfx1250); read when the kernels build. 0 leaves them out.
+    "ATOM_KIMI_MONO_PREFETCH": lambda: os.getenv("ATOM_KIMI_MONO_PREFETCH", "0") == "1",
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
     # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.

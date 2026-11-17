@@ -103,6 +103,7 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
     MOE_STATE_WORDS,
     build_moe,
 )
+from atom.models.kimi_k3.mono.kernels.stages.prefetch_gfx1250 import prefetch_args
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
 from atom.models.kimi_k3.mono.runner import (
@@ -843,9 +844,15 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         return out
 
     def _oproj(self, kernel, layer_id, core):
-        """o_proj of the BF16 core rows and its all-reduce, in one kernel."""
+        """o_proj of the BF16 core rows and its all-reduce, in one kernel;
+        with prefetch, it prefetches the layer's front weights."""
         weight, scale = self.oproj_weights[layer_id]
         attn_out = core.new_empty(core.size(0), HIDDEN)
+        ranges = getattr(kernel, "prefetch_ranges", 0)
+        front = ()
+        if ranges:
+            routed = self.routed[layer_id]
+            front = (routed.w_gate, routed.w_ld, routed.w_sgu, routed.w_sgu_scale)
         kernel.launcher(
             core.data_ptr(),
             weight.data_ptr(),
@@ -854,9 +861,24 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             self.oproj_peers.data_ptr(),
             self.k2_peers.epochs.data_ptr(),
             self.rank,
+            *prefetch_args(ranges, front),
             stream=torch.cuda.current_stream(),
         )
         return attn_out
+
+    def _next_k1_weights(self, layer_id) -> tuple:
+        """The in-projection weights (then scales) of the K1 that runs next
+        after layer ``layer_id``'s K2: the next layer's, where it is a KDA one
+        run here; else none."""
+        if "_next_k1" not in self.__dict__:
+            self._next_k1 = {
+                plan.layer_id: (after.kda.w_in, after.kda.w_in_scale)
+                for plan, after in zip(self.plans, self.plans[1:])
+                if after.kda is not None
+                and after.layer_id in self.routed
+                and after.layer_id not in self.ffn_layers
+            }
+        return self._next_k1.get(layer_id, ())
 
     def _routed_k2(self, build, plan, attn_out, prefix, blocks):
         weight = self.routed[plan.layer_id]
@@ -927,6 +949,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if local.replicated_finalize:
             tail = getattr(local, "tail", None)
             if tail is not None and gathered is not None:
+                ranges = getattr(tail, "prefetch_ranges", 0)
                 tail.launcher(
                     buffers["reduce"].data_ptr(),
                     *[t.data_ptr() for t in gathered],
@@ -937,6 +960,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     self.k2_peers.peers.data_ptr(),
                     self.k2_peers.epochs.data_ptr(),
                     self.rank,
+                    *prefetch_args(
+                        ranges, self._next_k1_weights(plan.layer_id) if ranges else ()
+                    ),
                     stream=stream,
                 )
                 return prefix, buffers["final"]

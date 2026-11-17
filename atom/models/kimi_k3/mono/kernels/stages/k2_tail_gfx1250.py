@@ -39,6 +39,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+from atom.models.kimi_k3.mono.kernels.stages import prefetch_gfx1250 as pf
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     TDM_CLUSTER,
     TDM_SLAB,
@@ -108,6 +109,9 @@ TAIL_ABI = KernelAbi(
         "rank",
     )
 )
+# with prefetch: the next layer's K1 in-projection and its scales
+PREFETCH_RANGES = 2
+TAIL_PREFETCH_ABI = KernelAbi(TAIL_ABI.names + pf.range_names(PREFETCH_RANGES))
 
 
 def tail_ar_ctas(rows: int) -> int:
@@ -185,6 +189,8 @@ class K2TailKernel:
     eps: float
     abi: KernelAbi = TAIL_ABI
     launch_count: int = 1
+    # ranges the launch prefetches after ``rank`` (``pf.prefetch_args``)
+    prefetch_ranges: int = 0
 
 
 def _rcp(value):
@@ -467,6 +473,7 @@ def build_k2_tail(
     tokens: int | None = None,
     identity_routes: bool = False,
     profile: bool = False,
+    prefetch: bool | None = None,
 ) -> K2TailKernel:
     """The gathering all-reduce, routed RMSNorm (``norm_weight`` [LATENT]
     BF16, ``eps``) and replicated finalize (``up_weight`` [HIDDEN, LATENT]
@@ -477,7 +484,10 @@ def build_k2_tail(
     ``route_rows`` is the identity (the fused MoE's) and goes unread.
     ``profile``: each CTA's 100 MHz stamps in ``flags`` past its flags,
     STAMPS a CTA: start, all-reduce done, flags seen, GEMV done, end, lines
-    gathered, routed lines polled, rstd."""
+    gathered, routed lines polled, rstd. ``prefetch``
+    (ATOM_KIMI_MONO_PREFETCH where None): every CTA prefetches its share of
+    PREFETCH_RANGES ranges once its all-reduce lines are pushed, before it
+    polls."""
     ar_ctas = tail_ar_ctas(rows)
     if rows < 1 or ar_ctas > MAX_CTAS:
         raise ValueError(
@@ -488,10 +498,12 @@ def build_k2_tail(
     lines = allreduce7_lines(rows)
     bank_words = tp * lines * LINE_WORDS
     tiles = (rows + ROWS - 1) // ROWS
+    prefetch = pf.enabled(prefetch)
     name = (
         f"k3_k2_gfx1250_tail_tp{tp}_s{rows}_d{layout.depth}_t{layout.tokens}"
         + ("_id" if identity_routes else "")
         + ("_profile" if profile else "")
+        + ("_pf" if prefetch else "")
     )
     sources = SOURCES
 
@@ -500,21 +512,21 @@ def build_k2_tail(
         words: fx.Array[fx.Int32, layout.words, 16]
         floats: fx.Array[fx.Float32, layout.words, 16]
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        data: Int64,
-        grouped: Int64,
-        route_rows: Int64,
-        route_weights: Int64,
-        norm_weight: Int64,
-        up_weight: Int64,
-        output: Int64,
-        flags: Int64,
-        peers: Int64,
-        epochs: Int64,
-        rank: Int32,
+    @traced
+    def body(
+        data,
+        grouped,
+        route_rows,
+        route_weights,
+        norm_weight,
+        up_weight,
+        output,
+        flags,
+        peers,
+        epochs,
+        rank,
+        ranges,
     ):
-        _ = sources
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -575,7 +587,9 @@ def build_k2_tail(
         bases = []
 
         def prologue():
-            _ar_finish(c, _ar_push(c))
+            gains = _ar_push(c)
+            pf.prefetch_all(ranges, bid, grid, tid, THREADS)
+            _ar_finish(c, gains)
             _store_epochs(epochs, bid, tid, grid, epoch)
             if const_expr(profile):
                 _stamp(flags, bid, tid, 1)
@@ -637,8 +651,85 @@ def build_k2_tail(
         if const_expr(profile):
             _stamp(flags, bid, tid, 4)
 
-    @flyc.jit
-    def launch(
+    def run(kernel, args, stream):
+        kernel(*args, value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"]).launch(
+            grid=(grid,),
+            block=(THREADS,),
+            stream=stream,
+            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+        )
+
+    if not prefetch:
+
+        @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+        def kernel(
+            data: Int64,
+            grouped: Int64,
+            route_rows: Int64,
+            route_weights: Int64,
+            norm_weight: Int64,
+            up_weight: Int64,
+            output: Int64,
+            flags: Int64,
+            peers: Int64,
+            epochs: Int64,
+            rank: Int32,
+        ):
+            _ = sources
+            body(
+                data,
+                grouped,
+                route_rows,
+                route_weights,
+                norm_weight,
+                up_weight,
+                output,
+                flags,
+                peers,
+                epochs,
+                rank,
+                [],
+            )
+
+        @flyc.jit
+        def launch(
+            data: Int64,
+            grouped: Int64,
+            route_rows: Int64,
+            route_weights: Int64,
+            norm_weight: Int64,
+            up_weight: Int64,
+            output: Int64,
+            flags: Int64,
+            peers: Int64,
+            epochs: Int64,
+            rank: Int32,
+            stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        ):
+            _ = sources
+            run(
+                kernel,
+                (
+                    data,
+                    grouped,
+                    route_rows,
+                    route_weights,
+                    norm_weight,
+                    up_weight,
+                    output,
+                    flags,
+                    peers,
+                    epochs,
+                    rank,
+                ),
+                stream,
+            )
+
+        TAIL_ABI.check(kernel, launch)
+        return K2TailKernel(name, launch, (grid,), (THREADS,), ar_ctas, eps)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def prefetch_kernel(
         data: Int64,
         grouped: Int64,
         route_rows: Int64,
@@ -650,10 +741,13 @@ def build_k2_tail(
         peers: Int64,
         epochs: Int64,
         rank: Int32,
-        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+        prefetch0: Int64,
+        prefetch0_bytes: Int64,
+        prefetch1: Int64,
+        prefetch1_bytes: Int64,
     ):
         _ = sources
-        kernel(
+        body(
             data,
             grouped,
             route_rows,
@@ -665,13 +759,59 @@ def build_k2_tail(
             peers,
             epochs,
             rank,
-            value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
-        ).launch(
-            grid=(grid,),
-            block=(THREADS,),
-            stream=stream,
-            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+            [(prefetch0, prefetch0_bytes), (prefetch1, prefetch1_bytes)],
         )
 
-    TAIL_ABI.check(kernel, launch)
-    return K2TailKernel(name, launch, (grid,), (THREADS,), ar_ctas, eps)
+    @flyc.jit
+    def prefetch_launch(
+        data: Int64,
+        grouped: Int64,
+        route_rows: Int64,
+        route_weights: Int64,
+        norm_weight: Int64,
+        up_weight: Int64,
+        output: Int64,
+        flags: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        prefetch0: Int64,
+        prefetch0_bytes: Int64,
+        prefetch1: Int64,
+        prefetch1_bytes: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = sources
+        run(
+            prefetch_kernel,
+            (
+                data,
+                grouped,
+                route_rows,
+                route_weights,
+                norm_weight,
+                up_weight,
+                output,
+                flags,
+                peers,
+                epochs,
+                rank,
+                prefetch0,
+                prefetch0_bytes,
+                prefetch1,
+                prefetch1_bytes,
+            ),
+            stream,
+        )
+
+    TAIL_PREFETCH_ABI.check(prefetch_kernel, prefetch_launch)
+    return K2TailKernel(
+        name,
+        prefetch_launch,
+        (grid,),
+        (THREADS,),
+        ar_ctas,
+        eps,
+        TAIL_PREFETCH_ABI,
+        prefetch_ranges=PREFETCH_RANGES,
+    )
