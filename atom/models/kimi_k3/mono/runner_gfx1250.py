@@ -85,6 +85,12 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_front_role_lds_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.k2_front_tdm_gfx1250 import (
     build_replicated_front,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_fused_gfx1250 import (
+    FLAGS as K2_FUSED_FLAGS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_fused_gfx1250 import (
+    build_k2_fused,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_local_kernels_gfx1250 import (
     build_finalize_local,
 )
@@ -267,6 +273,9 @@ class Gfx1250RoutedK2Build:
     # the gathering all-reduce, routed RMSNorm and finalize as one launch
     # (k2_tail_gfx1250) where ATOM_KIMI_MONO_TAIL is set
     tail: object | None = None
+    # the finish and ``fused_moe`` (and ``tail``, where its ``tail`` is set)
+    # as one launch (k2_fused_gfx1250) where ATOM_KIMI_MONO_K2_FUSED is set
+    fused: object | None = None
 
 
 @dataclass(frozen=True)
@@ -292,6 +301,9 @@ class Gfx1250WidthBuild:
             tail = getattr(k2, "tail", None)
             if tail is not None:
                 pairs.append((tail.launcher, tail.abi))
+            fused = getattr(k2, "fused", None)
+            if fused is not None:
+                pairs.append((fused.launcher, fused.abi))
         if self.oproj is not None:
             pairs.append((self.oproj.launcher, self.oproj.abi))
 
@@ -747,6 +759,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 self.k2_tail_flags = torch.zeros(
                     tail_flag_words(), dtype=torch.int32, device=self.device
                 )
+        fused = None
+        if envs.ATOM_KIMI_MONO_K2_FUSED and fused_moe is not None:
+            fused = build_k2_fused(
+                plan,
+                herd=herd,
+                fp8_shared_down=fp8_down,
+                tail_tp=None if tail is None else self.tp,
+                tail_eps=tail_eps,
+            )
+            if "k2_fused_flags" not in self.__dict__:
+                # one set for every layer and width, as the fused MoE's
+                self.k2_fused_flags = torch.zeros(
+                    K2_FUSED_FLAGS, dtype=torch.int32, device=self.device
+                )
         return Gfx1250RoutedK2Build(
             plan,
             front,
@@ -770,6 +796,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             grouped_moe,
             fused_moe,
             tail,
+            fused,
         )
 
     def _fused_moe_for(self, rows: int):
@@ -962,12 +989,19 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 gathered = self._sharded_front(
                     plan, weight, local, attn_out, prefix, blocks, x
                 )
-        self._finish(weight, local, gathered, stream)
+        fused = getattr(local, "fused", None)
+        if fused is None:
+            self._finish(weight, local, gathered, stream)
+        logits = gathered
         moe = self.inner.layers[plan.layer_id].block_sparse_moe
         # gemm2's grouped rows and their routes, held until the all-reduce that
         # gathers them is queued
         gathered = None
-        if local.fused_moe is not None:
+        if fused is not None:
+            gathered = self._k2_fused(weight, local, moe, logits, stream)
+            if fused.tail:
+                return prefix, buffers["final"]
+        elif local.fused_moe is not None:
             gathered = self._fused_moe(weight, local, moe, stream)
         elif local.grouped_moe is not None:
             gathered = self._grouped_moe(weight, local, moe)
@@ -1220,10 +1254,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         identity (row, weight) routes the gathering all-reduce takes; or, with
         no such all-reduce, their gather-reduce into ``routed``."""
         buffers = local.buffers
-        if local.herd_routes is not None:
-            weights, ids = local.herd_routes.routes[:2]
-        else:
-            weights, ids = buffers["tile_route"], buffers["route"]
+        weights, ids = self._fused_moe_routes(local)
         flags, state = self.fused_moe_sync
         local.fused_moe.launcher(
             ids.data_ptr(),
@@ -1239,6 +1270,19 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             state.data_ptr(),
             stream=stream,
         )
+        return self._fused_moe_out(local, weights)
+
+    @staticmethod
+    def _fused_moe_routes(local):
+        """The fused MoE's (weights, ids): HERD's kept routes, or the lite
+        finish's top-k."""
+        if local.herd_routes is not None:
+            return local.herd_routes.routes[:2]
+        return local.buffers["tile_route"], local.buffers["route"]
+
+    @staticmethod
+    def _fused_moe_out(local, weights):
+        buffers = local.buffers
         grouped = buffers["fused_grouped"].unsqueeze(0)
         rows = buffers["fused_rows"]
         if local.allreduce is not None and local.allreduce.abi is GATHER_ALLREDUCE_ABI:
@@ -1321,9 +1365,49 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             raise RuntimeError("the grouped MoE refused the precomputed HERD routes")
         _return_output(out, buffers["routed"])
 
-    def _finish(self, weight, local, gathered, stream):
+    def _k2_fused(self, weight, local, moe, gathered, stream):
+        """The lite finish and the fused MoE (and the K2 tail, into
+        ``final``) as one launch; returns what ``_fused_moe`` does."""
         buffers = local.buffers
-        local.finish.launcher(
+        weights, ids = self._fused_moe_routes(local)
+        flags, state = self.fused_moe_sync
+        tail = local.fused.tail
+        local.fused.launcher(
+            *self._finish_args(weight, local, gathered),
+            ids.data_ptr(),
+            moe.experts.w13_weight_scale.data_ptr(),
+            moe.experts.w2_weight_scale.data_ptr(),
+            buffers["fused_inter"].data_ptr(),
+            buffers["fused_grouped"].data_ptr(),
+            flags.data_ptr(),
+            state.data_ptr(),
+            self.k2_fused_flags.data_ptr(),
+            *(
+                (
+                    buffers["reduce"].data_ptr(),
+                    weights.data_ptr(),
+                    weight.ln_w.data_ptr(),
+                    weight.w_up_full.data_ptr(),
+                    buffers["final"].data_ptr(),
+                    self.k2_tail_flags.data_ptr(),
+                    self.k2_peers.peers.data_ptr(),
+                    self.k2_peers.epochs.data_ptr(),
+                    self.rank,
+                )
+                if tail
+                else (0,) * 9
+            ),
+            stream=stream,
+        )
+        return None if tail else self._fused_moe_out(local, weights)
+
+    def _finish(self, weight, local, gathered, stream):
+        local.finish.launcher(*self._finish_args(weight, local, gathered), stream=stream)
+
+    @staticmethod
+    def _finish_args(weight, local, gathered):
+        buffers = local.buffers
+        return (
             gathered.data_ptr(),
             weight.bias.data_ptr(),
             buffers["shared_gate_up"].data_ptr(),
@@ -1347,7 +1431,6 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["routed"].data_ptr(),
             buffers["shared"].data_ptr(),
             buffers["finish_scratch"].data_ptr(),
-            stream=stream,
         )
 
     def _k1(self, build, plan, prefix, delta, blocks, metadata, taps=None):
