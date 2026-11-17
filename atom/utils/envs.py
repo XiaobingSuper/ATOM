@@ -660,6 +660,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_ROLLED_LITE": lambda: (
         os.getenv("ATOM_KIMI_MONO_ROLLED_LITE", "1") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: the MLP-side AttnRes mix and the replicated K2
+    # front in one launch (k2_seam_front_gfx1250, bit-identical to the two),
+    # where the gfx1250 mix applies; 0 keeps the two launches.
+    "ATOM_KIMI_MONO_SEAM_FRONT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_SEAM_FRONT", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: widths up to this many rows run the routed experts
     # as one fused launch (moe_tdm_gfx1250.build_moe, bit-identical to AITER's
     # grouped MoE) instead of AITER's; 0 keeps AITER's everywhere. 48 is the

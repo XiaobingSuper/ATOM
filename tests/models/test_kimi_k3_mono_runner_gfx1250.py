@@ -577,6 +577,114 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
 
 
+@pytest.mark.parametrize("enabled", (False, True))
+def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(monkeypatch, enabled):
+    rows, layer_id = 2, 3
+    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        w_gate=tensor(4, 4),
+        w_ld=tensor(4, 4),
+        w_sgu=tensor(4, 4),
+        w_sgu_scale=tensor(2, dtype=torch.uint8),
+    )
+    buffers = {
+        name: tensor(rows, 4)
+        for name in ("router_logits", "latent_fp4", "latent_scales", "shared_hidden")
+    }
+    calls = {}
+
+    def recorder(name):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+        )
+
+    local = SimpleNamespace(
+        plan=SimpleNamespace(tokens=rows),
+        front=recorder("front"),
+        buffers=buffers,
+        grouped_experts=True,
+    )
+    blocks = tensor(rows, 3, 4)
+    mix = runner_module._MixArgs(
+        (2, 1, 1e-6, 1e-5),
+        blocks[:, :2],
+        tensor(rows, 4),
+        tensor(rows, 4),
+        tensor(rows, 4),
+        tensor(4),
+        tensor(4),
+        tensor(rows, 4),
+        tensor(rows, 4),
+    )
+    built = []
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.device = torch.device("cpu")
+    runner.routed = {layer_id: weight}
+    runner.inner = SimpleNamespace(
+        layers={layer_id: SimpleNamespace(mlp_attn_res=object())}
+    )
+    monkeypatch.setenv("ATOM_KIMI_MONO_SEAM_FRONT", "1" if enabled else "0")
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(runner_module, "_SEAM_FRONTS", {})
+    monkeypatch.setattr(runner_module, "_mono_mix_args", lambda *_args: mix)
+    monkeypatch.setattr(
+        runner_module,
+        "_mono_attn_res",
+        lambda *_args: (mix.out, mix.prefix_out),
+    )
+    monkeypatch.setattr(
+        runner_module,
+        "build_seam_front",
+        lambda plan, *key, fp8_shared: (
+            built.append((plan, key, fp8_shared)) or recorder("seam")
+        ),
+    )
+
+    class Finished(Exception):
+        pass
+
+    def finish(_self, _weight, _local, gathered, _stream):
+        calls["finish"] = gathered
+        raise Finished
+
+    monkeypatch.setattr(K3Gfx1250MonoDecodeRunner, "_finish", finish)
+    build = SimpleNamespace(k2={layer_id: local})
+    plan = SimpleNamespace(layer_id=layer_id)
+
+    with pytest.raises(Finished):
+        runner._routed_k2(build, plan, tensor(rows, 4), tensor(rows, 4), blocks)
+
+    assert calls["finish"] is buffers["router_logits"]
+    if not enabled:
+        assert "seam" not in calls and calls["front"][0] == mix.out.data_ptr()
+        return
+    assert "front" not in calls
+    assert built == [(local.plan, mix.key, True)]
+    args = calls["seam"]
+    assert args[:9] == (
+        mix.blocks.data_ptr(),
+        mix.prefix.data_ptr(),
+        mix.first.data_ptr(),
+        mix.second.data_ptr(),
+        mix.score_weight.data_ptr(),
+        mix.out_weight.data_ptr(),
+        mix.out.data_ptr(),
+        mix.prefix_out.data_ptr(),
+        blocks.stride(0),
+    )
+    assert args[9] == runner.seam_front_sync.data_ptr()
+    assert runner.seam_front_sync.numel() == runner_module.SEAM_FRONT_SYNC_WORDS
+    assert args[10:] == (
+        weight.w_gate.data_ptr(),
+        weight.w_ld.data_ptr(),
+        weight.w_sgu.data_ptr(),
+        weight.w_sgu_scale.data_ptr(),
+        *(buffers[name].data_ptr() for name in buffers),
+    )
+
+
 @pytest.mark.parametrize("all_reduce", ("collective", "kernel", "gather"))
 def test_replicated_finalize_all_reduces_both_partials_once(monkeypatch, all_reduce):
     rows, layer_id, latent, hidden = 2, 3, 3584, 7168

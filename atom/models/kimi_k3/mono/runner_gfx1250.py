@@ -92,6 +92,13 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
     build_oproj_allreduce,
     oproj_peer_bytes,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_seam_front_gfx1250 import (
+    SYNC_WORDS as SEAM_FRONT_SYNC_WORDS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_seam_front_gfx1250 import (
+    K2SeamFrontKernel,
+    build_seam_front,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_tail_gfx1250 import (
     build_k2_tail,
     tail_flag_words,
@@ -288,15 +295,32 @@ class Gfx1250WidthBuild:
 
 
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
+_SEAM_FRONTS: dict[tuple, K2SeamFrontKernel] = {}
 
 
-def _mono_attn_res(site, prefix, blocks, add, add2):
-    """``_bf16_attn_res`` on the gfx1250 AttnRes mix (``attn_res_gfx1250``):
-    the same mix, its reductions in another order, a CTA a token. Where that
-    kernel does not apply -- nothing to mix, no BF16 out_norm, blocks not rows
-    HIDDEN apart -- or ATOM_KIMI_MONO_ATTN_RES is 0, ``_bf16_attn_res``."""
+@dataclass(frozen=True)
+class _MixArgs:
+    """One seam's ``attn_res_gfx1250`` arguments: ``key`` is (blocks,
+    addends, eps, out_eps); ``first``/``second`` the addends, the prefix
+    where absent; ``prefix_out`` the prefix itself with no addend."""
+
+    key: tuple
+    blocks: torch.Tensor
+    prefix: torch.Tensor
+    first: torch.Tensor
+    second: torch.Tensor
+    score_weight: torch.Tensor
+    out_weight: torch.Tensor
+    out: torch.Tensor
+    prefix_out: torch.Tensor
+
+
+def _mono_mix_args(site, prefix, blocks, add, add2) -> _MixArgs | None:
+    """The gfx1250 AttnRes mix's arguments, or None where that kernel does
+    not apply: nothing to mix, no BF16 out_norm, blocks not rows HIDDEN apart,
+    or ATOM_KIMI_MONO_ATTN_RES 0."""
     if not (envs.ATOM_KIMI_MONO_ATTN_RES and getattr(site, "enabled", False)):
-        return _bf16_attn_res(site, prefix, blocks, add, add2)
+        return None
     if site.score_weight is None:
         site.process_weights_after_loading()
     first_prefix = add if prefix is None else prefix
@@ -313,31 +337,48 @@ def _mono_attn_res(site, prefix, blocks, add, add2):
         and blocks.stride(-1) == 1
         and blocks.stride(1) == HIDDEN
     ):
-        return _bf16_attn_res(site, prefix, blocks, add, add2)
-    key = (count, len(addends), float(site.eps), float(site.out_eps))
-    if key not in _ATTN_RES_MIXES:
-        _ATTN_RES_MIXES[key] = attn_res_gfx1250.build_attn_res(
-            count, len(addends), True, *key[2:]
-        )
+        return None
     prefix = first_prefix.contiguous()
     addends = [a.contiguous() for a in addends]
-    out = torch.empty_like(prefix)
-    prefix_out = torch.empty_like(prefix) if addends else prefix
     first, second = (addends + [prefix, prefix])[:2]
-    _ATTN_RES_MIXES[key].launcher(
-        blocks.data_ptr(),
-        prefix.data_ptr(),
-        first.data_ptr(),
-        second.data_ptr(),
-        site.score_weight.data_ptr(),
-        norm.weight.data_ptr(),
-        out.data_ptr(),
-        prefix_out.data_ptr(),
-        blocks.stride(0),
-        prefix.size(0),
+    return _MixArgs(
+        (count, len(addends), float(site.eps), float(site.out_eps)),
+        blocks,
+        prefix,
+        first,
+        second,
+        site.score_weight,
+        norm.weight,
+        torch.empty_like(prefix),
+        torch.empty_like(prefix) if addends else prefix,
+    )
+
+
+def _mono_attn_res(site, prefix, blocks, add, add2):
+    """``_bf16_attn_res`` on the gfx1250 AttnRes mix (``attn_res_gfx1250``):
+    the same mix, its reductions in another order, a CTA a token; where that
+    kernel does not apply (``_mono_mix_args``), ``_bf16_attn_res``."""
+    mix = _mono_mix_args(site, prefix, blocks, add, add2)
+    if mix is None:
+        return _bf16_attn_res(site, prefix, blocks, add, add2)
+    if mix.key not in _ATTN_RES_MIXES:
+        _ATTN_RES_MIXES[mix.key] = attn_res_gfx1250.build_attn_res(
+            mix.key[0], mix.key[1], True, *mix.key[2:]
+        )
+    _ATTN_RES_MIXES[mix.key].launcher(
+        mix.blocks.data_ptr(),
+        mix.prefix.data_ptr(),
+        mix.first.data_ptr(),
+        mix.second.data_ptr(),
+        mix.score_weight.data_ptr(),
+        mix.out_weight.data_ptr(),
+        mix.out.data_ptr(),
+        mix.prefix_out.data_ptr(),
+        mix.blocks.stride(0),
+        mix.prefix.size(0),
         stream=torch.cuda.current_stream(),
     )
-    return out, prefix_out
+    return mix.out, mix.prefix_out
 
 
 class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
@@ -864,31 +905,36 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         buffers = local.buffers
         stream = torch.cuda.current_stream()
         reset = weight.write_idx >= 0
-        x, prefix = _mono_attn_res(
-            self.inner.layers[plan.layer_id].mlp_attn_res,
-            None if reset else prefix,
-            blocks[:, : weight.blocks + reset],
-            attn_out,
-            None,
+        site = self.inner.layers[plan.layer_id].mlp_attn_res
+        seam = (None if reset else prefix, blocks[:, : weight.blocks + reset], attn_out)
+        mix = (
+            _mono_mix_args(site, *seam, None)
+            if local.grouped_experts and envs.ATOM_KIMI_MONO_SEAM_FRONT
+            else None
         )
-        if local.grouped_experts:
-            local.front.launcher(
-                x.data_ptr(),
-                weight.w_gate.data_ptr(),
-                weight.w_ld.data_ptr(),
-                weight.w_sgu.data_ptr(),
-                0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
-                buffers["router_logits"].data_ptr(),
-                buffers["latent_fp4"].data_ptr(),
-                buffers["latent_scales"].data_ptr(),
-                buffers["shared_hidden"].data_ptr(),
-                stream=stream,
-            )
+        if mix is not None:
+            prefix = self._seam_front(local, weight, mix, stream)
             gathered = buffers["router_logits"]
         else:
-            gathered = self._sharded_front(
-                plan, weight, local, attn_out, prefix, blocks, x
-            )
+            x, prefix = _mono_attn_res(site, *seam, None)
+            if local.grouped_experts:
+                local.front.launcher(
+                    x.data_ptr(),
+                    weight.w_gate.data_ptr(),
+                    weight.w_ld.data_ptr(),
+                    weight.w_sgu.data_ptr(),
+                    0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
+                    buffers["router_logits"].data_ptr(),
+                    buffers["latent_fp4"].data_ptr(),
+                    buffers["latent_scales"].data_ptr(),
+                    buffers["shared_hidden"].data_ptr(),
+                    stream=stream,
+                )
+                gathered = buffers["router_logits"]
+            else:
+                gathered = self._sharded_front(
+                    plan, weight, local, attn_out, prefix, blocks, x
+                )
         self._finish(weight, local, gathered, stream)
         moe = self.inner.layers[plan.layer_id].block_sparse_moe
         # gemm2's grouped rows and their routes, held until the all-reduce that
@@ -982,6 +1028,43 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         final = get_tp_group().all_reduce(buffers["final"], ca_fp8_quant=False)
         return prefix, buffers["final"] if final is None else final
+
+    def _seam_front(self, local, weight, mix, stream):
+        """The MLP-side AttnRes mix and the replicated front in one launch
+        (``k2_seam_front_gfx1250``, the two launches' bits); the mix's
+        ``prefix_out``. Its sync words are one set for every layer and width:
+        launches never overlap."""
+        fp8 = weight.w_sgu_scale is not None
+        key = (local.plan.tokens, fp8, *mix.key)
+        if key not in _SEAM_FRONTS:
+            _SEAM_FRONTS[key] = build_seam_front(local.plan, *mix.key, fp8_shared=fp8)
+        if "seam_front_sync" not in self.__dict__:
+            self.seam_front_sync = torch.zeros(
+                SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
+            )
+        buffers = local.buffers
+        _SEAM_FRONTS[key].launcher(
+            mix.blocks.data_ptr(),
+            mix.prefix.data_ptr(),
+            mix.first.data_ptr(),
+            mix.second.data_ptr(),
+            mix.score_weight.data_ptr(),
+            mix.out_weight.data_ptr(),
+            mix.out.data_ptr(),
+            mix.prefix_out.data_ptr(),
+            mix.blocks.stride(0),
+            self.seam_front_sync.data_ptr(),
+            weight.w_gate.data_ptr(),
+            weight.w_ld.data_ptr(),
+            weight.w_sgu.data_ptr(),
+            0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
+            buffers["router_logits"].data_ptr(),
+            buffers["latent_fp4"].data_ptr(),
+            buffers["latent_scales"].data_ptr(),
+            buffers["shared_hidden"].data_ptr(),
+            stream=stream,
+        )
+        return mix.prefix_out
 
     def _sharded_front(self, plan, weight, local, attn_out, prefix, blocks, x):
         """This rank's router/latent rows and the packed all-gather of them."""
