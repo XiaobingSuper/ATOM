@@ -295,7 +295,7 @@ class Gfx1250WidthBuild:
 
 
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
-_SEAM_FRONTS: dict[tuple, K2SeamFrontKernel] = {}
+_SEAM_FRONTS: dict[tuple, K2SeamFrontKernel | None] = {}
 
 
 @dataclass(frozen=True)
@@ -907,13 +907,13 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         reset = weight.write_idx >= 0
         site = self.inner.layers[plan.layer_id].mlp_attn_res
         seam = (None if reset else prefix, blocks[:, : weight.blocks + reset], attn_out)
-        mix = (
-            _mono_mix_args(site, *seam, None)
+        prefix_out = (
+            self._seam_front(local, weight, site, seam, stream)
             if local.grouped_experts and envs.ATOM_KIMI_MONO_SEAM_FRONT
             else None
         )
-        if mix is not None:
-            prefix = self._seam_front(local, weight, mix, stream)
+        if prefix_out is not None:
+            prefix = prefix_out
             gathered = buffers["router_logits"]
         else:
             x, prefix = _mono_attn_res(site, *seam, None)
@@ -1029,15 +1029,27 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         final = get_tp_group().all_reduce(buffers["final"], ca_fp8_quant=False)
         return prefix, buffers["final"] if final is None else final
 
-    def _seam_front(self, local, weight, mix, stream):
+    def _seam_front(self, local, weight, site, seam, stream):
         """The MLP-side AttnRes mix and the replicated front in one launch
         (``k2_seam_front_gfx1250``, the two launches' bits); the mix's
-        ``prefix_out``. Its sync words are one set for every layer and width:
-        launches never overlap."""
+        ``prefix_out``, or None where the gfx1250 mix does not apply or the
+        launch cannot hold it. Its sync words are one set for every layer and
+        width: launches never overlap."""
+        mix = _mono_mix_args(site, *seam, None)
+        if mix is None:
+            return None
         fp8 = weight.w_sgu_scale is not None
         key = (local.plan.tokens, fp8, *mix.key)
         if key not in _SEAM_FRONTS:
-            _SEAM_FRONTS[key] = build_seam_front(local.plan, *mix.key, fp8_shared=fp8)
+            try:
+                _SEAM_FRONTS[key] = build_seam_front(
+                    local.plan, *mix.key, fp8_shared=fp8
+                )
+            except ValueError as e:
+                logger.info("Kimi-K3 mono: the MLP seam keeps two launches (%s)", e)
+                _SEAM_FRONTS[key] = None
+        if _SEAM_FRONTS[key] is None:
+            return None
         if "seam_front_sync" not in self.__dict__:
             self.seam_front_sync = torch.zeros(
                 SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
