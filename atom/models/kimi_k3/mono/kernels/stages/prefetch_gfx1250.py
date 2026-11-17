@@ -81,7 +81,7 @@ def prefetch_range(
 def prefetch_all(ranges, part, parts, slot, slots):
     """``prefetch_range`` of each ``(address, bytes)`` of ``ranges``."""
     for base, nbytes in ranges:
-        prefetch_range(base, nbytes, part, parts, slot, slots)
+        prefetch_range(base, nbytes, part, parts, slot, slots, CACHE_POLICY)
 
 
 def prefetch_args(ranges: int, tensors) -> list[int]:
