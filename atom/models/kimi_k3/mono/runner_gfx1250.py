@@ -92,6 +92,13 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_ar_gfx1250 import (
     build_oproj_allreduce,
     oproj_peer_bytes,
 )
+from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_seam_front_gfx1250 import (
+    SYNC_WORDS as OPROJ_SEAM_FRONT_SYNC_WORDS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.k2_oproj_seam_front_gfx1250 import (
+    K2OprojSeamFrontKernel,
+    build_oproj_seam_front,
+)
 from atom.models.kimi_k3.mono.kernels.stages.k2_seam_front_gfx1250 import (
     SYNC_WORDS as SEAM_FRONT_SYNC_WORDS,
 )
@@ -296,6 +303,7 @@ class Gfx1250WidthBuild:
 
 _ATTN_RES_MIXES: dict[tuple, attn_res_gfx1250.AttnResKernel] = {}
 _SEAM_FRONTS: dict[tuple, K2SeamFrontKernel | None] = {}
+_OPROJ_SEAM_FRONTS: dict[tuple, K2OprojSeamFrontKernel | None] = {}
 
 
 @dataclass(frozen=True)
@@ -857,8 +865,14 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 if write_idx >= 0:
                     blocks[:, write_idx].copy_(prefix)
                 core = self._k1(build, plan, normed, None, blocks, metadata)
+            pending = None
             if build.oproj is not None and plan.layer_id in self.oproj_weights:
-                attn_out = self._oproj(build.oproj, plan.layer_id, core)
+                if envs.ATOM_KIMI_MONO_OPROJ_SEAM_FRONT:
+                    # landed by the fused launch, or by _oproj where it fails
+                    attn_out = core.new_empty(core.size(0), HIDDEN)
+                    pending = core
+                else:
+                    attn_out = self._oproj(build.oproj, plan.layer_id, core)
             elif isinstance(core, tuple):
                 core, core_scale = core
                 attn_out = layer.self_attn.o_proj(core, x_scale=core_scale)
@@ -870,6 +884,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 attn_out,
                 prefix,
                 blocks,
+                pending,
             )
             out = (prefix, add, None)
 
@@ -883,10 +898,11 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         self._write_aux(plan.layer_id, out)
         return out
 
-    def _oproj(self, kernel, layer_id, core):
+    def _oproj(self, kernel, layer_id, core, attn_out=None):
         """o_proj of the BF16 core rows and its all-reduce, in one kernel."""
         weight, scale = self.oproj_weights[layer_id]
-        attn_out = core.new_empty(core.size(0), HIDDEN)
+        if attn_out is None:
+            attn_out = core.new_empty(core.size(0), HIDDEN)
         kernel.launcher(
             core.data_ptr(),
             weight.data_ptr(),
@@ -899,7 +915,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         )
         return attn_out
 
-    def _routed_k2(self, build, plan, attn_out, prefix, blocks):
+    def _routed_k2(self, build, plan, attn_out, prefix, blocks, core=None):
+        """``core``: o_proj's input where its all-reduce is still to land
+        ``attn_out``."""
         weight = self.routed[plan.layer_id]
         local = build.k2[plan.layer_id]
         buffers = local.buffers
@@ -907,11 +925,20 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         reset = weight.write_idx >= 0
         site = self.inner.layers[plan.layer_id].mlp_attn_res
         seam = (None if reset else prefix, blocks[:, : weight.blocks + reset], attn_out)
-        prefix_out = (
-            self._seam_front(local, weight, site, seam, stream)
-            if local.grouped_experts and envs.ATOM_KIMI_MONO_SEAM_FRONT
-            else None
-        )
+        prefix_out = None
+        if core is not None:
+            if local.grouped_experts:
+                prefix_out = self._oproj_seam_front(
+                    local, weight, site, seam, core, plan.layer_id, stream
+                )
+            if prefix_out is None:
+                self._oproj(build.oproj, plan.layer_id, core, attn_out)
+        if (
+            prefix_out is None
+            and local.grouped_experts
+            and envs.ATOM_KIMI_MONO_SEAM_FRONT
+        ):
+            prefix_out = self._seam_front(local, weight, site, seam, stream)
         if prefix_out is not None:
             prefix = prefix_out
             gathered = buffers["router_logits"]
@@ -1066,6 +1093,65 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             mix.prefix_out.data_ptr(),
             mix.blocks.stride(0),
             self.seam_front_sync.data_ptr(),
+            weight.w_gate.data_ptr(),
+            weight.w_ld.data_ptr(),
+            weight.w_sgu.data_ptr(),
+            0 if weight.w_sgu_scale is None else weight.w_sgu_scale.data_ptr(),
+            buffers["router_logits"].data_ptr(),
+            buffers["latent_fp4"].data_ptr(),
+            buffers["latent_scales"].data_ptr(),
+            buffers["shared_hidden"].data_ptr(),
+            stream=stream,
+        )
+        return mix.prefix_out
+
+    def _oproj_seam_front(self, local, weight, site, seam, core, layer_id, stream):
+        """o_proj, its all-reduce into ``seam``'s attention row, the MLP-side
+        AttnRes mix and the replicated front in one launch
+        (``k2_oproj_seam_front_gfx1250``, the separate launches' bits); the
+        mix's ``prefix_out``, or None where the mix takes no single attention
+        addend or the launch cannot hold it. Its sync words are one set for
+        every layer and width: launches never overlap."""
+        mix = _mono_mix_args(site, *seam, None)
+        if mix is None or mix.key[1] > 1:
+            return None
+        fp8 = weight.w_sgu_scale is not None
+        key = (local.plan.tokens, fp8, self.tp, self.dims.proj, *mix.key)
+        if key not in _OPROJ_SEAM_FRONTS:
+            try:
+                _OPROJ_SEAM_FRONTS[key] = build_oproj_seam_front(
+                    local.plan, self.tp, self.dims.proj, *mix.key, fp8_shared=fp8
+                )
+            except ValueError as e:
+                logger.info(
+                    "Kimi-K3 mono: o_proj and the MLP seam keep separate launches (%s)",
+                    e,
+                )
+                _OPROJ_SEAM_FRONTS[key] = None
+        if _OPROJ_SEAM_FRONTS[key] is None:
+            return None
+        if "oproj_seam_front_sync" not in self.__dict__:
+            self.oproj_seam_front_sync = torch.zeros(
+                OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
+            )
+        o_weight, o_scale = self.oproj_weights[layer_id]
+        buffers = local.buffers
+        _OPROJ_SEAM_FRONTS[key].launcher(
+            core.data_ptr(),
+            o_weight.data_ptr(),
+            o_scale.data_ptr(),
+            seam[2].data_ptr(),
+            self.oproj_peers.data_ptr(),
+            self.k2_peers.epochs.data_ptr(),
+            self.rank,
+            mix.blocks.data_ptr(),
+            mix.prefix.data_ptr(),
+            mix.score_weight.data_ptr(),
+            mix.out_weight.data_ptr(),
+            mix.out.data_ptr(),
+            mix.prefix_out.data_ptr(),
+            mix.blocks.stride(0),
+            self.oproj_seam_front_sync.data_ptr(),
             weight.w_gate.data_ptr(),
             weight.w_ld.data_ptr(),
             weight.w_sgu.data_ptr(),
