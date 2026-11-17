@@ -40,6 +40,7 @@ from flydsl.expr.typing import Int32, Int64, T
 from atom.models.kimi_k3.mono.config import SITU_BETA, SITU_LINEAR_BETA
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    LINE7_ELEMENTS,
     LINE_WORDS,
     allreduce7_lines,
     push_line7,
@@ -741,6 +742,12 @@ def build_expert_down(rows: int, threads: int = THREADS) -> ExpertDownKernel:
 
 
 DOWN_TILES = LATENT // TASK_ROWS
+# build_moe(push_tp=): a half row is the tail's THREADS lines of seven and
+# HALF_TILES down tiles of each of its TOPK routes
+HALF_TILES = DOWN_TILES // 2
+PUSH_TILES = TOPK * HALF_TILES
+assert DOWN_TILES % 2 == 0 and HALF_TILES * TASK_ROWS == LATENT // 2
+assert LATENT // 2 == THREADS * LINE7_ELEMENTS
 # The fused MoE streams 48 KB items through a ring of four: a gate/up K tile
 # of 12 groups (192 rows, three MXFP4 blocks: four tasks an expert) or a down
 # tile of 16 groups (256 rows). Three in flight keep a CU fed past the HBM
@@ -1553,12 +1560,13 @@ def build_moe(
                                 cache_modifier=_out_cm(fused, push),
                             )
             if const_expr(push is not None):
-                # an expert's picks are distinct tokens
+                # a pick a thread, its token's half row of this tile; the
+                # atomic counts a token's repeated expert (a padded route)
                 if tid < count:
                     fx.atomic_add(
                         lds["done_tiles"]
                         + fx.ptr_load(lds["picks"] + start + tid) // TOPK * 2
-                        + tile // (DOWN_TILES // 2),
+                        + tile // HALF_TILES,
                         fx.Int32(1),
                         syncscope="workgroup",
                     )
@@ -1578,7 +1586,7 @@ def build_moe(
                             syncscope="agent",
                         )
                     )
-                    if before_add + ran == TOPK * (DOWN_TILES // 2):
+                    if before_add + ran == PUSH_TILES:
                         st_dev(fx.Int32(0), push["counters"], tid)
                         at = fx.atomic_add(
                             lds["completed"], fx.Int32(1), syncscope="workgroup"
