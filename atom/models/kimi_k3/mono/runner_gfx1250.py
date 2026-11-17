@@ -102,6 +102,7 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
     INTER_ROW_WORDS,
     MOE_STATE_WORDS,
     build_moe,
+    push_counter_words,
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
@@ -688,9 +689,22 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             and allreduce.abi is GATHER_ALLREDUCE_ABI
             and rows <= tail_max_rows()
         ):
+            pushed = envs.ATOM_KIMI_MONO_MOE_PUSH and fused_moe is not None
+            if pushed:
+                fused_moe = build_moe(rows, push_tp=self.tp)
+                if "moe_push_counters" not in self.__dict__:
+                    # one set for every layer and width: each launch leaves
+                    # them zero
+                    self.moe_push_counters = torch.zeros(
+                        push_counter_words(), dtype=torch.int32, device=self.device
+                    )
             # the fused MoE's routes are its own rows: ``fused_rows``
             tail = build_k2_tail(
-                self.tp, rows, tail_eps, identity_routes=fused_moe is not None
+                self.tp,
+                rows,
+                tail_eps,
+                identity_routes=fused_moe is not None,
+                pushed=pushed,
             )
             if "k2_tail_flags" not in self.__dict__:
                 # one set for every layer and width: a launch's flags carry
@@ -1056,6 +1070,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             buffers["fused_grouped"].data_ptr(),
             flags.data_ptr(),
             state.data_ptr(),
+            *(
+                ()
+                if local.fused_moe.push_tp is None
+                else (
+                    weights.data_ptr(),
+                    self.moe_push_counters.data_ptr(),
+                    self.k2_peers.peers.data_ptr(),
+                    self.k2_peers.epochs.data_ptr(),
+                    self.rank,
+                )
+            ),
             stream=stream,
         )
         grouped = buffers["fused_grouped"].unsqueeze(0)

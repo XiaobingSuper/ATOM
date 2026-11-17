@@ -53,6 +53,7 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     THREADS,
     _pack,
     _poll_lines7,
+    _poll_lines7_bounded,
     _seven,
     _store_line_sys,
     allreduce7_lines,
@@ -92,6 +93,7 @@ assert THREADS == 2 * ROWS * 8
 AR_WORDS = LATENT + WAVES + 2 * TOPK
 STAMPS = 8
 TAIL_DEPTH = 3
+PUSHED_DEPTH = 4
 
 TAIL_ABI = KernelAbi(
     (
@@ -147,7 +149,10 @@ class TailLayout:
 
 
 def tail_layout(
-    rows: int, depth: int | None = None, tokens: int | None = None
+    rows: int,
+    depth: int | None = None,
+    tokens: int | None = None,
+    max_depth: int = TAIL_DEPTH,
 ) -> TailLayout:
     """``depth``: up-weight slabs issued ahead of the all-reduce, at most
     TAIL_DEPTH by default: more slow its gathers more than they save.
@@ -158,7 +163,7 @@ def tail_layout(
     stage_words = 2 * tdm_task_words()
     red_words = 2 * tiles * ACCUMULATOR_WORDS
     limit = GFX1250.max_workgroup_lds_bytes // 4
-    for d in [depth] if depth is not None else range(TAIL_DEPTH, 0, -1):
+    for d in [depth] if depth is not None else range(max_depth, 0, -1):
         stages = d + 1
         last = (SLABS - 1) % stages
         need = -(-red_words // stage_words)
@@ -303,6 +308,12 @@ def _row_square_sum(row, squares, tid, lane, wave):
     return quads[0] + quads[1]
 
 
+def _poll(c, ats):
+    if c["poll_limit"] is None:
+        return _poll_lines7(c["mine"], ats, c["tag"])
+    return _poll_lines7_bounded(c["mine"], ats, c["tag"], c["poll_limit"])
+
+
 @traced
 def _routed_finish(c, line, gains):
     """A routed line's copies and its partner's (the other half of the row,
@@ -311,11 +322,10 @@ def _routed_finish(c, line, gains):
     tp, lines, bank = c["tp"], c["lines"], c["bank"]
     tid, bid, lane, wave = c["tid"], c["bid"], c["lane"], c["wave"]
     partner = line ^ THREADS
-    got = _poll_lines7(
-        c["mine"],
+    got = _poll(
+        c,
         [bank + (p * lines + line) * LINE_WORDS for p in range(tp)]
         + [bank + (p * lines + partner) * LINE_WORDS for p in range(tp)],
-        c["tag"],
     )
     own = _reduced(got, 0, tp)
     other = _reduced(got, tp, tp)
@@ -344,11 +354,7 @@ def _routed_finish(c, line, gains):
 @traced
 def _shared_finish(c, line):
     tp, lines, bank = c["tp"], c["lines"], c["bank"]
-    got = _poll_lines7(
-        c["mine"],
-        [bank + (p * lines + line) * LINE_WORDS for p in range(tp)],
-        c["tag"],
-    )
+    got = _poll(c, [bank + (p * lines + line) * LINE_WORDS for p in range(tp)])
     _store_seven_dev(c["local"], line * LINE7_ELEMENTS, _reduced(got, 0, tp))
 
 
@@ -445,6 +451,34 @@ def _ar_push(c):
 
 
 @traced
+def _ar_push_shared(c):
+    """``_ar_push`` where the fused MoE pushed the routed lines
+    (``moe_tdm_gfx1250.build_moe(push_tp=)``): a shared CTA's lines pushed,
+    a routed CTA's line's norm weights loaded."""
+    tid, bid = c["tid"], c["bid"]
+    line = bid * THREADS + tid
+    g0 = g1 = g2 = g3 = g4 = g5 = g6 = fx.Float32(0.0)
+    if bid < 2 * c["rows"]:
+        g0, g1, g2, g3, g4, g5, g6 = _seven(
+            rsrc(c["norm_weight"]), (bid % 2) * HALF + tid * LINE7_ELEMENTS
+        )
+    elif bid < c["ar_ctas"]:
+        values = _seven(c["local"], line * LINE7_ELEMENTS, _load_cm(c))
+        gpu.barrier()
+        words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
+        words.append(
+            (_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (c["tag"] << 16)
+        )
+        out = fx.Vector.from_elements(words, fx.Int32)
+        at = fx.Int64(c["bank"] + (c["rank"] * c["lines"] + line) * LINE_WORDS) * 4
+        for base in c["bases"]:
+            _store_line_sys(base + at, out)
+    if const_expr(c["profile"]):
+        _stamp(c["flags"], bid, tid, 5)
+    return [g0, g1, g2, g3, g4, g5, g6]
+
+
+@traced
 def _ar_finish(c, gains):
     """This CTA's lines reduced, the routed ones normalized, then its flag."""
     tid, bid = c["tid"], c["bid"]
@@ -485,6 +519,8 @@ def build_k2_tail(
     tokens: int | None = None,
     identity_routes: bool = False,
     profile: bool = False,
+    pushed: bool = False,
+    poll_limit: int | None = None,
 ) -> K2TailKernel:
     """The gathering all-reduce, routed RMSNorm (``norm_weight`` [LATENT]
     BF16, ``eps``) and replicated finalize (``up_weight`` [HIDDEN, LATENT]
@@ -495,20 +531,30 @@ def build_k2_tail(
     ``route_rows`` is the identity (the fused MoE's) and goes unread.
     ``profile``: each CTA's 100 MHz stamps in ``flags`` past its flags,
     STAMPS a CTA: start, all-reduce done, flags seen, GEMV done, end, lines
-    gathered, routed lines polled, rstd."""
+    gathered, routed lines polled, rstd. ``pushed``: the fused MoE pushed
+    the routed lines (``moe_tdm_gfx1250.build_moe(push_tp=)``, identity
+    routes): ``grouped`` and ``route_weights`` go unread, and with no gathers
+    ahead of its GEMV the up weights go out PUSHED_DEPTH slabs deep.
+    ``poll_limit`` (tests): the line polls give up past that many."""
+    if pushed and not identity_routes:
+        raise ValueError("the MoE pushes the routed lines of identity routes alone")
     ar_ctas = tail_ar_ctas(rows)
     if rows < 1 or ar_ctas > MAX_CTAS:
         raise ValueError(
             f"the K2 tail takes a line a thread up to {tail_max_rows()} rows"
         )
     grid = tail_grid(rows)
-    layout = tail_layout(rows, depth, tokens)
+    layout = tail_layout(
+        rows, depth, tokens, max_depth=PUSHED_DEPTH if pushed else TAIL_DEPTH
+    )
     lines = allreduce7_lines(rows)
     bank_words = tp * lines * LINE_WORDS
     tiles = (rows + ROWS - 1) // ROWS
     name = (
         f"k3_k2_gfx1250_tail_tp{tp}_s{rows}_d{layout.depth}_t{layout.tokens}"
         + ("_id" if identity_routes else "")
+        + ("_pm" if pushed else "")
+        + (f"_pl{poll_limit}" if poll_limit is not None else "")
         + ("_profile" if profile else "")
     )
     sources = SOURCES
@@ -594,13 +640,14 @@ def build_k2_tail(
             "squares": floats + LATENT,
             "routes": floats + LATENT + WAVES,
             "fused": fused is not None,
+            "poll_limit": poll_limit,
         }
         bases = []
 
         def prologue():
             if const_expr(fused is not None):
                 fused["wait_inputs"]()
-            _ar_finish(c, _ar_push(c))
+            _ar_finish(c, _ar_push_shared(c) if pushed else _ar_push(c))
             _store_epochs(epochs, bid, tid, grid, epoch)
             if const_expr(profile):
                 _stamp(flags, bid, tid, 1)

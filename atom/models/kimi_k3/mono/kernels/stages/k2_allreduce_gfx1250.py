@@ -511,6 +511,19 @@ def _poll_lines7(mine, ats, tag):
 
 
 @traced
+def _poll_lines7_bounded(mine, ats, tag, limit):
+    """``_poll_lines7`` giving up past ``limit`` polls (a test build's: a
+    lost line ends the launch with wrong bits, not a hung GPU)."""
+    words = _load_lines(mine, ats)
+    polls = fx.Int32(0)
+    while _stale7(words, len(ats), tag) & (polls < limit):
+        spin_pause()
+        polls = polls + 1
+        words = _load_lines(mine, ats)
+    return words
+
+
+@traced
 def _store_seven(local, element, values):
     """Seven BF16 at ``element``: the whole pairs as words, the odd end alone."""
     if element % 2 == 0:
@@ -554,6 +567,46 @@ def _push_reduce7(local, mine, bases, rank, tp, lines, bank, tag, line, values):
         copy.append(bf2_f32(fx.Int32(got[p * LINE_WORDS + 3]))[0])
         reduced = copy if p == 0 else [a + b for a, b in zip(reduced, copy)]
     _store_seven(local, line * LINE7_ELEMENTS, [bf16_round(v) for v in reduced])
+
+
+def routed_line7(grouped, route_weights, token, half, tid, cache_modifier=0):
+    """Line ``half * THREADS + tid`` of token ``token``'s routed row, as the
+    K2 tail gathers it: route ``k``'s BF16 row ``token * TOPK + k`` of
+    ``grouped``, weighted by its fp32 ``route_weights`` entry, summed in route
+    order in fp32 from 0 and rounded to BF16."""
+    column = half * (LATENT // 2) + tid * LINE7_ELEMENTS
+    loaded = fx.Vector(
+        bo.buffer_load(
+            rsrc(route_weights),
+            token * TOPK,
+            vec_width=TOPK,
+            dtype=T.i32,
+            is_scalar=True,
+        )
+    )
+    weights = [fx.Int32(loaded[k]).bitcast(fx.Float32) for k in range(TOPK)]
+    source = rsrc(grouped)
+    picks = [
+        _seven(source, (token * TOPK + k) * LATENT + column, cache_modifier)
+        for k in range(TOPK)
+    ]
+    sums = []
+    for j in range_constexpr(LINE7_ELEMENTS):
+        total = fx.Float32(0.0)
+        for pick, weight in zip(picks, weights):
+            total = total + weight * (fx.Float32(0.0) + pick[j])
+        sums.append(bf16_round(total))
+    return sums
+
+
+def push_line7(bases, rank, lines, bank, tag, line, values):
+    """Line ``line``'s seven values, tagged, to every rank's receive bank."""
+    words = [_pack(values[2 * w], values[2 * w + 1]) for w in range(3)]
+    words.append((_pack(values[6], fx.Float32(0.0)) & fx.Int32(0xFFFF)) | (tag << 16))
+    out = fx.Vector.from_elements(words, fx.Int32)
+    at = fx.Int64(bank + (rank * lines + line) * LINE_WORDS) * 4
+    for base in bases:
+        _store_line_sys(base + at, out)
 
 
 def build_gather_allreduce(tp: int, rows: int) -> K2AllReduceKernel:

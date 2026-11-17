@@ -35,10 +35,16 @@ from aiter.ops.flydsl.kernels.quant_utils import (
 )
 from aiter.utility.mx_types import MxDtypeInt
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
-from flydsl.expr.typing import Int64, T
+from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import SITU_BETA, SITU_LINEAR_BETA
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
+    LINE_WORDS,
+    allreduce7_lines,
+    push_line7,
+    routed_line7,
+)
 from atom.models.kimi_k3.mono.kernels.stages.moe_expert_gfx1250 import (
     _activation_fragment,
     _weight_scale_word,
@@ -50,11 +56,13 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     LATENT,
     TOPK,
 )
+from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device import queue as task_queue
 from atom.mono.device.ops import (
     CM_DEV,
     ld_dev,
+    load_ptr64,
     readlane,
     rsrc,
     st_dev,
@@ -101,9 +109,10 @@ class ExpertUpKernel:
     grid: tuple[int]
 
 
-def _out_cm(fused):
-    """A fused launch's outputs' cache policy: device scope, read in it."""
-    return 0 if fused is None else CM_DEV
+def _out_cm(fused, push=None):
+    """A fused or pushing launch's outputs' cache policy: device scope, read
+    in it."""
+    return 0 if fused is None and push is None else CM_DEV
 
 
 @traced
@@ -774,6 +783,8 @@ class MoeKernel:
     # its LDS struct and kernel body, for a launch that runs it as a part
     lds: object = None
     body: object = None
+    # ``build_moe``'s: the TP it pushes the tail's routed lines at
+    push_tp: int | None = None
 
 
 def _realtime():
@@ -881,6 +892,7 @@ def build_moe(
     publish_at: int = 1,
     up_units: int = UP_UNITS,
     rolled: bool | None = None,
+    push_tp: int | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -900,10 +912,22 @@ def build_moe(
     ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
     M tiles' epilogues, a down tile's M tiles and the ring's first copies run
     as runtime loops, and a switch stages its picks' rows a round an
-    iteration, so a cold launch fetches one body of each."""
+    iteration, so a cold launch fetches one body of each.
+
+    ``push_tp``: the K2 tail's routed all-reduce lines from here, at that TP
+    (``build_k2_tail(..., pushed=True)`` takes the rest). Its launch takes
+    ``route_weights`` (the tail's, its routes the identity), ``counters``
+    (``push_counter_words()`` i32, zeroed once), ``peers``, ``epochs`` and
+    ``rank`` (the tail's) past ``state``. A CTA counts its down tiles a
+    (token, half row) in LDS; past its last tile, its rows drained, it adds
+    them to ``counters`` and the CTA whose add completes a half row -- every
+    route's tiles of it stored -- resets its counter, gathers it as the tail
+    does (``routed_line7``, the routes in order) and pushes its lines tagged
+    with the tail's epoch, under the other CTAs' last tiles."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     routes = rows * TOPK
+    halves = 2 * rows
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
         + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
@@ -911,6 +935,7 @@ def build_moe(
         + 2 * EXPERTS
         + 4 * routes
         + WAVES
+        + (2 * halves + 1 if push_tp is not None else 0)
     )
     if rows < 1 or lds_bytes > GFX1250.max_workgroup_lds_bytes:
         raise ValueError(f"the fused MoE's {rows}-row LDS ({lds_bytes} B) does not fit")
@@ -934,23 +959,33 @@ def build_moe(
         picks_n: fx.Array[fx.Int32, routes, 16]
         picks: fx.Array[fx.Int32, routes, 16]
         scan: fx.Array[fx.Int32, WAVES, 16]
+        if push_tp is not None:
+            # a (token, half row)'s down tiles this CTA ran; then the count
+            # and list of the half rows its adds completed
+            done_tiles: fx.Array[fx.Int32, halves, 16]
+            completed: fx.Array[fx.Int32, halves + 1, 16]
 
     name = (
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + ("_rl" if rolled else "")
+        + (f"_push{push_tp}" if push_tp is not None else "")
         + ("_profile" if profile else "")
     )
     sources = SOURCES
+    push_lines = allreduce7_lines(rows)
+    push_bank_words = (push_tp or 0) * push_lines * LINE_WORDS
 
     @traced
     def body(
         smem, ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
-        fused=None,
+        fused=None, push=None,
     ):
         """The kernel on ``smem`` (an ``Lds``). ``fused``: the launch's part
         after the lite finish (``k2_fused_gfx1250``): ``epoch`` its tag's,
         ``wait_routes()`` until ``ids`` are in, ``down_done(tag)`` once the
-        CTA's ``grouped`` rows are stored at device scope and drained."""
+        CTA's ``grouped`` rows are stored at device scope and drained.
+        ``push``: ``push_tp``'s arguments (``weights``, ``counters``,
+        ``peers``, ``epochs``, ``rank``)."""
         tid = fx.Int32(fx.thread_idx.x)
         bid = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -969,7 +1004,14 @@ def build_moe(
                 "picks",
                 "scan",
             )
+            + (("done_tiles", "completed") if push is not None else ())
         }
+        if const_expr(push is not None):
+            # zeroed ahead of the union's barriers
+            if tid < halves:
+                fx.ptr_store(fx.Int32(0), lds["done_tiles"] + tid)
+            if tid == 0:
+                fx.ptr_store(fx.Int32(0), lds["completed"])
 
         def stamp(i, value=None):
             if const_expr(profile):  # noqa: SIM102
@@ -1470,7 +1512,7 @@ def build_moe(
                                 down_packed,
                                 rsrc(grouped),
                                 (down_pick * LATENT + out + half * 16) // 2,
-                                cache_modifier=_out_cm(fused),
+                                cache_modifier=_out_cm(fused, push),
                             )
             for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
@@ -1508,11 +1550,78 @@ def build_moe(
                                 packed,
                                 rsrc(grouped),
                                 (pick * LATENT + out + half * 16) // 2,
-                                cache_modifier=_out_cm(fused),
+                                cache_modifier=_out_cm(fused, push),
                             )
+            if const_expr(push is not None):
+                # an expert's picks are distinct tokens
+                if tid < count:
+                    fx.atomic_add(
+                        lds["done_tiles"]
+                        + fx.ptr_load(lds["picks"] + start + tid) // TOPK * 2
+                        + tile // (DOWN_TILES // 2),
+                        fx.Int32(1),
+                        syncscope="workgroup",
+                    )
             i = i + 1
         stamp(3)
         stamp(4, downs)
+        if const_expr(push is not None):
+            rocdl.s_wait_storecnt(0)
+            _lds_barrier()
+            if tid < halves:
+                ran = fx.ptr_load(lds["done_tiles"] + tid)
+                if ran > 0:
+                    before_add = fx.Int32(
+                        fx.llvm.atomic_add(
+                            task_queue.word(push["counters"] + fx.Int64(tid) * 4),
+                            ran,
+                            syncscope="agent",
+                        )
+                    )
+                    if before_add + ran == TOPK * (DOWN_TILES // 2):
+                        st_dev(fx.Int32(0), push["counters"], tid)
+                        at = fx.atomic_add(
+                            lds["completed"], fx.Int32(1), syncscope="workgroup"
+                        )
+                        fx.ptr_store(tid, lds["completed"] + 1 + at)
+            _lds_barrier()
+            completed = uniform(fx.ptr_load(lds["completed"]))
+            if completed > 0:
+                ar_epoch = (
+                    fx.Int32(
+                        bo.buffer_load(
+                            rsrc(push["epochs"]),
+                            0,
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    )
+                    + 1
+                )
+                ar_tag = ar_epoch & fx.Int32(0xFFFF)
+                ar_bank = (ar_epoch & 1) * push_bank_words
+                ar_bases = [load_ptr64(push["peers"], p) for p in range(push_tp)]
+                pushed = fx.Int32(0)
+                while pushed < completed:
+                    half_row = uniform(fx.ptr_load(lds["completed"] + 1 + pushed))
+                    values = routed_line7(
+                        grouped, push["weights"], half_row // 2, half_row % 2, tid, CM_DEV
+                    )
+                    # every wave's gathers in before any pushes: a CU with
+                    # remote stores in flight holds loads back behind them
+                    rocdl.s_wait_loadcnt(0)
+                    _lds_barrier()
+                    push_line7(
+                        ar_bases,
+                        push["rank"],
+                        push_lines,
+                        ar_bank,
+                        ar_tag,
+                        half_row * THREADS + tid,
+                        values,
+                    )
+                    pushed = pushed + 1
         if const_expr(profile):  # noqa: SIM102
             if tid == 0:
                 st_dev(waited, state, MOE_STATE_WORDS + 256 * 5 + bid * 2)
@@ -1570,4 +1679,70 @@ def build_moe(
             ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state
         ).launch(grid=(256,), block=(THREADS,), stream=stream)
 
-    return MoeKernel(name, launch, (256,), Lds, body)
+    if push_tp is None:
+        return MoeKernel(name, launch, (256,), Lds, body)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def push_kernel(
+        ids: Int64,
+        latent: Int64,
+        scales: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        inter: Int64,
+        grouped: Int64,
+        flags: Int64,
+        state: Int64,
+        route_weights: Int64,
+        counters: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+    ):
+        _ = sources
+        body(
+            fx.SharedAllocator().allocate(Lds).peek(),
+            ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+            push={
+                "weights": route_weights,
+                "counters": counters,
+                "peers": peers,
+                "epochs": epochs,
+                "rank": rank,
+            },
+        )
+
+    @flyc.jit
+    def push_launch(
+        ids: Int64,
+        latent: Int64,
+        scales: Int64,
+        w13: Int64,
+        w13s: Int64,
+        w2: Int64,
+        w2s: Int64,
+        inter: Int64,
+        grouped: Int64,
+        flags: Int64,
+        state: Int64,
+        route_weights: Int64,
+        counters: Int64,
+        peers: Int64,
+        epochs: Int64,
+        rank: Int32,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = sources
+        push_kernel(
+            ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state,
+            route_weights, counters, peers, epochs, rank,
+        ).launch(grid=(256,), block=(THREADS,), stream=stream)
+
+    return MoeKernel(name, push_launch, (256,), Lds, body, push_tp)
+
+
+def push_counter_words() -> int:
+    """``build_moe(push_tp=)``'s counters: one a (token, half row)."""
+    return 2 * GFX1250_MAX_TOKENS
