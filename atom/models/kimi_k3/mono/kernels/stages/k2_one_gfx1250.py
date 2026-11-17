@@ -19,6 +19,15 @@ each then reads at device scope, with no acquire fence. These waits give up
 past ``POLL_LIMIT`` polls and record themselves in ``flags[RECORD]``, as
 ``k2_fused_gfx1250``'s do.
 
+Known to fail at TP > 1: every wait past the front sits behind the
+cross-rank all-reduce, so a rank that waits on its peers (a launch skew of
+more than ``POLL_LIMIT`` polls) gives up and reads stale flags. The fix: the
+waits downstream of the all-reduce -- ``wait_front``, ``wait_routes``,
+``wait_inputs`` here and the MoE's and tail's own bounded waits -- poll
+without a limit, as the seam's all-reduce polls do (or with a limit sized for
+the ranks' skew, its record kept as a diagnostic); the MoE and tail bodies
+need a hook for that.
+
 A ``profile`` build stamps each CTA's 100 MHz clock (``STAMPS`` words a CTA
 past ``FLAGS``): start, its o_proj seam front part done, router logits in,
 shared rows in, finish done, latent in, routes in, MoE done, tail inputs
