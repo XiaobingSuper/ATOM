@@ -577,8 +577,12 @@ def test_grouped_k2_projects_locally_then_runs_grouped_moe(monkeypatch, herd):
     assert calls["finalize"][0] == buffers["routed"].data_ptr()
 
 
-@pytest.mark.parametrize("enabled", (False, True))
-def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(monkeypatch, enabled):
+@pytest.mark.parametrize(
+    ("enabled", "fits"), ((False, True), (True, True), (True, False))
+)
+def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(
+    monkeypatch, enabled, fits
+):
     rows, layer_id = 2, 3
     tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)
     weight = SimpleNamespace(
@@ -634,13 +638,14 @@ def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(monkeypatch, e
         "_mono_attn_res",
         lambda *_args: (mix.out, mix.prefix_out),
     )
-    monkeypatch.setattr(
-        runner_module,
-        "build_seam_front",
-        lambda plan, *key, fp8_shared: (
-            built.append((plan, key, fp8_shared)) or recorder("seam")
-        ),
-    )
+
+    def build_seam_front(plan, *key, fp8_shared):
+        built.append((plan, key, fp8_shared))
+        if not fits:
+            raise ValueError("no LDS")
+        return recorder("seam")
+
+    monkeypatch.setattr(runner_module, "build_seam_front", build_seam_front)
 
     class Finished(Exception):
         pass
@@ -657,8 +662,9 @@ def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(monkeypatch, e
         runner._routed_k2(build, plan, tensor(rows, 4), tensor(rows, 4), blocks)
 
     assert calls["finish"] is buffers["router_logits"]
-    if not enabled:
+    if not (enabled and fits):
         assert "seam" not in calls and calls["front"][0] == mix.out.data_ptr()
+        assert built == ([(local.plan, mix.key, True)] if enabled else [])
         return
     assert "front" not in calls
     assert built == [(local.plan, mix.key, True)]

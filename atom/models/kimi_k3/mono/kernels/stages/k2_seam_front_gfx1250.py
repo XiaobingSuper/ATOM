@@ -611,7 +611,8 @@ def _idle_mix(split):
 
 @traced
 def _publish(sync, flag, tag, tid):
-    """The CTA's flag, once every thread's ``x`` stores are done."""
+    """The CTA's flag, once its ``x`` columns are at device scope: the TDM
+    store's wave waited on its SCOPE_DEV completion before this barrier."""
     rocdl.s_wait_storecnt(0)
     _lds_barrier()
     if tid == 0:
