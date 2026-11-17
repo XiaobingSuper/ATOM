@@ -258,6 +258,7 @@ def project(
     wide: bool = True,
     on_slab=None,
     token_buffers: int = 2,
+    prefetch: int | None = None,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -280,7 +281,11 @@ def project(
     build's stamps); it keeps the slab loop unrolled.
 
     ``token_buffers``: token slabs resident in LDS (``x_words`` grows with
-    it), so that many are in flight once ``x`` is first read."""
+    it), so that many are in flight once ``x`` is first read.
+
+    ``prefetch``: of the first ``depth`` weight slabs, those issued before
+    ``prologue`` (all by default); the rest follow it. A prologue whose wait
+    is latency-bound runs it with fewer bytes in flight."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -293,6 +298,7 @@ def project(
         _ROLLED_UNROLL
         and wide
         and on_slab is None
+        and prefetch is None
         and token_buffers == 2
         and 1 + 2 * tasks <= WAVES
     ):
@@ -415,10 +421,14 @@ def project(
     if prologue is None:
         for slab in range(max(ahead - 1, 1)):
             issue_tokens(slab)
-    for slab in range(min(depth, slabs)):
+    early = min(depth, slabs) if prefetch is None else min(prefetch, depth, slabs)
+    for slab in range(early):
         issue_weights(slab)
     if prologue is not None:
         prologue()
+    for slab in range(early, min(depth, slabs)):
+        issue_weights(slab)
+    if prologue is not None:
         for slab in range(max(ahead - 1, 1)):
             issue_tokens(slab)
     for slab in range(slabs):

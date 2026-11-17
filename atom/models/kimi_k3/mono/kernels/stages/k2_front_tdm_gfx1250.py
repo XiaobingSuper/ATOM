@@ -114,6 +114,7 @@ def _front_tasks(
     depth=gemv_tdm.DEPTH,
     on_slab=None,
     token_buffers=2,
+    prefetch=None,
 ):
     """CTA ``pair``'s two projection tasks of ``x`` and their epilogue. The
     accumulators are reduced in the weight slabs' LDS, consumed by then (not
@@ -157,6 +158,7 @@ def _front_tasks(
                     wide=wide,
                     on_slab=on_slab,
                     token_buffers=token_buffers,
+                    prefetch=prefetch,
                 ),
                 red,
                 tiles,
@@ -181,6 +183,7 @@ def _front_tasks(
                     wide=wide,
                     on_slab=on_slab,
                     token_buffers=token_buffers,
+                    prefetch=prefetch,
                     depth=depth,
                 ),
                 red,
@@ -206,6 +209,7 @@ def _front_tasks(
                 wide=wide,
                 on_slab=on_slab,
                 token_buffers=token_buffers,
+                prefetch=prefetch,
                 depth=depth,
             ),
             red,

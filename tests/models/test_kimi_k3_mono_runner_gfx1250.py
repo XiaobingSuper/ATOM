@@ -199,7 +199,7 @@ def test_k1_reads_the_production_seam_and_hands_its_core_to_k2(layer_id):
     runner.inner = SimpleNamespace(layers={layer_id: layer})
     runner.routed = {layer_id: object()}
     runner._k1 = k1
-    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks, _core=None: (
         calls.update(routed=(attn, value)) or value + 1,
         attn + 2,
     )
@@ -254,7 +254,7 @@ def test_k1_core_goes_through_the_kernel_o_proj_all_reduce_when_built():
     runner._oproj = lambda built, layer_id, value: (
         calls.update(oproj=(built, layer_id, value)) or value + 3
     )
-    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks, _core=None: (
         calls.update(attn=attn) or value,
         attn,
     )
@@ -297,7 +297,7 @@ def test_full_attention_layer_runs_production_attention_then_the_kernel_k2():
     runner._oproj = lambda built, layer_id, value: (
         calls.update(oproj=(built, layer_id, value)) or value[:, :hidden] + 3
     )
-    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks: (
+    runner._routed_k2 = lambda _build, _plan, attn, value, _blocks, _core=None: (
         calls.update(k2=(attn, value)) or value,
         attn,
     )
@@ -683,6 +683,143 @@ def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(
     assert args[9] == runner.seam_front_sync.data_ptr()
     assert runner.seam_front_sync.numel() == runner_module.SEAM_FRONT_SYNC_WORDS
     assert args[10:] == (
+        weight.w_gate.data_ptr(),
+        weight.w_ld.data_ptr(),
+        weight.w_sgu.data_ptr(),
+        weight.w_sgu_scale.data_ptr(),
+        *(buffers[name].data_ptr() for name in buffers),
+    )
+
+
+@pytest.mark.parametrize(
+    ("fits", "addends"), ((True, 1), (False, 1), (True, 2))
+)
+def test_oproj_seam_front_takes_oproj_its_all_reduce_and_the_seam_in_one_launch(
+    monkeypatch, fits, addends
+):
+    rows, layer_id = 2, 3
+    tensor = lambda *shape, dtype=torch.float32: torch.zeros(shape, dtype=dtype)
+    weight = SimpleNamespace(
+        write_idx=-1,
+        blocks=2,
+        w_gate=tensor(4, 4),
+        w_ld=tensor(4, 4),
+        w_sgu=tensor(4, 4),
+        w_sgu_scale=tensor(2, dtype=torch.uint8),
+    )
+    buffers = {
+        name: tensor(rows, 4)
+        for name in ("router_logits", "latent_fp4", "latent_scales", "shared_hidden")
+    }
+    calls = {}
+
+    def recorder(name):
+        return SimpleNamespace(
+            launcher=lambda *args, **_kwargs: calls.setdefault(name, args)
+        )
+
+    local = SimpleNamespace(
+        plan=SimpleNamespace(tokens=rows),
+        front=recorder("front"),
+        buffers=buffers,
+        grouped_experts=True,
+    )
+    blocks = tensor(rows, 3, 4)
+    mix = runner_module._MixArgs(
+        (2, addends, 1e-6, 1e-5),
+        blocks[:, :2],
+        tensor(rows, 4),
+        tensor(rows, 4),
+        tensor(rows, 4),
+        tensor(4),
+        tensor(4),
+        tensor(rows, 4),
+        tensor(rows, 4),
+    )
+    built = []
+    runner = object.__new__(K3Gfx1250MonoDecodeRunner)
+    runner.device = torch.device("cpu")
+    runner.tp, runner.rank = 4, 1
+    runner.dims = SimpleNamespace(proj=3072)
+    runner.routed = {layer_id: weight}
+    runner.oproj_weights = {layer_id: (tensor(4, 4), tensor(4))}
+    runner.oproj_peers = tensor(4, dtype=torch.int64)
+    runner.k2_peers = SimpleNamespace(epochs=tensor(256, dtype=torch.int32))
+    runner.inner = SimpleNamespace(
+        layers={layer_id: SimpleNamespace(mlp_attn_res=object())}
+    )
+    monkeypatch.setenv("ATOM_KIMI_MONO_SEAM_FRONT", "0")
+    monkeypatch.setattr(runner_module.torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(runner_module, "_OPROJ_SEAM_FRONTS", {})
+    monkeypatch.setattr(runner_module, "_mono_mix_args", lambda *_args: mix)
+    monkeypatch.setattr(
+        runner_module,
+        "_mono_attn_res",
+        lambda *_args: (mix.out, mix.prefix_out),
+    )
+
+    def build_oproj_seam_front(plan, tp, proj, *key, fp8_shared):
+        built.append((plan, tp, proj, key, fp8_shared))
+        if not fits:
+            raise ValueError("no LDS")
+        return recorder("fused")
+
+    monkeypatch.setattr(runner_module, "build_oproj_seam_front", build_oproj_seam_front)
+
+    class Finished(Exception):
+        pass
+
+    def finish(_self, _weight, _local, gathered, _stream):
+        calls["finish"] = gathered
+        raise Finished
+
+    monkeypatch.setattr(K3Gfx1250MonoDecodeRunner, "_finish", finish)
+    build = SimpleNamespace(k2={layer_id: local}, oproj=recorder("oproj"))
+    plan = SimpleNamespace(layer_id=layer_id)
+    attn_out, core = tensor(rows, 4), tensor(rows, 6)
+
+    with pytest.raises(Finished):
+        runner._routed_k2(build, plan, attn_out, tensor(rows, 4), blocks, core)
+
+    assert calls["finish"] is buffers["router_logits"]
+    if not fits or addends > 1:
+        # o_proj lands the attention row, then the two launches
+        assert "fused" not in calls
+        assert calls["oproj"][:4] == (
+            core.data_ptr(),
+            runner.oproj_weights[layer_id][0].data_ptr(),
+            runner.oproj_weights[layer_id][1].data_ptr(),
+            attn_out.data_ptr(),
+        )
+        assert calls["front"][0] == mix.out.data_ptr()
+        assert built == ([] if addends > 1 else [(local.plan, 4, 3072, mix.key, True)])
+        return
+    assert "oproj" not in calls and "front" not in calls
+    args = calls["fused"]
+    assert args[:7] == (
+        core.data_ptr(),
+        runner.oproj_weights[layer_id][0].data_ptr(),
+        runner.oproj_weights[layer_id][1].data_ptr(),
+        attn_out.data_ptr(),
+        runner.oproj_peers.data_ptr(),
+        runner.k2_peers.epochs.data_ptr(),
+        1,
+    )
+    assert args[7:14] == (
+        mix.blocks.data_ptr(),
+        mix.prefix.data_ptr(),
+        mix.score_weight.data_ptr(),
+        mix.out_weight.data_ptr(),
+        mix.out.data_ptr(),
+        mix.prefix_out.data_ptr(),
+        blocks.stride(0),
+    )
+    assert args[14] == runner.oproj_seam_front_sync.data_ptr()
+    assert (
+        runner.oproj_seam_front_sync.numel()
+        == runner_module.OPROJ_SEAM_FRONT_SYNC_WORDS
+    )
+    assert args[15:] == (
         weight.w_gate.data_ptr(),
         weight.w_ld.data_ptr(),
         weight.w_sgu.data_ptr(),

@@ -397,27 +397,26 @@ def _tdm_row(wave, issuer, address, row, width, row_stride, rows, cache_policy, 
         )
 
 
-def _stage(regions, token, column0, wave, pointers, token_stride, layout):
+def _stage(regions, token, column0, wave, pointers, token_stride, layout, skip=None, wait=True):  # fmt: skip
     """The CTA's columns of the token's rows and the two weights to LDS, a
-    TDM copy a wave."""
+    TDM copy a wave. ``skip``: a candidate row (``layout.count`` the prefix,
+    past it the addends) the caller lands itself; ``wait``: the copies done
+    on return."""
     blocks, prefix, add, add2, score_weight, out_weight = pointers
     rows, scores, gains = regions[:3]
     width, step = layout.width, layout.row_words
+    singles = [prefix, add, add2][: 1 + layout.addends]
     copies = [
-        (blocks + fx.Int64(token * token_stride + column0) * 2, rows, layout.count),
-        (
-            prefix + fx.Int64(token * HIDDEN + column0) * 2,
-            rows + layout.count * step,
-            1,
-        ),
+        (blocks + fx.Int64(token * token_stride + column0) * 2, rows, layout.count)
     ]
     copies += [
         (
-            addend + fx.Int64(token * HIDDEN + column0) * 2,
-            rows + (layout.count + 1 + a) * step,
+            source + fx.Int64(token * HIDDEN + column0) * 2,
+            rows + (layout.count + s) * step,
             1,
         )
-        for a, addend in enumerate([add, add2][: layout.addends])
+        for s, source in enumerate(singles)
+        if layout.count + s != skip
     ]
     for issuer, (address, row, count) in enumerate(copies):
         _tdm_row(wave, issuer, address, row, width, HIDDEN, count, 0, False)
@@ -444,8 +443,9 @@ def _stage(regions, token, column0, wave, pointers, token_stride, layout):
         0,
         False,
     )
-    rocdl.s_wait_tensorcnt(0)
-    _lds_barrier()
+    if const_expr(wait):
+        rocdl.s_wait_tensorcnt(0)
+        _lds_barrier()
 
 
 @traced
@@ -481,10 +481,11 @@ def _exchange(sync, base, lds, own0, own, total, tid):
 
 
 @traced
-def _mix_token(mix, staged, sync, token, part, tid, lane, wave, pointers, token_stride, layout, stamp):  # fmt: skip
+def _mix_token(mix, staged, sync, token, part, tid, lane, wave, pointers, token_stride, layout, stamp, stage=None):  # fmt: skip
     """``attn_res_gfx1250``'s mix of ``token``, part ``part`` of its columns
     (``layout.turns`` turns of this CTA's); this part's ``x`` columns stored
-    at device scope, the TDM store done, on return."""
+    at device scope, the TDM store done, on return. ``stage()``: the part's
+    rows landed in LDS by the caller, else ``_stage``'s copies."""
     blocks, prefix, add, add2, score_weight, out_weight, x, prefix_out = pointers
     split, reductions = layout.split, layout.reductions
     candidates = layout.count + 1
@@ -499,15 +500,18 @@ def _mix_token(mix, staged, sync, token, part, tid, lane, wave, pointers, token_
     # opaque, so LLVM keeps each loop of turns one turn's code
     turns = uniform(fresh(layout.turns))
     selectors = _selectors(tid)
-    _stage(
-        regions,
-        token,
-        column0,
-        wave,
-        (blocks, prefix, add, add2, score_weight, out_weight),
-        token_stride,
-        layout,
-    )
+    if const_expr(stage is None):
+        _stage(
+            regions,
+            token,
+            column0,
+            wave,
+            (blocks, prefix, add, add2, score_weight, out_weight),
+            token_stride,
+            layout,
+        )
+    else:
+        stage()
     stamp(1)
     for turn in range(turns):
         _partials(
