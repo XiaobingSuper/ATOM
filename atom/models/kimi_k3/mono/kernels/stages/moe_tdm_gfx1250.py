@@ -924,6 +924,7 @@ def build_moe(
     rolled: bool | None = None,
     ring: int | None = None,
     resident: int | None = None,
+    refill: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -946,13 +947,24 @@ def build_moe(
     ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
     M tiles' epilogues, a down tile's M tiles and the ring's first copies run
     as runtime loops, and a switch stages its picks' rows a round an
-    iteration, so a cold launch fetches one body of each."""
+    iteration, so a cold launch fetches one body of each.
+
+    ``refill`` (default ``ATOM_KIMI_MONO_FUSED_MOE_REFILL``): a rolled build
+    frees an item's slot once its weights are in registers -- a second
+    barrier there -- and refills it before the item's math, a ring's whole
+    depth ahead."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
+    if refill is None:
+        refill = envs.ATOM_KIMI_MONO_FUSED_MOE_REFILL
+    refill = bool(refill) and rolled
     routes = rows * TOPK
     # Past 48 rows every token's latent and a ring of four do not fit: a
     # token's last K tiles are read from global memory (L2), the ring kept.
     ring, resident = _moe_fit(rows, ring, resident)
+    # The items issued past the one consumed: a refill build refills the
+    # consumed item's own slot, a ring's whole depth on.
+    lead = ring if refill else ring - 1
     latq_words = resident * (STEPS * 16 + 1)
     slots = min(routes, EXPERTS)
     tiles = (rows + 15) // 16
@@ -982,6 +994,7 @@ def build_moe(
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
+        + ("_e" if refill else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1177,8 +1190,8 @@ def build_moe(
                     )
 
         def wait_for(item):
-            if item + ring - 2 < flat:
-                rocdl.s_wait_tensorcnt(ring - 2)
+            if item + lead - 1 < flat:
+                rocdl.s_wait_tensorcnt(lead - 1)
             else:
                 rocdl.s_wait_tensorcnt(0)
 
@@ -1194,7 +1207,7 @@ def build_moe(
                 # Its down rows land where the latent does.
                 rocdl.s_wait_tensorcnt(0)
         if const_expr(rolled):
-            for first_item in range(fx.Int32(0), fx.Int32(ring - 1), unroll=1):
+            for first_item in range(fx.Int32(0), fx.Int32(lead), unroll=1):
                 if first_item < flat:
                     issue(first_item, first_item)
         else:
@@ -1222,6 +1235,30 @@ def build_moe(
         def since(before):
             return clock() - before
 
+        def up_operands(item, stage):
+            """A gate/up wave's weights and scales of an item, from its slot."""
+            scale = (
+                smem.item_scales.ptr
+                + (item % ring) * SCALE_WORDS
+                + wave * STEPS * 32
+                + lane
+            )
+            return (
+                [_weight_operand(stage, wave, lane, step) for step in range(STEPS)],
+                [fx.ptr_load(scale + step * 32) for step in range(STEPS)],
+            )
+
+        def up_held(item, stage):
+            """``up_operands`` in the gate/up's waves, zeros in the rest: one
+            list, so a branch yields it."""
+            held = [fx.Vector.filled(16, 0, fx.Int32) for _ in range(STEPS)] + [
+                fx.Int32(0) for _ in range(STEPS)
+            ]
+            if wave < UP_WAVES:
+                weights, scales = up_operands(item, stage)
+                held = weights + scales
+            return held
+
         up_start = clock()
         n = fx.Int32(0)
         while n < mine:
@@ -1247,23 +1284,21 @@ def build_moe(
                     up_wait = up_wait + since(k_before)
                     if (k_tile == publish_at) & (tid == 0) & (pending >= 0):
                         publish(pending)
-                    if k_item + ring - 1 < flat:
-                        issue(k_item + ring - 1, (k_item + ring - 1) % ring)
+                    if const_expr(not refill):  # noqa: SIM102
+                        if k_item + ring - 1 < flat:
+                            issue(k_item + ring - 1, (k_item + ring - 1) % ring)
                     k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
+                    if const_expr(refill):
+                        k_held = up_held(k_item, k_stage)
+                        _lds_barrier()
+                        if k_item + ring < flat:
+                            issue(k_item + ring, k_item % ring)
                     if wave < UP_WAVES:
-                        k_scale = (
-                            smem.item_scales.ptr
-                            + (k_item % ring) * SCALE_WORDS
-                            + wave * STEPS * 32
-                            + lane
-                        )
-                        k_weights = [
-                            _weight_operand(k_stage, wave, lane, step)
-                            for step in range(STEPS)
-                        ]
-                        k_weight_scales = [
-                            fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
-                        ]
+                        if const_expr(refill):
+                            k_weights = k_held[:STEPS]
+                            k_weight_scales = k_held[STEPS:]
+                        else:
+                            k_weights, k_weight_scales = up_operands(k_item, k_stage)
                         # A K tile's STEPS * 16 words hold one pad dword.
                         k_latq = lds["latq"] + k_tile
                         for m in range_constexpr(tiles):
@@ -1302,23 +1337,21 @@ def build_moe(
                     if const_expr(publish_at >= resident):  # noqa: SIM102
                         if (g_tile == publish_at) & (tid == 0) & (pending >= 0):
                             publish(pending)
-                    if g_item + ring - 1 < flat:
-                        issue(g_item + ring - 1, (g_item + ring - 1) % ring)
+                    if const_expr(not refill):  # noqa: SIM102
+                        if g_item + ring - 1 < flat:
+                            issue(g_item + ring - 1, (g_item + ring - 1) % ring)
                     g_stage = smem.stages.ptr + (g_item % ring) * (SLOT_BYTES // 4)
+                    if const_expr(refill):
+                        g_held = up_held(g_item, g_stage)
+                        _lds_barrier()
+                        if g_item + ring < flat:
+                            issue(g_item + ring, g_item % ring)
                     if wave < UP_WAVES:
-                        g_scale = (
-                            smem.item_scales.ptr
-                            + (g_item % ring) * SCALE_WORDS
-                            + wave * STEPS * 32
-                            + lane
-                        )
-                        g_weights = [
-                            _weight_operand(g_stage, wave, lane, step)
-                            for step in range(STEPS)
-                        ]
-                        g_weight_scales = [
-                            fx.ptr_load(g_scale + step * 32) for step in range(STEPS)
-                        ]
+                        if const_expr(refill):
+                            g_weights = g_held[:STEPS]
+                            g_weight_scales = g_held[STEPS:]
+                        else:
+                            g_weights, g_weight_scales = up_operands(g_item, g_stage)
                         for m in range_constexpr(tiles):
                             if m == 0 or m * 16 < count:
                                 for step in range_constexpr(STEPS):
@@ -1531,8 +1564,9 @@ def build_moe(
             wait_for(item)
             _lds_barrier()
             down_wait = down_wait + since(before)
-            if item + ring - 1 < flat:
-                issue(item + ring - 1, (item + ring - 1) % ring)
+            if const_expr(not refill):  # noqa: SIM102
+                if item + ring - 1 < flat:
+                    issue(item + ring - 1, (item + ring - 1) % ring)
             stage = smem.stages.ptr + (item % ring) * (SLOT_BYTES // 4)
             item_scale = (
                 smem.item_scales.ptr
@@ -1549,6 +1583,10 @@ def build_moe(
                 down_scales = [
                     fx.ptr_load(item_scale + step * 32) for step in range(DOWN_STEPS)
                 ]
+                if const_expr(refill):
+                    _lds_barrier()
+                    if item + ring < flat:
+                        issue(item + ring, item % ring)
                 down_tiles = fx.min((count + 15) // 16, tiles)
                 for down_m in range(fx.Int32(0), down_tiles, unroll=1):
                     down_index = down_m * 16 + lane % 16
