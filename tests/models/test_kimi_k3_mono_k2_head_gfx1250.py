@@ -58,6 +58,33 @@ def test_small_widths_hold_the_router_and_shared_shares_whole():
     assert kernel.split["router"][2] and kernel.split["shared"][2]
 
 
+@pytest.mark.parametrize("rows", (20, 40))
+def test_an_mxfp4_latent_takes_the_scale_plane_and_fits_whole(rows):
+    kernel = head.build_k2_head(
+        _plan(rows), 4, PROJ[4], 4, 1, 1e-6, 1e-5, fp8_shared=True, fp4_latent=True
+    )
+    assert kernel.abi is head.K2_HEAD_FP4_ABI
+    assert kernel.abi.names[-1] == "latent_scale"
+    assert kernel.split["latent"][0] == "fp4" and kernel.split["latent"][2]
+    assert "_f4_" in kernel.name
+
+
+def test_prefetch_hints_only_the_slabs_streamed_after_x():
+    kernel = head.build_k2_head(
+        _plan(40), 4, PROJ[4], 4, 1, 1e-6, 1e-5, fp8_shared=True, prefetch=2
+    )
+    quarter = head.tdm_split_slabs(head.HIDDEN)
+    for kind, (_, stages, whole) in kernel.split.items():
+        first, count = head._streamed(kernel.split, kind, 2)
+        assert first == stages
+        assert count == (0 if whole else min(quarter - stages, 2))
+    assert (
+        head._streamed(kernel.split, "latent", 99)[1]
+        == quarter - (kernel.split["latent"][1])
+    )
+    assert "_p2c0" in kernel.name
+
+
 @pytest.mark.parametrize(
     ("count", "addends", "rows"),
     ((0, 1, 8), (4, 2, 8), (4, 1, 41)),
