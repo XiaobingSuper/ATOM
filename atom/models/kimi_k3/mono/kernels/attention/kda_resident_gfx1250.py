@@ -257,6 +257,11 @@ def build_resident_k1(
     slabs = declaration.lds.arena.gemv_slabs[0]
     tile_starts = tuple(tile.row_start for tile in declaration.token_tiles)
     tile_rows = tuple(tile.rows for tile in declaration.token_tiles)
+    # Past 64 rows ``acc`` holds one tile's accumulators, each tile stored and
+    # reduced before the next.
+    whole_acc = declaration.lds.accumulator_tiles == len(tile_starts)
+    if not whole_acc and (split_stages or declaration.lds.accumulator_tiles != 1):
+        raise ValueError("resident K1 accumulators drifted from its declaration")
     group_columns = plan.kda_matrix_contract().group_columns
     s = declaration.tokens
     qlen = declaration.qlen
@@ -866,71 +871,126 @@ def build_resident_k1(
                             accumulators1[tile],
                         )
                         gpu.barrier()
-            # Every accumulator first, then one cross-wave reduction of them all.
             slot_words = plan.kda_accumulator_lds_elements
-            for task_offset in range_constexpr(
-                0 if split_stages else PROJECTION_ROWS_PER_CTA
-            ):
-                accumulators = (
-                    accumulators0 if const_expr(task_offset == 0) else accumulators1
-                )
-                for tile in range_constexpr(len(tile_starts)):
-                    compute["kda_gemv_store"](
-                        accumulators[tile],
-                        projection.acc.ptr
-                        + (task_offset * len(tile_starts) + tile) * slot_words,
-                        wave,
-                        lane,
+            if const_expr(whole_acc):
+                # Every accumulator first, then one cross-wave reduction of them all.
+                for task_offset in range_constexpr(
+                    0 if split_stages else PROJECTION_ROWS_PER_CTA
+                ):
+                    accumulators = (
+                        accumulators0 if const_expr(task_offset == 0) else accumulators1
                     )
-            gpu.barrier()
-            tdm_timeline.stamp(tdm_timeline.STAGED)
-            projected_tag = collect_generation(smem.tls.ptr, generation)
-            # ``preload``: derived from ``scratch`` here, after the projection,
-            # so the first copies never wait on its (unpreloaded) kernarg.
-            projected_out = (
-                gemv_tdm.opaque_pointer(scratch) + fx.Int64(layout["proj"][0])
-                if const_expr(gemv_tdm.late_scratch())
-                else projected
-            )
-            for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
-                task = first_task + task_offset
-                if task < PROJECTION_TASKS:
                     for tile in range_constexpr(len(tile_starts)):
-                        slot = (
+                        compute["kda_gemv_store"](
+                            accumulators[tile],
                             projection.acc.ptr
-                            + (task_offset * len(tile_starts) + tile) * slot_words
+                            + (task_offset * len(tile_starts) + tile) * slot_words,
+                            wave,
+                            lane,
                         )
-                        work_items = tile_rows[tile] * ROWS
-                        for iteration in range_constexpr(
-                            (work_items + declaration.threads - 1)
-                            // declaration.threads
-                        ):
-                            work = tid + declaration.threads * iteration
-                            if work < work_items:
-                                local_token = work // ROWS
-                                row = work % ROWS
-                                if const_expr(split_stages):
-                                    total = _split_sum(
-                                        projection.xl.ptr + split_out,
-                                        task_offset,
-                                        tile,
-                                        len(tile_starts),
-                                        row,
-                                        local_token,
+                gpu.barrier()
+                tdm_timeline.stamp(tdm_timeline.STAGED)
+                projected_tag = collect_generation(smem.tls.ptr, generation)
+                # ``preload``: derived from ``scratch`` here, after the projection,
+                # so the first copies never wait on its (unpreloaded) kernarg.
+                projected_out = (
+                    gemv_tdm.opaque_pointer(scratch) + fx.Int64(layout["proj"][0])
+                    if const_expr(gemv_tdm.late_scratch())
+                    else projected
+                )
+                for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+                    task = first_task + task_offset
+                    if task < PROJECTION_TASKS:
+                        for tile in range_constexpr(len(tile_starts)):
+                            slot = (
+                                projection.acc.ptr
+                                + (task_offset * len(tile_starts) + tile) * slot_words
+                            )
+                            work_items = tile_rows[tile] * ROWS
+                            for iteration in range_constexpr(
+                                (work_items + declaration.threads - 1)
+                                // declaration.threads
+                            ):
+                                work = tid + declaration.threads * iteration
+                                if work < work_items:
+                                    local_token = work // ROWS
+                                    row = work % ROWS
+                                    if const_expr(split_stages):
+                                        total = _split_sum(
+                                            projection.xl.ptr + split_out,
+                                            task_offset,
+                                            tile,
+                                            len(tile_starts),
+                                            row,
+                                            local_token,
+                                        )
+                                    else:
+                                        total = compute["kda_gemv_row_sum"](
+                                            slot, row, local_token
+                                        )
+                                    value = fx.Float32(total).to(fx.BFloat16)
+                                    value = fx.Float32(value)
+                                    global_token = tile_starts[tile] + local_token
+                                    gfx_backend.mailbox_store_device(
+                                        projected_out,
+                                        global_token * NPROJ + task * ROWS + row,
+                                        value,
+                                        projected_tag,
                                     )
-                                else:
+            else:
+                projected_tag = None
+                projected_out = None
+                for tile in range_constexpr(len(tile_starts)):
+                    if const_expr(tile):
+                        # every wave past its reads of the previous tile's
+                        gpu.barrier()
+                    for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+                        accumulators = (
+                            accumulators0
+                            if const_expr(task_offset == 0)
+                            else accumulators1
+                        )
+                        compute["kda_gemv_store"](
+                            accumulators[tile],
+                            projection.acc.ptr + task_offset * slot_words,
+                            wave,
+                            lane,
+                        )
+                    gpu.barrier()
+                    if const_expr(tile == 0):
+                        tdm_timeline.stamp(tdm_timeline.STAGED)
+                        projected_tag = collect_generation(smem.tls.ptr, generation)
+                        projected_out = (
+                            gemv_tdm.opaque_pointer(scratch)
+                            + fx.Int64(layout["proj"][0])
+                            if const_expr(gemv_tdm.late_scratch())
+                            else projected
+                        )
+                    for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+                        task = first_task + task_offset
+                        if task < PROJECTION_TASKS:
+                            slot = projection.acc.ptr + task_offset * slot_words
+                            work_items = tile_rows[tile] * ROWS
+                            for iteration in range_constexpr(
+                                (work_items + declaration.threads - 1)
+                                // declaration.threads
+                            ):
+                                work = tid + declaration.threads * iteration
+                                if work < work_items:
+                                    local_token = work // ROWS
+                                    row = work % ROWS
                                     total = compute["kda_gemv_row_sum"](
                                         slot, row, local_token
                                     )
-                                value = fx.Float32(total).to(fx.BFloat16)
-                                value = fx.Float32(value)
-                                global_token = tile_starts[tile] + local_token
-                                gfx_backend.mailbox_store_device(
-                                    projected_out,
-                                    global_token * NPROJ + task * ROWS + row,
-                                    value,
-                                    projected_tag,
-                                )
+                                    value = fx.Float32(total).to(fx.BFloat16)
+                                    value = fx.Float32(value)
+                                    global_token = tile_starts[tile] + local_token
+                                    gfx_backend.mailbox_store_device(
+                                        projected_out,
+                                        global_token * NPROJ + task * ROWS + row,
+                                        value,
+                                        projected_tag,
+                                    )
             tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
             gpu.barrier()
             device["wait_vector_stores"]()

@@ -40,7 +40,10 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     tdm_split_scratch_bytes,
     tdm_split_stages,
 )
-from atom.models.kimi_k3.mono.kernels.token_tiling import TokenTile
+from atom.models.kimi_k3.mono.kernels.token_tiling import (
+    WMMA_TOKEN_ROWS,
+    TokenTile,
+)
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.plan.layout import pair_layout
 
@@ -202,6 +205,10 @@ class K1RoleLdsPlan:
     # and slab stages, or None and 0.
     split_format: str | None = None
     split_stages: int = 0
+    # 16-row token tiles whose projection accumulators ``acc`` holds at once:
+    # every tile (one barrier ends the projection), or past
+    # ``WHOLE_ACCUMULATOR_ROWS`` one, each reduced before the next is stored.
+    accumulator_tiles: int = 1
 
     @property
     def smem(self) -> LdsRegion:
@@ -501,6 +508,18 @@ def split_projection_ctas(blocks: int) -> int:
     return ctas
 
 
+# Rows to which the projection keeps every tile's accumulators in LDS at once;
+# past them (and only there) one tile's at a time, and no split-K projection.
+WHOLE_ACCUMULATOR_ROWS = 64
+
+
+def accumulator_tiles(tokens: int) -> int:
+    """Token tiles whose projection accumulators K1 holds in LDS at once."""
+
+    tiles = -(-tokens // WMMA_TOKEN_ROWS)
+    return tiles if tokens <= WHOLE_ACCUMULATOR_ROWS else 1
+
+
 def role_lds_plan(
     plan: Gfx1250KimiBuildPlan,
     *,
@@ -555,10 +574,8 @@ def role_lds_plan(
         tile_rows * xrow * 2,
         tdm_lds_bytes(plan.tokens, PROJECTION_TASKS_PER_CTA),
     )
-    # Every task's and tile's accumulator, so one barrier ends the projection.
-    accumulator_bytes = (
-        PROJECTION_TASKS_PER_CTA * plan.token_tiling.tile_count * red_elements * 4
-    )
+    acc_tiles = accumulator_tiles(plan.tokens)
+    accumulator_bytes = PROJECTION_TASKS_PER_CTA * acc_tiles * red_elements * 4
     if fp8 and smem_bytes + projection_bytes + accumulator_bytes > plan.lds_bytes:
         projection_bytes = max(
             tile_rows * xrow * 2,
@@ -566,6 +583,11 @@ def role_lds_plan(
         )
     split_stages = 0
     if split is not None:
+        if plan.tokens > WHOLE_ACCUMULATOR_ROWS:
+            raise ValueError(
+                f"gfx1250 K1 split-K projection serves at most "
+                f"{WHOLE_ACCUMULATOR_ROWS} rows, got {plan.tokens}"
+            )
         split_projection_ctas(plan.blocks)
         budget = (plan.lds_bytes - smem_bytes - _align(accumulator_bytes)) // 4
         split_stages = tdm_split_stages(plan.tokens, HIDDEN, split, budget)
@@ -624,7 +646,9 @@ def role_lds_plan(
         LdsRegion("role", smem_bytes, role_bytes),
     )
     arena = KimiLdsPlan(plan.lds_bytes, regions, (slabs,))
-    return K1RoleLdsPlan(arena, smem_fields, variants, xrow, split, split_stages)
+    return K1RoleLdsPlan(
+        arena, smem_fields, variants, xrow, split, split_stages, acc_tiles
+    )
 
 
 def role_lds_type_spec(layout: K1RoleLdsPlan) -> K1LdsTypeSpec:

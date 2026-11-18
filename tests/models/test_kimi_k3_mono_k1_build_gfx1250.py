@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,7 @@ from atom.models.kimi_k3.mono.kernels.attention import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import tdm_lds_bytes
 
 
 def _plan(rows=16):
@@ -257,3 +259,75 @@ def test_replay_spec_refuses_an_inconsistent_window(cap, window, message):
     spec = replace(_spec(5), replay_cap=cap, replay_window=window)
     with pytest.raises(ValueError, match=message):
         spec.validate(_plan(40))
+
+
+@pytest.fixture
+def cap80(monkeypatch):
+    """The gfx1250 token cap raised to 80 rows wherever it was imported."""
+    for module in list(sys.modules.values()):
+        names = getattr(module, "__dict__", {})
+        if str(names.get("__name__", "")).startswith("atom.") and (
+            "GFX1250_MAX_TOKENS" in names
+        ):
+            monkeypatch.setattr(module, "GFX1250_MAX_TOKENS", 80)
+
+
+def _projection(lds):
+    return {field.name: field.bytes for field in lds.variant("projection").fields}
+
+
+@pytest.mark.parametrize("fp8", (False, True))
+def test_projection_holds_every_tiles_accumulators_to_64_rows(fp8):
+    # BF16's slabs beside every tile's sums: to 58 rows, as before
+    for rows in () if fp8 else range(59, 65):
+        with pytest.raises(ValueError, match="projection needs"):
+            builder.role_lds_plan(_plan(rows), qlen=1)
+    for rows in range(1, 65 if fp8 else 59):
+        tiles = -(-rows // 16)
+        assert builder.accumulator_tiles(rows) == tiles
+        lds = builder.role_lds_plan(_plan(rows), qlen=1, fp8=fp8)
+        assert lds.accumulator_tiles == tiles
+        assert _projection(lds)["acc"] == 2 * tiles * 2048 * 4
+        assert lds.smem.bytes + lds.role.bytes <= 320 * 1024
+
+
+@pytest.mark.parametrize("rows", (65, 72, 75, 76, 80))
+@pytest.mark.parametrize("fp8", (False, True))
+def test_projection_holds_one_tiles_accumulators_past_64_rows(cap80, rows, fp8):
+    assert builder.accumulator_tiles(rows) == 1
+    lds = builder.role_lds_plan(_plan(rows), qlen=1, fp8=fp8)
+    assert lds.accumulator_tiles == 1
+    projection = _projection(lds)
+    assert projection["acc"] == 2 * 2048 * 4
+    # the BF16-sized slabs fit beside one tile's sums even for FP8
+    assert projection["xl"] == tdm_lds_bytes(rows, 2)
+    assert lds.smem.bytes + lds.role.bytes <= 320 * 1024
+    # every tile's at once would not have fit
+    every = 2 * (-(-rows // 16)) * 2048 * 4
+    assert lds.smem.bytes + projection["xl"] + every > 320 * 1024
+
+
+def test_projection_at_80_rows_is_the_planned_324224_bytes(cap80):
+    lds = builder.role_lds_plan(_plan(80), qlen=5, fp8=True)
+    assert lds.smem.bytes + lds.role.bytes == 8320 + 2080 * 80 + 133120 + 16384
+
+
+@pytest.mark.parametrize("rows", (65, 72, 80))
+def test_split_projection_refuses_rows_past_64(cap80, rows):
+    assert not builder.split_projection_fits(_plan(rows), qlen=1)
+    with pytest.raises(ValueError, match="at most 64 rows"):
+        builder.role_lds_plan(_plan(rows), qlen=1, split="fp8")
+
+
+def test_split_projection_is_off_by_default(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_SPLITK", raising=False)
+    assert "k1" not in envs.ATOM_KIMI_MONO_SPLITK
+
+
+def test_wide_declaration_carries_one_tile_of_accumulators(cap80):
+    declaration = builder.declare_local(_plan(80), qlen=5)
+    assert declaration.lds.accumulator_tiles == 1
+    assert len(declaration.token_tiles) == 5
+    assert builder.declare_local(_plan(64), qlen=8, fp8=True).lds.accumulator_tiles == 4
