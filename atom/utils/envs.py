@@ -715,6 +715,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_K1_HEAD_SPLIT": lambda: os.getenv(
         "ATOM_KIMI_MONO_K1_HEAD_SPLIT", "auto"
     ),
+    # Kimi-K3 gfx1250 mono: K1's gate epilogue computes a wave's eight decay
+    # elements before one guarded store block, so their dependency chains
+    # overlap (the same bits); 0 (the default) guards each element.
+    "ATOM_KIMI_MONO_K1_GATE_ILP": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_GATE_ILP", "0"
+    )
+    == "1",
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them
