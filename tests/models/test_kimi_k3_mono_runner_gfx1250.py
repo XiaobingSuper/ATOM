@@ -691,9 +691,7 @@ def test_seam_front_takes_the_mlp_mix_and_the_front_in_one_launch(
     )
 
 
-@pytest.mark.parametrize(
-    ("fits", "addends"), ((True, 1), (False, 1), (True, 2))
-)
+@pytest.mark.parametrize(("fits", "addends"), ((True, 1), (False, 1), (True, 2)))
 def test_oproj_seam_front_takes_oproj_its_all_reduce_and_the_seam_in_one_launch(
     monkeypatch, fits, addends
 ):
@@ -885,9 +883,14 @@ def test_k2_head_is_tried_before_the_oproj_seam_front(monkeypatch, fits):
     monkeypatch.setattr(runner_module, "_K2_HEADS", {})
     monkeypatch.setattr(runner_module, "_mono_mix_args", lambda *_args: mix)
 
-    def build_k2_head(plan, tp, proj, *key, fp8_shared):
-        assert (plan, tp, proj, key, fp8_shared) == (
-            local.plan, 4, 3072, mix.key, False
+    def build_k2_head(plan, tp, proj, *key, fp8_shared, fp4_latent):
+        assert (plan, tp, proj, key, fp8_shared, fp4_latent) == (
+            local.plan,
+            4,
+            3072,
+            mix.key,
+            False,
+            False,
         )
         if not fits:
             raise ValueError("no LDS")

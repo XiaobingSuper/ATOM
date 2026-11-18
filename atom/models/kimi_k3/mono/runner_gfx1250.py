@@ -468,7 +468,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                 self.rank,
                 GFX1250,
                 fp8_shared=True,
-                fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK,
+                fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK
+                or envs.ATOM_KIMI_MONO_K2_HEAD,
             )
             for plan in self.plans
             if plan.kda is not None
@@ -498,7 +499,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
                     self.rank,
                     GFX1250,
                     fp8_shared=True,
-                    fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK,
+                    fp4_latent="front" in envs.ATOM_KIMI_MONO_SPLITK
+                    or envs.ATOM_KIMI_MONO_K2_HEAD,
                 )
                 # its core is o_proj's input, which the o_proj kernel reads
                 # [rows, proj]: only a layer whose o_proj it binds
@@ -981,7 +983,9 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         else:
             x, prefix = _mono_attn_res(site, *seam, None)
             if local.grouped_experts:
-                fp4_latent = local.front.abi is REPLICATED_FRONT_FP4_ABI
+                fp4_latent = (
+                    getattr(local.front, "abi", None) is REPLICATED_FRONT_FP4_ABI
+                )
                 local.front.launcher(
                     x.data_ptr(),
                     weight.w_gate.data_ptr(),
@@ -1188,11 +1192,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if mix is None or mix.key[1] > 1:
             return None
         fp8 = weight.w_sgu_scale is not None
-        key = (local.plan.tokens, fp8, self.tp, self.dims.proj, *mix.key)
+        fp4 = getattr(weight, "w_ld_fp4", None) is not None
+        key = (local.plan.tokens, fp8, fp4, self.tp, self.dims.proj, *mix.key)
         if key not in _K2_HEADS:
             try:
                 _K2_HEADS[key] = build_k2_head(
-                    local.plan, self.tp, self.dims.proj, *mix.key, fp8_shared=fp8
+                    local.plan,
+                    self.tp,
+                    self.dims.proj,
+                    *mix.key,
+                    fp8_shared=fp8,
+                    fp4_latent=fp4,
                 )
             except ValueError as e:
                 logger.info("Kimi-K3 mono: the K2 head keeps its full-K front (%s)", e)
@@ -1203,12 +1213,18 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             self.k2_head_sync = torch.zeros(
                 OPROJ_SEAM_FRONT_SYNC_WORDS, dtype=torch.int32, device=self.device
             )
-        _K2_HEADS[key].launcher(
-            *self._oproj_seam_args(
-                local, weight, seam, core, layer_id, mix, self.k2_head_sync
-            ),
-            stream=stream,
+        args = self._oproj_seam_args(
+            local, weight, seam, core, layer_id, mix, self.k2_head_sync
         )
+        if fp4:
+            # the latent's planes in its weight's place, its scales past all
+            args = (
+                *args[:16],
+                weight.w_ld_fp4.data_ptr(),
+                *args[17:],
+                weight.w_ld_scale.data_ptr(),
+            )
+        _K2_HEADS[key].launcher(*args, stream=stream)
         return mix.prefix_out
 
     def _oproj_seam_args(self, local, weight, seam, core, layer_id, mix, sync):

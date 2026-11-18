@@ -74,10 +74,12 @@ STAMP_REDUCED = osf.STAMP_REDUCED
 STAMP_MIX_POLLED = osf.STAMP_LANDED
 assert STAMP_ISSUED not in (STAMP_PUSHED, STAMP_REDUCED, STAMP_MIX_POLLED)
 
-# The launcher's arguments: the o_proj seam front's.
+# The launcher's arguments: the o_proj seam front's, then (an MXFP4 latent,
+# its planes in ``latent_weight``) the latent's E8M0 plane.
 K2_HEAD_ABI = osf.OPROJ_SEAM_FRONT_ABI
+K2_HEAD_FP4_ABI = KernelAbi((*K2_HEAD_ABI.names, "latent_scale"))
 # The kernel's: those, then the front's f32 partials (kept by the kernel).
-_KERNEL_ABI = KernelAbi((*K2_HEAD_ABI.names, "front_scratch"))
+_KERNEL_ABI = KernelAbi((*K2_HEAD_FP4_ABI.names, "front_scratch"))
 
 
 @dataclass(frozen=True)
@@ -201,6 +203,7 @@ def build_k2_head(
     eps: float,
     out_eps: float,
     fp8_shared: bool = False,
+    fp4_latent: bool = False,
     resident: bool = True,
     mix: HeadMix | None = None,
     poll_scope: int | None = None,
@@ -211,7 +214,10 @@ def build_k2_head(
     same arguments and ``sync`` (``SYNC_WORDS`` i32, ``PROFILE_WORDS`` more in
     a ``profile`` build, zeroed once and used by no other kernel). ``mix``:
     a ``HeadMix`` (``row_mix`` by default). ``resident``: each front
-    projection whose whole weight share fits the LDS is copied whole."""
+    projection whose whole weight share fits the LDS is copied whole.
+    ``fp4_latent``: the latent weight is its MXFP4 planes, the launcher's
+    ``latent_weight`` and its trailing ``latent_scale``
+    (``K2_HEAD_FP4_ABI``)."""
     import torch
 
     if plan.architecture is not GFX1250:
@@ -247,7 +253,9 @@ def build_k2_head(
     tiles = (rows + front.ROWS - 1) // front.ROWS
     group_words = rows * 16
     budget = (plan.lds_bytes - 1024) // 4 - group_words - head_mix.mix_words
-    split = front.front_split_plan(rows, fp8_shared, False, budget, resident=resident)
+    split = front.front_split_plan(
+        rows, fp8_shared, fp4_latent, budget, resident=resident
+    )
     if split is None:
         raise ValueError(f"the split-K front does not fit {rows} rows")
     gemv_words = max(
@@ -269,7 +277,7 @@ def build_k2_head(
     stages = "".join("r" if whole else str(depth) for _, depth, whole in split.values())
     name = (
         f"k3_k2_gfx1250_head_tp{tp}_b{count}_a{addends}_s{rows}"
-        f"{'_f8' if fp8_shared else ''}_{head_mix.name}_k{stages}_q{poll_scope & 0xFF}"
+        f"{'_f8' if fp8_shared else ''}{'_f4' if fp4_latent else ''}_{head_mix.name}_k{stages}_q{poll_scope & 0xFF}"
         f"{'_profile' if profile else ''}"
     )
     scratch = torch.empty(
@@ -310,6 +318,7 @@ def build_k2_head(
         latent_fp4: Int64,
         latent_scales: Int64,
         shared_hidden: Int64,
+        latent_scale: Int64,
         front_scratch: Int64,
     ):
         _ = sources
@@ -367,7 +376,7 @@ def build_k2_head(
                 (
                     router_weight,
                     latent_weight,
-                    latent_weight,
+                    latent_scale,
                     shared_weight,
                     shared_scale,
                 ),
@@ -421,6 +430,7 @@ def build_k2_head(
         latent_fp4: Int64,
         latent_scales: Int64,
         shared_hidden: Int64,
+        latent_scale: Int64,
         front_scratch: Int64,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
@@ -449,6 +459,7 @@ def build_k2_head(
             latent_fp4,
             latent_scales,
             shared_hidden,
+            latent_scale,
             front_scratch,
             value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
         ).launch(
@@ -459,9 +470,14 @@ def build_k2_head(
         )
 
     _KERNEL_ABI.check(kernel, launch)
-    scratch_address = scratch.data_ptr()
-
-    def launcher(*args, **kwargs):
-        return launch(*args, scratch_address, **kwargs)
-
-    return K2HeadKernel(name, launcher, (grid,), (THREADS,), head_mix, split, scratch)
+    tail = (scratch.data_ptr(),) if fp4_latent else (0, scratch.data_ptr())
+    return K2HeadKernel(
+        name,
+        front._TailedLauncher(launch, tail),
+        (grid,),
+        (THREADS,),
+        head_mix,
+        split,
+        scratch,
+        K2_HEAD_FP4_ABI if fp4_latent else K2_HEAD_ABI,
+    )
