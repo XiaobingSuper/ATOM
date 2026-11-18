@@ -29,6 +29,7 @@ every column.
 """
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -458,6 +459,32 @@ def build_oproj_allreduce(
         # the CTA's pairs ``[token][pair]``, cut into lines once all are in
         stage: fx.Array[fx.Int32, triples(rows) * LINE_TOKENS * CTA_PAIRS, 16]
 
+    # Where they do not fit side by side (past 64 rows) the accumulators
+    # overlay the GEMV's LDS, written once every wave is past its last read.
+    gemv_words = sum(tdm_lds_words(rows, 2, True, depth=gemv_tdm.FP8_DEPTH))
+    red_words = 2 * tiles * ACCUMULATOR_WORDS
+    stage_words = triples(rows) * LINE_TOKENS * CTA_PAIRS
+    overlay = (
+        4 * (gemv_words + red_words + stage_words) > GFX1250.max_workgroup_lds_bytes
+    )
+
+    @fx.struct
+    class GemvLds:
+        gemv: fx.Array[fx.Int32, gemv_words, 16]
+
+    @fx.struct
+    class RedLds:
+        red: fx.Array[fx.Float32, red_words, 16]
+
+    @fx.union
+    class GemvRed:
+        gemv: GemvLds
+        red: RedLds
+
+    @fx.struct
+    class StageLds:
+        stage: fx.Array[fx.Int32, stage_words, 16]
+
     name = (
         f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}{'_os' if oneshot else ''}"
         f"{'_profile' if profile else ''}{fresh.suffix('oproj')}"
@@ -486,7 +513,15 @@ def build_oproj_allreduce(
             "oproj", core, rows * proj * 2, bid, tid, CTAS, THREADS, TDM_CLUSTER
         )
         allocator = fx.SharedAllocator()
-        lds = allocator.allocate(Lds).peek()
+        if const_expr(overlay):
+            union = allocator.allocate(GemvRed)
+            lds = SimpleNamespace(
+                gemv=union.gemv.peek().gemv,
+                red=union.red.peek().red,
+                stage=allocator.allocate(StageLds).peek().stage,
+            )
+        else:
+            lds = allocator.allocate(Lds).peek()
         tdm_timeline.open_cta(bid, wave, timeline, allocator)
 
         def stamp(index, local=None):
@@ -521,6 +556,8 @@ def build_oproj_allreduce(
             w_scale=w_o_scale,
             depth=gemv_tdm.FP8_DEPTH,
         )
+        if const_expr(overlay):
+            gpu.barrier()
         for tile in range_constexpr(tiles):
             for index in range_constexpr(2):
                 gemv_gfx1250.store_accumulator(
