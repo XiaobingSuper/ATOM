@@ -542,25 +542,38 @@ def _poll_lines7(mine, ats, tag):
 
 
 @traced
-def _store_seven(local, element, values):
+def _store_seven(local, element, values, cache_modifier=0):
     """Seven BF16 at ``element``: the whole pairs as words, the odd end alone."""
+    cm = cache_modifier
     if element % 2 == 0:
         for w in range_constexpr(3):
             bo.buffer_store(
-                _pack(values[2 * w], values[2 * w + 1]), local, element // 2 + w
+                _pack(values[2 * w], values[2 * w + 1]),
+                local,
+                element // 2 + w,
+                cache_modifier=cm,
             )
         bo.buffer_store(
-            values[6].to(fx.BFloat16), local, element + 6, offset_is_bytes=False
+            values[6].to(fx.BFloat16),
+            local,
+            element + 6,
+            offset_is_bytes=False,
+            cache_modifier=cm,
         )
     else:
         bo.buffer_store(
-            values[0].to(fx.BFloat16), local, element, offset_is_bytes=False
+            values[0].to(fx.BFloat16),
+            local,
+            element,
+            offset_is_bytes=False,
+            cache_modifier=cm,
         )
         for w in range_constexpr(3):
             bo.buffer_store(
                 _pack(values[2 * w + 1], values[2 * w + 2]),
                 local,
                 (element + 1) // 2 + w,
+                cache_modifier=cm,
             )
 
 

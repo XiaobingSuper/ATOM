@@ -692,6 +692,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
         for site in os.getenv("ATOM_KIMI_MONO_XPF", "gather").split(",")
         if site not in ("", "0")
     ),
+    # Kimi-K3 gfx1250 mono: kernels launched with the AQL barrier bit clear,
+    # so they start while the kernel before them runs and wait for its
+    # device-scope ready flags themselves (any_order_launch), a comma list:
+    # "front" (after the MLP AttnRes, which publishes its rows; the caller
+    # launches that AttnRes from build_attn_res(publish=True)); for
+    # diagnosis, "front-serial" (the same flags, the front in order) and
+    # "front-late" (any-order, but the front waits before its first weight
+    # copies). Empty, the default: every launch in order.
+    "ATOM_KIMI_MONO_ANY_ORDER": lambda: frozenset(
+        site
+        for site in os.getenv("ATOM_KIMI_MONO_ANY_ORDER", "").split(",")
+        if site not in ("", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K1's whole-head recurrence issues its conv
     # weights and state window, gate fragments and output-norm weights before
     # waiting on the projection (the same bits), the default; 0 loads each

@@ -21,12 +21,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T
 
+from atom.models.kimi_k3.mono import any_order_launch
 from atom.models.kimi_k3.mono.config import HIDDEN
+from atom.models.kimi_k3.mono.kernels.stages import ready_flags_gfx1250 as ready
 from atom.models.kimi_k3.mono.kernels.stages.k2_allreduce_gfx1250 import (
     _seven,
     _store_seven,
 )
-from atom.mono.device.ops import butterfly, exp, hw_rsq, rsrc, traced, xred
+from atom.mono.device.ops import CM_DEV, butterfly, exp, hw_rsq, rsrc, traced, xred
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 
@@ -51,6 +53,8 @@ ATTN_RES_ABI = KernelAbi(
         "tokens",
     )
 )
+# build_attn_res(publish=True)'s kernel: and the any-order front's ready flags
+_PUBLISH_KERNEL_ABI = KernelAbi((*ATTN_RES_ABI.names, "ready_flags"))
 
 
 @dataclass(frozen=True)
@@ -85,21 +89,33 @@ def _seven_f32(pointer, element):
 
 
 def build_attn_res(
-    count: int, addends: int, out_norm: bool, eps: float, out_eps: float
+    count: int,
+    addends: int,
+    out_norm: bool,
+    eps: float,
+    out_eps: float,
+    publish: bool = False,
 ) -> AttnResKernel:
     """The mix of ``count`` block rows and the prefix with ``addends`` (0 to
     2) folded in, written back as ``prefix_out`` when there are any;
     ``out_weight`` is read only with ``out_norm``. ``blocks`` rows are HIDDEN
     apart within a token and ``token_stride`` apart across tokens; the other
     tensors are ``[tokens, HIDDEN]`` BF16 but ``score_weight``, ``[HIDDEN]``
-    FP32."""
+    FP32. ``publish`` (taken only with "front" in ``ATOM_KIMI_MONO_ANY_ORDER``):
+    ``out`` is stored at device scope and then each token's ready flag, for
+    the any-order front launched next; the launcher passes the boundary's
+    flags itself (``ready_flags_gfx1250``, up to its ``TOKENS`` tokens)."""
+    publish = publish and any_order_launch.enabled("front")
     candidates = count + 1
     if not 1 <= count < MAX_CANDIDATES:
         raise ValueError(f"the AttnRes mix holds 1 to {MAX_CANDIDATES - 1} blocks")
     if addends not in (0, 1, 2):
         raise ValueError("the AttnRes mix folds up to two addends")
     reductions = 2 * candidates
-    name = f"k3_gfx1250_attn_res_b{count}_a{addends}{'_n' if out_norm else ''}"
+    name = (
+        f"k3_gfx1250_attn_res_b{count}_a{addends}{'_n' if out_norm else ''}"
+        f"{'_pub' if publish else ''}"
+    )
 
     @fx.struct
     class Lds:
@@ -107,20 +123,21 @@ def build_attn_res(
         total: fx.Array[fx.Float32, reductions, 16]
         squares: fx.Array[fx.Float32, WAVES, 16]
 
-    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
-    def kernel(
-        blocks: Int64,
-        prefix: Int64,
-        add: Int64,
-        add2: Int64,
-        score_weight: Int64,
-        out_weight: Int64,
-        out: Int64,
-        prefix_out: Int64,
-        token_stride: Int32,
-        tokens: Int32,
+    @traced
+    def mix(
+        blocks,
+        prefix,
+        add,
+        add2,
+        score_weight,
+        out_weight,
+        out,
+        prefix_out,
+        token_stride,
+        ready_flags=None,
     ):
-        _ = tokens
+        if const_expr(ready_flags is not None):
+            epoch = ready.producer_epoch(ready_flags)
         tid = fx.Int32(fx.thread_idx.x)
         token = fx.Int32(fx.block_idx.x)
         lane = tid % GFX1250.wave_size
@@ -194,7 +211,37 @@ def build_attn_res(
             inverse = hw_rsq(norm * fx.Float32(1.0 / HIDDEN) + fx.Float32(out_eps))
             gains = _seven(rsrc(out_weight), column)
             mixed = [m * inverse * g for m, g in zip(mixed, gains)]
-        _store_seven(rsrc(out), element, mixed)
+        if const_expr(ready_flags is None):
+            _store_seven(rsrc(out), element, mixed)
+        else:
+            _store_seven(rsrc(out), element, mixed, cache_modifier=CM_DEV)
+            ready.publish(ready_flags, token, tid, epoch)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        blocks: Int64,
+        prefix: Int64,
+        add: Int64,
+        add2: Int64,
+        score_weight: Int64,
+        out_weight: Int64,
+        out: Int64,
+        prefix_out: Int64,
+        token_stride: Int32,
+        tokens: Int32,
+    ):
+        _ = tokens
+        mix(
+            blocks,
+            prefix,
+            add,
+            add2,
+            score_weight,
+            out_weight,
+            out,
+            prefix_out,
+            token_stride,
+        )
 
     @flyc.jit
     def launch(
@@ -223,5 +270,82 @@ def build_attn_res(
             tokens,
         ).launch(grid=(fx.Int64(tokens), 1, 1), block=(THREADS, 1, 1), stream=stream)
 
-    ATTN_RES_ABI.check(kernel, launch)
-    return AttnResKernel(name, launch)
+    if not publish:
+        ATTN_RES_ABI.check(kernel, launch)
+        return AttnResKernel(name, launch)
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def publishing(
+        blocks: Int64,
+        prefix: Int64,
+        add: Int64,
+        add2: Int64,
+        score_weight: Int64,
+        out_weight: Int64,
+        out: Int64,
+        prefix_out: Int64,
+        token_stride: Int32,
+        tokens: Int32,
+        ready_flags: Int64,
+    ):
+        _ = tokens
+        mix(
+            blocks,
+            prefix,
+            add,
+            add2,
+            score_weight,
+            out_weight,
+            out,
+            prefix_out,
+            token_stride,
+            ready_flags,
+        )
+
+    @flyc.jit
+    def launch_publishing(
+        blocks: Int64,
+        prefix: Int64,
+        add: Int64,
+        add2: Int64,
+        score_weight: Int64,
+        out_weight: Int64,
+        out: Int64,
+        prefix_out: Int64,
+        token_stride: Int32,
+        tokens: Int32,
+        ready_flags: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        publishing(
+            blocks,
+            prefix,
+            add,
+            add2,
+            score_weight,
+            out_weight,
+            out,
+            prefix_out,
+            token_stride,
+            tokens,
+            ready_flags,
+        ).launch(grid=(fx.Int64(tokens), 1, 1), block=(THREADS, 1, 1), stream=stream)
+
+    _PUBLISH_KERNEL_ABI.check(publishing, launch_publishing)
+    flags = any_order_launch.ready_flags("front").data_ptr()
+    return AttnResKernel(name, _Publishing(launch_publishing, flags))
+
+
+class _Publishing:
+    """A publishing launcher with the ATTN_RES_ABI: the flags appended."""
+
+    def __init__(self, launch, flags):
+        self.launch = launch
+        self.flags = flags
+
+    def __call__(self, *args, **kwargs):
+        return self.launch(*args, self.flags, **kwargs)
+
+    @property
+    def _mem_cache(self):
+        return self.launch._mem_cache

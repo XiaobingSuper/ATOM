@@ -18,12 +18,14 @@ from aiter.ops.flydsl.kernels import buffer_ops as bo
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int64
 
+from atom.models.kimi_k3.mono import any_order_launch
 from atom.models.kimi_k3.mono.config import EXPERTS, HIDDEN, LATENT, SUPPORTED_TP
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import (
     gemv_gfx1250,
     moe_expert_gfx1250,
     moe_gfx1250,
+    ready_flags_gfx1250,
     tdm_timeline,
 )
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
@@ -38,7 +40,15 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     tdm_split_stages,
 )
 from atom.models.kimi_k3.mono.sources import SOURCES
-from atom.mono.device.ops import bf_hi, bf_lo, butterfly, lds_bytes, rsrc, traced
+from atom.mono.device.ops import (
+    CM_DEV,
+    bf_hi,
+    bf_lo,
+    butterfly,
+    lds_bytes,
+    rsrc,
+    traced,
+)
 from atom.mono.plan.architecture import GFX1250
 from atom.mono.runtime.abi import KernelAbi
 from atom.utils import envs
@@ -82,6 +92,8 @@ REPLICATED_FRONT_ABI = KernelAbi(
 
 # Split-K with the latent weight MXFP4: its E8M0 [LATENT, HIDDEN / 32] plane.
 REPLICATED_FRONT_FP4_ABI = KernelAbi((*REPLICATED_FRONT_ABI.names, "latent_scale"))
+# "front" in ATOM_KIMI_MONO_ANY_ORDER: and the MLP AttnRes's ready flags
+_WAITING_KERNEL_ABI = KernelAbi((*REPLICATED_FRONT_ABI.names, "ready_flags"))
 _SPLIT_KERNEL_ABI = KernelAbi((*REPLICATED_FRONT_FP4_ABI.names, "scratch"))
 
 
@@ -496,7 +508,8 @@ def build_replicated_front(
     its E8M0 block scales in ``shared_scale``. ``split`` (default: "front" in
     ATOM_KIMI_MONO_SPLITK): split K over each cluster where the LDS holds it.
     ``fp4_latent`` (split only): the latent weight is MXFP4, its E8M0 plane
-    the launcher's ``latent_scale``."""
+    the launcher's ``latent_scale``. With "front" in
+    ``ATOM_KIMI_MONO_ANY_ORDER`` (not split), ``_build_waiting_front``'s."""
     if split is None:
         split = "front" in envs.ATOM_KIMI_MONO_SPLITK
     if split or fp4_latent:
@@ -529,6 +542,8 @@ def build_replicated_front(
 
     if lds_bytes(Lds) > plan.lds_bytes:
         raise ValueError(f"replicated K2 front needs {lds_bytes(Lds)} B of LDS")
+    if any_order_launch.enabled("front"):
+        return _build_waiting_front(Lds, rows, tiles, fp8_shared, wide, depth)
     name = (
         f"k3_k2_gfx1250_replicated_front{'_w' if wide else ''}_d{depth}"
         f"_s{rows}{'_f8' if fp8_shared else ''}{gemv_tdm.cold_suffix()}"
@@ -615,16 +630,130 @@ def build_replicated_front(
     return K2ReplicatedFrontKernel(name, launch, (PAIRS,), (THREADS,))
 
 
+def _build_waiting_front(Lds, rows, tiles, fp8_shared, wide, depth):
+    """The replicated front launched any-order after the MLP AttnRes: its
+    first weight slabs go out while that AttnRes runs, then each CTA waits
+    for the AttnRes's ready flags (``ready_flags_gfx1250``) and reads ``x``
+    at device scope, without the entry's L2 prefetch of ``x``."""
+    assert PAIRS <= ready_flags_gfx1250.CTAS and rows <= ready_flags_gfx1250.TOKENS
+    mode = any_order_launch.mode("front")
+    late = mode == "front-late"
+    name = (
+        f"k3_k2_gfx1250_replicated_front{'_w' if wide else ''}_d{depth}"
+        f"_s{rows}{'_f8' if fp8_shared else ''}{gemv_tdm.cold_suffix()}"
+        f"{tdm_timeline.suffix()}_ao{'_late' if late else ''}"
+    )
+    sources = SOURCES
+    timeline = tdm_timeline.key()
+
+    @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
+    def kernel(
+        x: Int64,
+        router_weight: Int64,
+        latent_weight: Int64,
+        shared_weight: Int64,
+        shared_scale: Int64,
+        router_logits: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        shared_hidden: Int64,
+        ready_flags: Int64,
+    ):
+        _ = sources, timeline
+        tid = fx.thread_idx.x
+        pair = fx.block_idx.x
+        lane = tid % GFX1250.wave_size
+        wave = tid // GFX1250.wave_size
+        gemv_tdm.prefetch_code(wave, 10 << 10)
+        epoch = ready_flags_gfx1250.consumer_epoch(ready_flags, fx.Int32(pair))
+        allocator = fx.SharedAllocator()
+        lds = allocator.allocate(Lds).peek()
+        tdm_timeline.open_cta(pair, wave, timeline, allocator)
+
+        def prologue():
+            ready_flags_gfx1250.wait_ready(ready_flags, rows, fx.Int32(tid), epoch)
+
+        if const_expr(late):
+            prologue()
+        if pair < PAIRS:
+            _front_tasks(
+                lds,
+                x,
+                (router_weight, latent_weight, shared_weight, shared_scale),
+                (router_logits, latent_fp4, latent_scales, shared_hidden),
+                pair,
+                tid,
+                lane,
+                wave,
+                rows,
+                tiles,
+                fp8_shared,
+                prologue=None if late else prologue,
+                x_cache_policy=CM_DEV,
+                wide=wide,
+                depth=depth,
+            )
+        ready_flags_gfx1250.done(ready_flags, fx.Int32(pair), fx.Int32(tid), epoch)
+        tdm_timeline.close_cta()
+
+    @flyc.jit
+    def launch(
+        x: Int64,
+        router_weight: Int64,
+        latent_weight: Int64,
+        shared_weight: Int64,
+        shared_scale: Int64,
+        router_logits: Int64,
+        latent_fp4: Int64,
+        latent_scales: Int64,
+        shared_hidden: Int64,
+        ready_flags: Int64,
+        stream: fx.Stream = fx.Stream(None),  # noqa: B008
+    ):
+        _ = sources, timeline
+        kernel(
+            x,
+            router_weight,
+            latent_weight,
+            shared_weight,
+            shared_scale,
+            router_logits,
+            latent_fp4,
+            latent_scales,
+            shared_hidden,
+            ready_flags,
+            value_attrs=gemv_tdm.CLUSTER_LAUNCH["value_attrs"],
+        ).launch(
+            grid=(PAIRS,),
+            block=(THREADS,),
+            stream=stream,
+            cluster=gemv_tdm.CLUSTER_LAUNCH["cluster"],
+        )
+
+    _WAITING_KERNEL_ABI.check(kernel, launch)
+    gemv_tdm.apply_preload(launch)
+    any_order_launch.install()
+    flags = any_order_launch.ready_flags("front")
+    launcher = _TailedLauncher(
+        launch, (flags.data_ptr(),), any_order=mode != "front-serial"
+    )
+    return K2ReplicatedFrontKernel(name, launcher, (PAIRS,), (THREADS,))
+
+
 class _TailedLauncher:
     """``launch`` with trailing arguments the caller does not pass (the split
     front's scratch, the BF16 latent's absent scale); its ``_mem_cache`` is
     ``launch``'s, for ``launcher_resources``."""
 
-    def __init__(self, launch, tail):
+    def __init__(self, launch, tail, any_order=False):
         self.launch = launch
         self.tail = tail
+        self.any_order = any_order
 
     def __call__(self, *args, **kwargs):
+        if self.any_order:
+            with any_order_launch.any_order():
+                return self.launch(*args, *self.tail, **kwargs)
         return self.launch(*args, *self.tail, **kwargs)
 
     @property
