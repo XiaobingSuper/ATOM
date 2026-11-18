@@ -195,6 +195,10 @@ def _gate_ilp() -> bool:
     return envs.ATOM_KIMI_MONO_K1_GATE_ILP
 
 
+def _late_publish() -> bool:
+    return envs.ATOM_KIMI_MONO_K1_LATE_PUBLISH
+
+
 def _auto_head_split(heads: int, blocks: int) -> int:
     """The most of 4, 2 CTAs a head whose parts all fit the grid at once."""
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
@@ -236,6 +240,7 @@ def build_resident_k1(
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
         envs.ATOM_KIMI_MONO_K1_WHOLE_HEADS,
+        _late_publish(),
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -309,6 +314,7 @@ def build_resident_k1(
         head_split,
         _gate_ilp(),
         *(("whole_heads",) if forced_heads else ()),
+        *(("late_publish",) if _late_publish() else ()),
     )
     timeline = tdm_timeline.key()
     name = (
@@ -322,6 +328,7 @@ def build_resident_k1(
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{'' if _gate_ilp() else '_nogi'}"
         f"{'_wh' if forced_heads else ''}"
+        f"{'_lp' if _late_publish() else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -897,7 +904,60 @@ def build_resident_k1(
                 if const_expr(gemv_tdm.late_scratch())
                 else projected
             )
-            for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+            if const_expr(_late_publish()):
+                # Every row sum read first, so the barrier that frees the
+                # accumulators' LDS for the recurrence is passed before the
+                # stores are issued and drains none of them.
+                pending = []
+                for task_offset in range_constexpr(PROJECTION_ROWS_PER_CTA):
+                    task = first_task + task_offset
+                    for tile in range_constexpr(len(tile_starts)):
+                        slot = (
+                            projection.acc.ptr
+                            + (task_offset * len(tile_starts) + tile) * slot_words
+                        )
+                        work_items = tile_rows[tile] * ROWS
+                        for iteration in range_constexpr(
+                            (work_items + declaration.threads - 1)
+                            // declaration.threads
+                        ):
+                            work = tid + declaration.threads * iteration
+                            item = fx.min(work, work_items - 1)
+                            local_token = item // ROWS
+                            row = item % ROWS
+                            if const_expr(split_stages):
+                                total = _split_sum(
+                                    projection.xl.ptr + split_out,
+                                    task_offset,
+                                    tile,
+                                    len(tile_starts),
+                                    row,
+                                    local_token,
+                                )
+                            else:
+                                total = compute["kda_gemv_row_sum"](
+                                    slot, row, local_token
+                                )
+                            value = fx.Float32(fx.Float32(total).to(fx.BFloat16))
+                            pending.append(
+                                (
+                                    (task < PROJECTION_TASKS) & (work < work_items),
+                                    (tile_starts[tile] + local_token) * NPROJ
+                                    + task * ROWS
+                                    + row,
+                                    value,
+                                )
+                            )
+                gpu.barrier()
+                for live, index, value in pending:
+                    if live:
+                        gfx_backend.mailbox_store_device(
+                            projected_out, index, value, projected_tag
+                        )
+                tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
+            for task_offset in range_constexpr(
+                0 if _late_publish() else PROJECTION_ROWS_PER_CTA
+            ):
                 task = first_task + task_offset
                 if task < PROJECTION_TASKS:
                     for tile in range_constexpr(len(tile_starts)):
@@ -936,10 +996,11 @@ def build_resident_k1(
                                     value,
                                     projected_tag,
                                 )
-            tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
-            gpu.barrier()
-            device["wait_vector_stores"]()
-            tdm_timeline.stamp(tdm_timeline.STORES_DONE)
+            if const_expr(not _late_publish()):
+                tdm_timeline.stamp(tdm_timeline.STORES_ISSUED)
+                gpu.barrier()
+                device["wait_vector_stores"]()
+                tdm_timeline.stamp(tdm_timeline.STORES_DONE)
 
         generation = collect_generation(smem.tls.ptr, generation)
         tdm_timeline.stamp(tdm_timeline.RECURRENCE)

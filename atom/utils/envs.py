@@ -745,6 +745,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "ATOM_KIMI_MONO_K1_WHOLE_HEADS", "0"
     )
     == "1",
+    # Kimi-K3 gfx1250 mono: a K1 projection CTA reads every row sum before
+    # the barrier that frees its accumulators, then issues the tagged stores,
+    # so that barrier drains none of them (the same bits). 0, the default,
+    # stores while summing and waits for the stores before the recurrence.
+    "ATOM_KIMI_MONO_K1_LATE_PUBLISH": lambda: os.getenv(
+        "ATOM_KIMI_MONO_K1_LATE_PUBLISH", "0"
+    )
+    == "1",
     # Kimi-K3 gfx1250 mono: the fused MoE's gate/up K tiles, its M tiles'
     # epilogues and down tiles, and its staging loops as runtime loops, so a
     # cold launch fetches one body's code each (the same bits); 0 unrolls them
