@@ -40,6 +40,15 @@ THREADS = 256
 WORDS = 4  # a thread's 16 B of a weight round
 STAMPS = 4  # low words of the 100 MHz clock: entry, flags seen, end; errors
 ENTRY, SEEN, END, ERRORS = range(STAMPS)
+# which producer waves poll the clock while busy: all, or wave 0 (the others
+# wait at a barrier); wave 0's s_sleep between polls
+BUSY_WAVES = os.environ.get("BUSY_WAVES", "all")
+BUSY_SLEEP = int(os.environ.get("BUSY_SLEEP", "1"))
+# which consumer waves poll the producer's flags (DEP=all): all, or wave 0
+POLL_WAVES = os.environ.get("POLL_WAVES", "all")
+# dynamic LDS a CTA of each kernel asks for (KB): enough of it keeps a
+# consumer CTA off a WGP until a producer CTA there exits
+LDS_KB = int(os.environ.get("LDS_KB", "0"))
 
 
 def tag(epoch, cta, word):
@@ -48,7 +57,8 @@ def tag(epoch, cta, word):
 
 def build(grid: int, dep: str, pro_rounds: int):
     @flyc.kernel(
-        name=f"k3_any_order_probe_producer_g{grid}", known_block_size=[THREADS, 1, 1]
+        name=f"k3_any_order_probe_producer_g{grid}_{BUSY_WAVES}_s{BUSY_SLEEP}",
+        known_block_size=[THREADS, 1, 1],
     )
     def producer(
         counter: Int64, flags: Int64, data: Int64, stamps: Int64,
@@ -60,10 +70,18 @@ def build(grid: int, dep: str, pro_rounds: int):
         epoch = fx.Int32(ld_dev(counter, bid)) + 1
         ticks = busy + (bid + tail_ctas >= grid).select(tail, fx.Int32(0))
         deadline = entry + fx.Int64(ticks)
-        now = _realtime()
-        while now < deadline:
-            rocdl.s_sleep(1)
+        if const_expr(BUSY_WAVES == "all"):
             now = _realtime()
+            while now < deadline:
+                rocdl.s_sleep(1)
+                now = _realtime()
+        else:
+            if tid < 32:
+                t = _realtime()
+                while t < deadline:
+                    rocdl.s_sleep(BUSY_SLEEP)
+                    t = _realtime()
+            gpu.barrier()
         st_dev(tag(epoch, bid, tid), data, bid * THREADS + tid)
         rocdl.s_wait_storecnt(0)
         gpu.barrier()
@@ -75,7 +93,7 @@ def build(grid: int, dep: str, pro_rounds: int):
             bo.buffer_store(fx.Int32(_realtime()), out, bid * STAMPS + END)
 
     @flyc.kernel(
-        name=f"k3_any_order_probe_consumer_g{grid}_{dep}_p{pro_rounds}",
+        name=f"k3_any_order_probe_consumer_g{grid}_{dep}_p{pro_rounds}_{POLL_WAVES}",
         known_block_size=[THREADS, 1, 1],
     )
     def consumer(
@@ -102,7 +120,15 @@ def build(grid: int, dep: str, pro_rounds: int):
             acc = (
                 acc ^ fx.Int32(v[0]) ^ fx.Int32(v[1]) ^ fx.Int32(v[2]) ^ fx.Int32(v[3])
             )
-        if const_expr(dep == "all"):
+        if const_expr(dep == "all" and POLL_WAVES == "wave0"):
+            if tid < 32:
+                for p0 in range_constexpr(0, grid, 32):
+                    if tid + p0 < grid:
+                        flag = fx.Int32(ld_dev(flags, tid + p0))
+                        while flag < epoch:
+                            spin_pause()
+                            flag = fx.Int32(ld_dev(flags, tid + p0))
+        elif const_expr(dep == "all"):
             if tid < grid:
                 flag = fx.Int32(ld_dev(flags, tid))
                 while flag < epoch:
@@ -143,7 +169,7 @@ def build(grid: int, dep: str, pro_rounds: int):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):  # fmt: skip
         producer(counter, flags, data, stamps, busy, tail, tail_ctas).launch(
-            grid=(grid,), block=(THREADS,), stream=stream
+            grid=(grid,), block=(THREADS,), smem=LDS_KB * 1024, stream=stream
         )
 
     @flyc.jit
@@ -152,7 +178,7 @@ def build(grid: int, dep: str, pro_rounds: int):
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):  # fmt: skip
         consumer(counter, flags, data, weights, stamps, sink).launch(
-            grid=(grid,), block=(THREADS,), stream=stream
+            grid=(grid,), block=(THREADS,), smem=LDS_KB * 1024, stream=stream
         )
 
     return launch_producer, launch_consumer
@@ -273,7 +299,7 @@ def main():
         print(json.dumps({
             "config": name, "grid": grid, "pairs": pairs, "dep": dep,
             "busy_us": busy / 100, "tail_us": tail / 100, "tail_ctas": tail_ctas,
-            "pro_kb": pro_rounds * WORDS * 4 * THREADS // 1024,
+            "lds_kb": LDS_KB, "pro_kb": pro_rounds * WORDS * 4 * THREADS // 1024,
             "pair_us_median": round(statistics.median(times[name]), 2),
             "gap_us_p50": round(statistics.median(gap), 3),
             "gap_us_min": round(min(gap), 3), "gap_us_max": round(max(gap), 3),
