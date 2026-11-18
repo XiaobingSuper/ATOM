@@ -8,8 +8,9 @@ completes: on gfx1250 ~1.5 us from a kernel's last CTA to the next one's first.
 A packet without the bit may start as soon as the one before it has
 dispatched. The one switch HIP has is ``hipExtAnyOrderLaunch`` in the flags of
 ``hipExtModuleLaunchKernel``; on a capturing stream the graph's kernel node
-keeps it (CLR ``GraphKernelNode::launchFlags_``) and the replayed packet keeps
-the clear bit. FlyDSL launches through ``mgpuLaunchKernel``
+keeps it (CLR ``GraphKernelNode::launchFlags_``, ROCm builds from 2026-07-29
+on; earlier ones drop it at capture) and the replayed packet keeps the clear
+bit. FlyDSL launches through ``mgpuLaunchKernel``
 (``libfly_jit_runtime``), a ``hipModuleLaunchKernel`` with no flags.
 ``install()`` registers a replacement ``mgpuLaunchKernel`` in every FlyDSL
 ``ExecutionEngine`` built after it: inside ``any_order()`` it launches with

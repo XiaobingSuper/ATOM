@@ -39,7 +39,9 @@
 //   DEP=none PRO_KB=0 BODY_KB=16 /tmp/aql_overlap_bench   # pure launch gap
 //   LDS_KB=160 /tmp/aql_overlap_bench                     # no co-residency
 //   TAIL_CTAS=8 TAIL_KB=256 /tmp/aql_overlap_bench        # straggler tail
-// Check the replayed packet headers (barrier=0 on the any-order nodes):
+// Check the replayed packet headers: barrier=0 on the any-order nodes (0xa02,
+// or 0xa00 as a gfx1250 ext packet; 0xb02 / 0xb00 with the bit set). A ROCm
+// build before 2026-07-29 (CLR #9421) drops the flag at capture:
 //   AMD_LOG_LEVEL=4 AMD_LOG_MASK=0x8 REPS=1 REPLAYS=1 /tmp/aql_overlap_bench \
 //     2>&1 | grep -m 40 "Dispatch Header"
 
