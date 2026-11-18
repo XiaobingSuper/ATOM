@@ -927,6 +927,7 @@ def build_moe(
     refill: bool | None = None,
     defer: bool | None = None,
     prefetch: int | None = None,
+    latent_first: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -965,7 +966,11 @@ def build_moe(
     ``prefetch`` (default ``ATOM_KIMI_MONO_FUSED_MOE_PREFETCH``), where a
     token's last K tiles are read from global memory: the first M tile's
     latent fragments of such a K tile are loaded an item ahead -- the first
-    of a task's before its global K tiles (1) or at its start (2)."""
+    of a task's before its global K tiles (1) or at its start (2).
+
+    ``latent_first`` (default ``ATOM_KIMI_MONO_FUSED_MOE_LATENT_FIRST``): the
+    latent's copy is issued before the union is built, as a fused launch's
+    is, so it lands under the union's build."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if refill is None:
@@ -978,6 +983,9 @@ def build_moe(
         raise ValueError("a deferred epilogue needs its flag published past K tile 0")
     if prefetch is None:
         prefetch = envs.ATOM_KIMI_MONO_FUSED_MOE_PREFETCH
+    if latent_first is None:
+        latent_first = envs.ATOM_KIMI_MONO_FUSED_MOE_LATENT_FIRST
+    latent_first = bool(latent_first)
     routes = rows * TOPK
     # Past 48 rows every token's latent and a ring of four do not fit: a
     # token's last K tiles are read from global memory (L2), the ring kept.
@@ -1018,6 +1026,7 @@ def build_moe(
         + ("_e" if refill else "")
         + ("_d" if defer else "")
         + (f"_pf{prefetch}" if prefetch else "")
+        + ("_lf" if latent_first else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1088,9 +1097,10 @@ def build_moe(
                     width=LATENT_SCALES // 2,
                 )
 
-        if const_expr(fused is not None):
+        if const_expr(fused is not None or latent_first):
             # The latent is the front's: in flight while the routes come in.
             issue_latent()
+        if const_expr(fused is not None):
             fused["wait_routes"]()
         union = uniform(
             _union(ids, rows, tid, lane, wave, lds, cache_modifier=_out_cm(fused))
@@ -1222,10 +1232,10 @@ def build_moe(
         # weights: a TDM counter drains in order, so the first item's wait
         # covers them. A CTA with no gate/up task (whose down tiles reuse
         # this LDS) loads none.
-        if const_expr(fused is None):
+        if const_expr(fused is None and not latent_first):  # noqa: SIM102
             if mine > 0:
                 issue_latent()
-        if const_expr(fused is not None):
+        if const_expr(fused is not None or latent_first):  # noqa: SIM102
             if mine == 0:
                 # Its down rows land where the latent does.
                 rocdl.s_wait_tensorcnt(0)

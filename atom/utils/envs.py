@@ -775,6 +775,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_FUSED_MOE_PREFETCH": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_PREFETCH", "0")
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE issues the latent's copy before it
+    # builds the expert union, so the copy lands under the build.
+    "ATOM_KIMI_MONO_FUSED_MOE_LATENT_FIRST": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_LATENT_FIRST", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
     # replicated finalize as one resident launch (k2_tail_gfx1250, the same
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
