@@ -1337,8 +1337,12 @@ def build_moe(
                 for m in range(tiles)
             ]
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
-            if const_expr(prefetch == 2):
-                g_next = global_fragments(tokens[0], fx.Int32(resident))
+            # A loop carries a name bound unconditionally before it.
+            g_next = (
+                global_fragments(tokens[0], fx.Int32(resident))
+                if prefetch == 2
+                else [fx.Vector.filled(8, 0, fx.Int32) for _ in range(STEPS)]
+            )
             if const_expr(rolled):
                 for k_tile in range(fx.Int32(0), fx.Int32(resident), unroll=1):
                     k_item = n * k_tiles + k_tile
@@ -1398,8 +1402,11 @@ def build_moe(
                                             + step
                                         ),
                                     )
-            if const_expr(prefetch == 1):
-                g_next = global_fragments(tokens[0], fx.Int32(resident))
+            g_next = (
+                global_fragments(tokens[0], fx.Int32(resident))
+                if prefetch == 1
+                else g_next
+            )
             if const_expr(rolled and resident < k_tiles):
                 for g_tile in range(
                     fx.Int32(resident), fx.Int32(k_tiles), unroll=1
