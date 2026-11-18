@@ -20,7 +20,7 @@ WIDTHS = range(1, tail.tail_max_rows() + 1)
 
 def test_tail_takes_a_share_a_cta_at_the_widths_of_the_seven_element_all_reduce():
     rows = tail.tail_line_rows()
-    assert rows == 42 and tail.tail_max_rows() == 64
+    assert rows == 42 and tail.tail_max_rows() >= 48
     assert tail.tail_rounds(rows) == 1 and tail.tail_rounds(rows + 1) == 2
     assert ar.allreduce7_lines(rows) <= ar.MAX_CTAS * ar.THREADS
     assert ar.allreduce7_lines(rows + 1) > ar.MAX_CTAS * ar.THREADS
@@ -87,7 +87,7 @@ def test_builder_refuses_widths_past_the_cap():
 
 def test_a_profile_tail_takes_a_share_a_cta():
     with pytest.raises(ValueError, match="share a CTA"):
-        tail.build_k2_tail(8, 64, 1e-5, profile=True)
+        tail.build_k2_tail(8, 43, 1e-5, profile=True)
 
 
 def test_flags_hold_a_word_a_cta_and_the_profile_stamps():

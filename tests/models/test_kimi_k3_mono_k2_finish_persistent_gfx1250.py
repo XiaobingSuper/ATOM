@@ -127,9 +127,12 @@ def test_herd_finalize_keeps_its_48_row_layout_and_grows_past_it():
 
     at48 = moe_gfx1250.herd_finalize_words(48)
     assert all(moe_gfx1250.herd_finalize_words(r)["slots"] == at48["slots"] for r in (1, 20, 48))
-    assert moe_gfx1250.herd_finalize_words(64)["slots"] == 64 * 16
+    from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
+
+    cap = GFX1250_MAX_TOKENS
+    assert moe_gfx1250.herd_finalize_words(cap)["slots"] == max(48, cap) * 16
     with pytest.raises(ValueError):
-        moe_gfx1250.herd_finalize_words(65)
+        moe_gfx1250.herd_finalize_words(cap + 1)
 
 
 @pytest.mark.parametrize("rows", _rows(48, 62, 63, 64))

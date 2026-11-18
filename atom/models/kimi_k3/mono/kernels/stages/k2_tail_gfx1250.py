@@ -39,7 +39,8 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
-from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, MAX_ROWS, TOPK
+from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
+from atom.models.kimi_k3.mono.kernels import token_tiling
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
@@ -129,7 +130,7 @@ def tail_line_rows() -> int:
 
 
 def tail_max_rows() -> int:
-    return MAX_ROWS
+    return token_tiling.GFX1250_MAX_TOKENS
 
 
 def tail_grid(rows: int) -> int:
