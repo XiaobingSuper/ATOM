@@ -693,6 +693,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_MOE_EARLY": lambda: (
         os.getenv("ATOM_KIMI_MONO_MOE_EARLY", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE's TDM ring stages (0: its default,
+    # build_moe(ring=...)).
+    "ATOM_KIMI_MONO_MOE_RING": lambda: int(os.getenv("ATOM_KIMI_MONO_MOE_RING", "0")),
+    # Kimi-K3 gfx1250 mono: 1: a fused MoE CTA runs its first gate/up task's
+    # first K tiles once the routes are counted, before the union scan and
+    # the down plan (implies ATOM_KIMI_MONO_MOE_EARLY; the same bits;
+    # build_moe(first_task=True)).
+    "ATOM_KIMI_MONO_MOE_FIRST_TASK": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MOE_FIRST_TASK", "0") == "1"
+    ),
+    # Kimi-K3 gfx1250 mono: the fused MoE's 16-row groups a gate/up task
+    # (0: its default; 8 or 4 split an expert's rows into shorter tasks, the
+    # same bits; build_moe(up_groups=...)).
+    "ATOM_KIMI_MONO_MOE_UP_GROUPS": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_MOE_UP_GROUPS", "0")
+    ),
     # Kimi-K3 gfx1250 mono: the lite finish routes a token by its whole CTA in
     # runtime loops (the same routes), reduces its shared down in one loop and
     # drops the gathered latent's dead unpack loops after a replicated front,

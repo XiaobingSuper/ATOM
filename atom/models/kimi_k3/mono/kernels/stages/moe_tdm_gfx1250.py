@@ -120,8 +120,9 @@ def _union(
     an expert's union index, ``expert[u]``, ``start[u]``/``count[u]`` its run
     in ``picks`` (token * TOPK + k). Returns the union size. ``mark(i)``
     (optional, profiling): called once the routes are counted (0) and once
-    the union is scanned (1). ``on_counted()`` (optional): called once
-    ``count[e]`` is in LDS, before the union is scanned."""
+    the union is scanned (1). ``on_counted(rank)`` (optional): called once
+    ``count[e]`` is in LDS, before the union is scanned, with each of the
+    thread's routes' (expert, rank among the expert's picks)."""
     routes = rows * TOPK
     count, slot, start = lds["count"], lds["slot"], lds["start"]
     # The routes' loads go out first, their latency under the zeroing.
@@ -155,7 +156,7 @@ def _union(
     if const_expr(mark is not None):
         mark(0)
     if const_expr(on_counted is not None):
-        on_counted()
+        on_counted(rank)
     per = (EXPERTS + threads - 1) // threads
     first = tid * per
     present, picks = fx.Int32(0), fx.Int32(0)
@@ -770,6 +771,11 @@ WEIGHT_ISSUER = WAVES - 2
 SCALE_ISSUER = WAVES - 1
 assert UP_WAVES * STEPS * 32 == DOWN_STEPS * 8 * 32 == SCALE_WORDS
 FLAG_WORDS = UP_BLOCKS
+# The gate/up groups a task may take (``build_moe(up_groups=...)``): whole
+# MXFP4 blocks (64 rows, 4 groups) each. An expert's flags are its tasks',
+# padded to a 16-byte load: the flags buffer holds the most a slot needs.
+UP_GROUP_CHOICES = (4, 8, 12)
+MAX_FLAG_WORDS = 12
 # What the fused MoE balances CTAs by: a down tile (48 KB) is 3 units, a
 # gate/up task (7 tiles' bytes) 15 -- measured, not its bytes' 21: counted at
 # its bytes, the CTAs with one fewer task took so many down tiles they ran
@@ -841,24 +847,44 @@ def _lds_barrier():
 
 
 @traced
-def _bounded_wait(flags, slot, tag, state, bid):
-    """Until expert ``slot``'s four gate/up flags carry ``tag``; past
-    ``POLL_LIMIT`` polls the wait records (CTA, slot, a flag) in ``state[3]``
-    and goes on."""
+def _bounded_wait(flags, slot, tag, state, bid, blocks=UP_BLOCKS, flag_words=FLAG_WORDS):
+    """Until expert ``slot``'s ``blocks`` gate/up flags (``flag_words`` a
+    slot) carry ``tag``; past ``POLL_LIMIT`` polls the wait records (CTA,
+    slot, a flag) in ``state[3]`` and goes on."""
+
+    def quad(q):
+        # (a slot's third quad past 8 words is the next slot's: in the buffer)
+        return fx.Vector(ld_dev(flags, slot * flag_words + q * 4, 4))
+
+    def pending(va, vb, vc):
+        words = [va[e] for e in range(4)] + [vb[e] for e in range(4)] + [vc[e] for e in range(4)]
+        out = words[0] != tag
+        for b in range_constexpr(1, blocks):
+            out = out | (words[b] != tag)
+        return out
+
     polls = fx.Int32(0)
-    v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
-    while ((v[0] != tag) | (v[1] != tag) | (v[2] != tag) | (v[3] != tag)) & (
-        polls < POLL_LIMIT
-    ):
-        rocdl.s_sleep(1)
-        polls = polls + 1
+    if const_expr(blocks == 4 and flag_words == 4):
         v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
+        while ((v[0] != tag) | (v[1] != tag) | (v[2] != tag) | (v[3] != tag)) & (
+            polls < POLL_LIMIT
+        ):
+            rocdl.s_sleep(1)
+            polls = polls + 1
+            v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
+    else:
+        va, vb, vc = quad(0), quad(1), quad(2)
+        while pending(va, vb, vc) & (polls < POLL_LIMIT):
+            rocdl.s_sleep(1)
+            polls = polls + 1
+            va, vb, vc = quad(0), quad(1), quad(2)
+        v = va
     if polls >= POLL_LIMIT:
         record = (bid << 20) | (slot << 8) | (fx.Int32(v[0]) & 0xFF) | (1 << 30)
         st_dev(record, state, 3)
 
 
-def _down_share(union, bid, ups, up_units=UP_UNITS):
+def _down_share(union, bid, ups, up_units=UP_UNITS, blocks=UP_BLOCKS):
     """CTA ``bid``'s down tiles (slot-major, ``DOWN_TILES`` an expert): a run
     of the early experts' and then one of the late experts' -- those whose
     gate/up is the last round's, by CTAs that run one more task -- as (first
@@ -868,12 +894,17 @@ def _down_share(union, bid, ups, up_units=UP_UNITS):
     end of its run, so a late expert's down runs on several CTAs once its
     flags are up, not on the one or two whose run it fell in. The early runs
     keep every CTA's weight bytes about even: those with one more gate/up task
-    take fewer, and the CTAs with fewer start first, on the lowest slots."""
-    tasks = union * UP_BLOCKS
+    take fewer, and the CTAs with fewer start first, on the lowest slots.
+    ``blocks`` (an expert's gate/up tasks) not dividing 256: the expert a
+    round boundary splits is late."""
+    tasks = union * blocks
     rest = tasks % 256
     tiles = union * DOWN_TILES
     late_round = (rest > 0).select(ups, fx.max(ups - 1, 0))
-    late_slot = late_round * (256 // UP_BLOCKS)
+    if const_expr(256 % blocks == 0):
+        late_slot = late_round * (256 // blocks)
+    else:
+        late_slot = late_round * 256 // blocks
     early_tiles = late_slot * DOWN_TILES
     late_tiles = tiles - early_tiles
     total = tasks * up_units + early_tiles * DOWN_UNITS
@@ -904,6 +935,9 @@ def build_moe(
     up_units: int = UP_UNITS,
     rolled: bool | None = None,
     early: bool | None = None,
+    ring: int | None = None,
+    up_groups: int | None = None,
+    first_task: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -933,18 +967,51 @@ def build_moe(
     ``early`` (default ``ATOM_KIMI_MONO_MOE_EARLY``): the latent's copy goes
     out at the launch's start and a CTA's first gate/up task's first copies
     as soon as the routes are counted, before the union is scanned, its
-    picks placed and the down tiles planned (the same bits)."""
+    picks placed and the down tiles planned (the same bits).
+
+    ``ring`` (default ``ATOM_KIMI_MONO_MOE_RING``, else ``RING``): the TDM
+    ring's stages, ``ring - 1`` items in flight. ``up_groups`` (default
+    ``ATOM_KIMI_MONO_MOE_UP_GROUPS``, else ``UP_GROUPS``): a gate/up task's
+    16-row groups, of ``UP_GROUP_CHOICES``: shorter tasks, more an expert
+    (each with its flag), each row's K sums as before (the same bits).
+    ``up_units`` left at ``UP_UNITS`` scales with the task.
+
+    ``first_task`` (default ``ATOM_KIMI_MONO_MOE_FIRST_TASK``; implies
+    ``early``, rolled only): a CTA runs its first gate/up task's first K
+    tiles once the routes are counted, from its own expert and picks, and
+    scans the union and plans the down tiles after them (the same bits)."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if early is None:
         early = envs.ATOM_KIMI_MONO_MOE_EARLY
+    if first_task is None:
+        first_task = envs.ATOM_KIMI_MONO_MOE_FIRST_TASK
+    if first_task and not rolled:
+        raise ValueError("the fused MoE's first task ahead of its plan is rolled only")
+    if ring is None:
+        ring = envs.ATOM_KIMI_MONO_MOE_RING or RING
+    if up_groups is None:
+        up_groups = envs.ATOM_KIMI_MONO_MOE_UP_GROUPS or UP_GROUPS
+    if ring < 2:
+        raise ValueError(f"the fused MoE's ring needs two stages (got {ring})")
+    if up_groups not in UP_GROUP_CHOICES:
+        raise ValueError(f"a gate/up task's groups are one of {UP_GROUP_CHOICES} (got {up_groups})")
+    if up_groups != UP_GROUPS and up_units == UP_UNITS:
+        up_units = (UP_UNITS * up_groups + UP_GROUPS // 2) // UP_GROUPS
+    up_rows = up_groups * 16
+    blocks = 2 * 384 // up_rows
+    up_waves = up_rows // 32
+    up_pairs = up_rows // 64
+    flag_words = (blocks + 3) // 4 * 4
+    assert flag_words <= MAX_FLAG_WORDS
     # (the body's ``early`` counts its early down tiles)
-    early_copies = early
+    early_copies = early or first_task
+    first_task_ahead = first_task
     routes = rows * TOPK
     lds_bytes = 4 * (
-        RING * (SLOT_BYTES // 4 + SCALE_WORDS)
+        ring * (SLOT_BYTES // 4 + SCALE_WORDS)
         + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
-        + UP_WAVES * GFX1250.wave_size * 8
+        + up_waves * GFX1250.wave_size * 8
         + 2 * EXPERTS
         + 4 * routes
         + WAVES
@@ -952,9 +1019,10 @@ def build_moe(
     if rows < 1 or lds_bytes > GFX1250.max_workgroup_lds_bytes:
         raise ValueError(f"the fused MoE's {rows}-row LDS ({lds_bytes} B) does not fit")
     tiles = (rows + 15) // 16
-    blocks = UP_BLOCKS
     k_tiles = LATENT // K_TILE
-    ring = RING
+    ahead_k_tiles = k_tiles - (ring - 1)
+    if ring > k_tiles:
+        raise ValueError(f"the fused MoE's ring ({ring}) is past a task's {k_tiles} K tiles")
     ring_words = ring * SLOT_BYTES // 4
 
     @fx.struct
@@ -963,7 +1031,7 @@ def build_moe(
         item_scales: fx.Array[fx.Int32, ring * SCALE_WORDS, 16]
         latq: fx.Array[fx.Int32, rows * LATENT_TDM_WORDS, 16]
         latsc: fx.Array[fx.Int32, rows * LATENT_SCALES // 4, 16]
-        red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 8, 16]
+        red: fx.Array[fx.Float32, up_waves * GFX1250.wave_size * 8, 16]
         count: fx.Array[fx.Int32, EXPERTS, 16]
         slot: fx.Array[fx.Int32, EXPERTS, 16]
         expert: fx.Array[fx.Int32, routes, 16]
@@ -976,6 +1044,9 @@ def build_moe(
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + ("_rl" if rolled else "")
         + ("_ea" if early_copies else "")
+        + ("_ft" if first_task_ahead else "")
+        + (f"_r{ring}" if ring != RING else "")
+        + (f"_g{up_groups}" if up_groups != UP_GROUPS else "")
         + ("_profile" if profile else "")
     )
     sources = SOURCES
@@ -1052,7 +1123,7 @@ def build_moe(
         def issue_up(buffer, scale_buffer, expert, task, tile):
             """``issue``'s gate/up copies of task ``task`` (of ``expert``), K
             tile ``tile``, for ``first_copies``."""
-            group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
+            group0 = expert * (2 * 384 // 16) + task % blocks * up_groups
             if wave == WEIGHT_ISSUER:
                 gemv_tdm.load_rows(
                     w13
@@ -1060,8 +1131,8 @@ def build_moe(
                     + fx.Int64(tile * GROUP_TILE_BYTES),
                     LATENT * 4,
                     buffer,
-                    UP_GROUPS,
-                    UP_GROUPS,
+                    up_groups,
+                    up_groups,
                     padded=False,
                     cache_policy=1,
                     whole=True,
@@ -1069,59 +1140,151 @@ def build_moe(
                 )
             # n32k4: (expert, 32-row group, K step, row) words; a task's
             # row groups are 28 K steps (3584 bytes) apart.
-            row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
+            row_group0 = expert * (2 * 384 // 32) + task % blocks * up_waves
             if wave == SCALE_ISSUER:
                 gemv_tdm.load_rows(
                     w13s
                     + fx.Int64(row_group0 * (LATENT // 128) + tile * STEPS) * 128,
                     LATENT // 128 * 64,
                     scale_buffer,
-                    UP_WAVES,
-                    UP_WAVES,
+                    up_waves,
+                    up_waves,
                     padded=False,
                     cache_policy=1,
                     whole=True,
                     width=STEPS * 64,
                 )
 
-        def first_copies():
-            """``early_copies``: the CTA's first task's first ``ring - 1`` K
-            tiles, by its issuers once the routes are counted: its expert is
-            the union's ``bid // blocks``-th, found by each issuer wave from
-            ``count`` on its own (``per`` experts a lane, a scan over lanes)."""
-            if (wave == WEIGHT_ISSUER) | (wave == SCALE_ISSUER):
-                nth = bid // blocks
-                per = EXPERTS // GFX1250.wave_size
-                routed = [
-                    fx.ptr_load(lds["count"] + lane * per + index) > 0 for index in range(per)
-                ]
-                present = fx.Int32(0)
-                for index in range_constexpr(per):
-                    present = present + routed[index].select(fx.Int32(1), fx.Int32(0))
-                after = _wave_inclusive_scan32(present, lane)
-                before = after - present
-                holder = _ballot32((before <= nth) & (nth < after))
-                seen, found = before, fx.Int32(0)
-                for index in range_constexpr(per):
-                    found = (routed[index] & (seen == nth)).select(lane * per + index, found)
-                    seen = seen + routed[index].select(fx.Int32(1), fx.Int32(0))
-                expert0 = (holder != 0).select(
-                    readlane(found, _popcount32(holder - fx.Uint32(1))), fx.Int32(-1)
+        def expert_of_first_task():
+            """The CTA's first task's expert, the union's ``bid // blocks``-th
+            (-1: none), found by a wave from ``count`` on its own (``per``
+            experts a lane, a scan over lanes)."""
+            nth = bid // blocks
+            per = EXPERTS // GFX1250.wave_size
+            routed = [
+                fx.ptr_load(lds["count"] + lane * per + index) > 0 for index in range(per)
+            ]
+            present = fx.Int32(0)
+            for index in range_constexpr(per):
+                present = present + routed[index].select(fx.Int32(1), fx.Int32(0))
+            after = _wave_inclusive_scan32(present, lane)
+            before = after - present
+            holder = _ballot32((before <= nth) & (nth < after))
+            seen, found = before, fx.Int32(0)
+            for index in range_constexpr(per):
+                found = (routed[index] & (seen == nth)).select(lane * per + index, found)
+                seen = seen + routed[index].select(fx.Int32(1), fx.Int32(0))
+            return (holder != 0).select(
+                readlane(found, _popcount32(holder - fx.Uint32(1))), fx.Int32(-1)
+            )
+
+        def copies_of_first_task(expert0):
+            for ahead in range_constexpr(ring - 1):
+                issue_up(
+                    smem.stages.ptr + ahead * (SLOT_BYTES // 4),
+                    smem.item_scales.ptr + ahead * SCALE_WORDS,
+                    expert0,
+                    bid,
+                    ahead,
                 )
+            if const_expr(profile):  # noqa: SIM102
+                if tid == WEIGHT_ISSUER * GFX1250.wave_size:
+                    st_dev(
+                        fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid
+                    )
+
+        def first_copies(rank):
+            """``early_copies``: the CTA's first task's first ``ring - 1`` K
+            tiles, by its issuers once the routes are counted."""
+            if (wave == WEIGHT_ISSUER) | (wave == SCALE_ISSUER):
+                expert0 = expert_of_first_task()
                 if expert0 >= 0:
-                    for ahead in range_constexpr(ring - 1):
-                        issue_up(
-                            smem.stages.ptr + ahead * (SLOT_BYTES // 4),
-                            smem.item_scales.ptr + ahead * SCALE_WORDS,
-                            expert0,
-                            bid,
-                            ahead,
-                        )
-                    if const_expr(profile):  # noqa: SIM102
-                        if tid == WEIGHT_ISSUER * GFX1250.wave_size:
-                            st_dev(
-                                fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid
+                    copies_of_first_task(expert0)
+
+        def up_tile(k_item, k_tile, tokens, count, accumulators):
+            """A gate/up task's K tile ``k_tile`` (ring item ``k_item``) into
+            its waves' ``accumulators`` (rolled)."""
+            k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
+            if wave < up_waves:
+                k_scale = (
+                    smem.item_scales.ptr
+                    + (k_item % ring) * SCALE_WORDS
+                    + wave * STEPS * 32
+                    + lane
+                )
+                k_weights = [
+                    _weight_operand(k_stage, wave, lane, step)
+                    for step in range(STEPS)
+                ]
+                k_weight_scales = [
+                    fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
+                ]
+                # A K tile's STEPS * 16 words hold one pad dword.
+                k_latq = lds["latq"] + k_tile
+                for m in range_constexpr(tiles):
+                    if m == 0 or m * 16 < count:
+                        for step in range_constexpr(STEPS):
+                            accumulators[m] = _wmma(
+                                k_weights[step],
+                                _activation_fragment(
+                                    k_latq,
+                                    LATENT_TDM_WORDS,
+                                    tokens[m],
+                                    k_tile * STEPS + step,
+                                    lane,
+                                ),
+                                accumulators[m],
+                                k_weight_scales[step],
+                                fx.ptr_load(
+                                    lds["latsc"]
+                                    + tokens[m] * (LATENT_SCALES // 4)
+                                    + k_tile * STEPS
+                                    + step
+                                ),
                             )
+            return accumulators
+
+        # ``first_task``: what the CTA's first task ran before the plan.
+        ahead_of_plan = {}
+
+        def first_task(rank):
+            """``first_task``: once the routes are counted, every wave finds
+            the CTA's first task's expert, its issuers send the task's first
+            ``ring - 1`` K tiles, its picks (in the union's order: by their
+            count ranks) go where the union's picks will, and the task's
+            first ``ahead_k_tiles`` K tiles run -- the rest of its tiles
+            issued as they go -- all before the union is scanned and the
+            down tiles planned. Its accumulators carry on into the task."""
+            expert0 = uniform(expert_of_first_task())
+            if ((wave == WEIGHT_ISSUER) | (wave == SCALE_ISSUER)) & (expert0 >= 0):
+                copies_of_first_task(expert0)
+            count0 = uniform(fx.ptr_load(lds["count"] + fx.max(expert0, 0)))
+            for index in range_constexpr(len(rank)):
+                at = tid + index * THREADS
+                expert, taken = rank[index]
+                if (at < routes) & (expert == expert0):
+                    fx.ptr_store(fx.Int32(at), lds["picks"] + taken)
+            _lds_barrier()
+            tokens0 = [
+                fx.ptr_load(lds["picks"] + fx.min(m * 16 + lane % 16, fx.max(count0 - 1, 0)))
+                // TOPK
+                for m in range(tiles)
+            ]
+            accumulators0 = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
+            if expert0 >= 0:
+                for k_tile in range(fx.Int32(0), fx.Int32(ahead_k_tiles), unroll=1):
+                    rocdl.s_wait_tensorcnt(ring - 2)
+                    _lds_barrier()
+                    ahead = k_tile + ring - 1
+                    issue_up(
+                        smem.stages.ptr + (ahead % ring) * (SLOT_BYTES // 4),
+                        smem.item_scales.ptr + (ahead % ring) * SCALE_WORDS,
+                        expert0,
+                        bid,
+                        ahead,
+                    )
+                    accumulators0 = up_tile(k_tile, k_tile, tokens0, count0, accumulators0)
+            ahead_of_plan["accumulators"] = accumulators0
 
         if const_expr(fused is not None):
             if const_expr(early_copies):
@@ -1137,13 +1300,15 @@ def build_moe(
             _union(
                 ids, rows, tid, lane, wave, lds, cache_modifier=_out_cm(fused),
                 mark=mark if profile else None,
-                on_counted=first_copies if early_copies else None,
+                on_counted=(first_task if first_task_ahead else first_copies)
+                if early_copies
+                else None,
             )
         )
         tasks = union * blocks
         ups = tasks // 256
         mine = (tasks - bid + 255) // 256
-        first_down, early, first_late, late = _down_share(union, bid, ups, up_units)
+        first_down, early, first_late, late = _down_share(union, bid, ups, up_units, blocks)
         downs = early + late
         up_items = mine * k_tiles
         flat = up_items + downs
@@ -1178,8 +1343,12 @@ def build_moe(
             if item < up_items:
                 n = item // k_tiles
                 task = bid + n * 256
-                expert = readlane(experts, n)
-                group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
+                if const_expr(blocks == UP_BLOCKS):
+                    expert = readlane(experts, n)
+                else:
+                    # (more than 8 tasks a CTA at this split)
+                    expert = uniform(fx.ptr_load(lds["expert"] + task // blocks))
+                group0 = expert * (2 * 384 // 16) + task % blocks * up_groups
                 if wave == WEIGHT_ISSUER:
                     gemv_tdm.load_rows(
                         w13
@@ -1187,8 +1356,8 @@ def build_moe(
                         + fx.Int64(item % k_tiles * GROUP_TILE_BYTES),
                         LATENT * 4,
                         buffer,
-                        UP_GROUPS,
-                        UP_GROUPS,
+                        up_groups,
+                        up_groups,
                         padded=False,
                         cache_policy=1,
                         whole=True,
@@ -1196,7 +1365,7 @@ def build_moe(
                     )
                 # n32k4: (expert, 32-row group, K step, row) words; a task's
                 # row groups are 28 K steps (3584 bytes) apart.
-                row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
+                row_group0 = expert * (2 * 384 // 32) + task % blocks * up_waves
                 if wave == SCALE_ISSUER:
                     gemv_tdm.load_rows(
                         w13s
@@ -1206,8 +1375,8 @@ def build_moe(
                         * 128,
                         LATENT // 128 * 64,
                         scale_buffer,
-                        UP_WAVES,
-                        UP_WAVES,
+                        up_waves,
+                        up_waves,
                         padded=False,
                         cache_policy=1,
                         whole=True,
@@ -1318,8 +1487,19 @@ def build_moe(
                 for m in range(tiles)
             ]
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
+            k_first = fx.Int32(0)
+            if const_expr(first_task_ahead):
+                carried = ahead_of_plan["accumulators"]
+                accumulators = [
+                    fx.Vector.from_elements(
+                        [(n == 0).select(carried[m][e], fx.Float32(0.0)) for e in range(16)],
+                        fx.Float32,
+                    )
+                    for m in range(tiles)
+                ]
+                k_first = (n == 0).select(fx.Int32(ahead_k_tiles), fx.Int32(0))
             if const_expr(rolled):
-                for k_tile in range(fx.Int32(0), fx.Int32(k_tiles), unroll=1):
+                for k_tile in range(k_first, fx.Int32(k_tiles), unroll=1):
                     k_item = n * k_tiles + k_tile
                     k_before = clock()
                     wait_for(k_item)
@@ -1331,44 +1511,7 @@ def build_moe(
                         publish(pending)
                     if k_item + ring - 1 < flat:
                         issue(k_item + ring - 1, (k_item + ring - 1) % ring)
-                    k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
-                    if wave < UP_WAVES:
-                        k_scale = (
-                            smem.item_scales.ptr
-                            + (k_item % ring) * SCALE_WORDS
-                            + wave * STEPS * 32
-                            + lane
-                        )
-                        k_weights = [
-                            _weight_operand(k_stage, wave, lane, step)
-                            for step in range(STEPS)
-                        ]
-                        k_weight_scales = [
-                            fx.ptr_load(k_scale + step * 32) for step in range(STEPS)
-                        ]
-                        # A K tile's STEPS * 16 words hold one pad dword.
-                        k_latq = lds["latq"] + k_tile
-                        for m in range_constexpr(tiles):
-                            if m == 0 or m * 16 < count:
-                                for step in range_constexpr(STEPS):
-                                    accumulators[m] = _wmma(
-                                        k_weights[step],
-                                        _activation_fragment(
-                                            k_latq,
-                                            LATENT_TDM_WORDS,
-                                            tokens[m],
-                                            k_tile * STEPS + step,
-                                            lane,
-                                        ),
-                                        accumulators[m],
-                                        k_weight_scales[step],
-                                        fx.ptr_load(
-                                            lds["latsc"]
-                                            + tokens[m] * (LATENT_SCALES // 4)
-                                            + k_tile * STEPS
-                                            + step
-                                        ),
-                                    )
+                    accumulators = up_tile(k_item, k_tile, tokens, count, accumulators)
             for tile_k in range_constexpr(0 if rolled else k_tiles):
                 item = n * k_tiles + tile_k
                 before = clock()
@@ -1386,7 +1529,7 @@ def build_moe(
                 # One branch a wave (6 and 7 hold no rows), then every K step's
                 # weights and scales loaded ahead of the first tile's WMMA chain:
                 # a tile's own branch held the loads behind each WMMA.
-                if wave < UP_WAVES:
+                if wave < up_waves:
                     item_scale = (
                         smem.item_scales.ptr
                         + (item % ring) * SCALE_WORDS
@@ -1425,7 +1568,7 @@ def build_moe(
             if const_expr(rolled):
                 up_tiles = fx.min((count + 15) // 16, tiles)
                 for up_m in range(fx.Int32(0), up_tiles, unroll=1):
-                    if wave < UP_WAVES:
+                    if wave < up_waves:
                         chosen = [accumulators[0][e] for e in range(16)]
                         for other in range_constexpr(1, tiles):
                             chosen = [
@@ -1439,7 +1582,7 @@ def build_moe(
                             lds["red"] + (wave * GFX1250.wave_size + lane) * 8,
                         )
                     _lds_barrier()
-                    if wave < UP_ROWS // 64:
+                    if wave < up_pairs:
                         _epilogue(
                             lds,
                             inter,
@@ -1451,20 +1594,20 @@ def build_moe(
                             up_m,
                             lane,
                             in_row=True,
-                            pairs=UP_ROWS // 64,
+                            pairs=up_pairs,
                             activated=True,
                         )
                     _lds_barrier()
             for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
                     # Each wave its own SiTU: 6 waves' share, not 3's.
-                    if wave < UP_WAVES:
+                    if wave < up_waves:
                         fx.ptr_store(
                             fx.Vector.from_elements(_situ(accumulators[m]), fx.Float32),
                             lds["red"] + (wave * GFX1250.wave_size + lane) * 8,
                         )
                     _lds_barrier()
-                    if wave < UP_ROWS // 64:
+                    if wave < up_pairs:
                         _epilogue(
                             lds,
                             inter,
@@ -1476,12 +1619,12 @@ def build_moe(
                             m,
                             lane,
                             in_row=True,
-                            pairs=UP_ROWS // 64,
+                            pairs=up_pairs,
                             activated=True,
                         )
                     _lds_barrier()
             up_epilogue = up_epilogue + since(before)
-            pending = slot * FLAG_WORDS + block
+            pending = slot * flag_words + block
             n = n + 1
         rocdl.s_wait_storecnt(0)
         _lds_barrier()
@@ -1511,7 +1654,7 @@ def build_moe(
                 )
                 before = fx.Int32(_realtime()) if profile else fx.Int32(0)
                 if tid == 0:
-                    _bounded_wait(flags, slot, tag, state, bid)
+                    _bounded_wait(flags, slot, tag, state, bid, blocks, flag_words)
                 _lds_barrier()
                 if const_expr(profile):
                     waited = waited + (fx.Int32(_realtime()) - before)

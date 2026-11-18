@@ -171,3 +171,62 @@ def test_the_early_moe_switch_defaults_off(monkeypatch):
     assert envs.ATOM_KIMI_MONO_MOE_EARLY is False
     monkeypatch.setenv("ATOM_KIMI_MONO_MOE_EARLY", "1")
     assert envs.ATOM_KIMI_MONO_MOE_EARLY is True
+
+
+@pytest.mark.parametrize("rows", (10, 40))
+def test_a_first_task_ahead_of_the_plan_is_an_early_build_of_its_own(rows):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    base = build_moe(rows, rolled=True)
+    ahead = build_moe(rows, rolled=True, first_task=True)
+    assert ahead.name == base.name + "_ea_ft"
+    assert ahead.grid == base.grid
+    with pytest.raises(ValueError, match="rolled only"):
+        build_moe(rows, rolled=False, first_task=True)
+
+
+@pytest.mark.parametrize("up_groups", (4, 8))
+def test_shorter_gate_up_tasks_are_builds_of_their_own(up_groups):
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    kernel = mt.build_moe(20, rolled=True, up_groups=up_groups)
+    units = (mt.UP_UNITS * up_groups + mt.UP_GROUPS // 2) // mt.UP_GROUPS
+    assert kernel.name == f"k3_gfx1250_moe_s20_p1_u{units}_rl_g{up_groups}"
+    with pytest.raises(ValueError, match="groups are one of"):
+        mt.build_moe(20, up_groups=6)
+
+
+def test_every_gate_up_split_fits_the_flags_buffer():
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    for up_groups in mt.UP_GROUP_CHOICES:
+        blocks = 2 * 384 // (up_groups * 16)
+        assert blocks * up_groups * 16 == 2 * 384 and up_groups % 4 == 0
+        # padded to a 16-byte load, the wait's three quads past the slot in the buffer
+        assert (blocks + 3) // 4 * 4 <= mt.MAX_FLAG_WORDS
+    assert mt.FLAG_WORDS == mt.UP_BLOCKS == 4
+
+
+def test_a_deeper_ring_is_a_build_of_its_own_where_it_fits():
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    assert mt.build_moe(20, rolled=True, ring=5).name.endswith("_rl_r5")
+    assert mt.build_moe(20, rolled=True, ring=mt.RING).name == mt.build_moe(20, rolled=True).name
+    with pytest.raises(ValueError, match="does not fit"):
+        mt.build_moe(40, ring=5)
+    with pytest.raises(ValueError, match="two stages"):
+        mt.build_moe(20, ring=1)
+
+
+def test_the_moe_shape_switches_default_off(monkeypatch):
+    from atom.utils import envs
+
+    for name in ("ATOM_KIMI_MONO_MOE_RING", "ATOM_KIMI_MONO_MOE_UP_GROUPS", "ATOM_KIMI_MONO_MOE_FIRST_TASK"):
+        monkeypatch.delenv(name, raising=False)
+    assert envs.ATOM_KIMI_MONO_MOE_RING == 0
+    assert envs.ATOM_KIMI_MONO_MOE_UP_GROUPS == 0
+    assert envs.ATOM_KIMI_MONO_MOE_FIRST_TASK is False
+    monkeypatch.setenv("ATOM_KIMI_MONO_MOE_UP_GROUPS", "8")
+    monkeypatch.setenv("ATOM_KIMI_MONO_MOE_FIRST_TASK", "1")
+    assert envs.ATOM_KIMI_MONO_MOE_UP_GROUPS == 8
+    assert envs.ATOM_KIMI_MONO_MOE_FIRST_TASK is True

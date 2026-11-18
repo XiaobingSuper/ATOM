@@ -105,8 +105,8 @@ from atom.models.kimi_k3.mono.kernels.stages.k2_tail_gfx1250 import (
     tail_max_rows,
 )
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
-    FLAG_WORDS,
     INTER_ROW_WORDS,
+    MAX_FLAG_WORDS,
     MOE_STATE_WORDS,
     build_moe,
 )
@@ -829,7 +829,7 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
         if "fused_moe_sync" not in self.__dict__:
             self.fused_moe_sync = (
                 torch.zeros(
-                    GFX1250_MAX_TOKENS * TOPK * FLAG_WORDS,
+                    GFX1250_MAX_TOKENS * TOPK * MAX_FLAG_WORDS,
                     dtype=torch.int32,
                     device=self.device,
                 ),
