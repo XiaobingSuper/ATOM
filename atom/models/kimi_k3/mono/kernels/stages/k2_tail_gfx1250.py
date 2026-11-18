@@ -161,6 +161,9 @@ class TailLayout:
     words: int
     depth: int
     tokens: int
+    # the sums over the token slabs instead (no weight stage holds them, past
+    # 64 rows), stored once every wave is past its last read of those
+    red_on_tokens: bool = False
 
 
 def tail_layout(
@@ -189,6 +192,13 @@ def tail_layout(
             if words <= limit:
                 red = gemv + x_words + start * stage_words
                 return TailLayout(gemv, red, words, d, b)
+    d = TAIL_DEPTH if depth is None else depth
+    for b in [tokens] if tokens is not None else range(SLABS, 1, -1):
+        x_words = b * token_words
+        gemv = -(-max(0, AR_WORDS - x_words) // 64) * 64
+        words = gemv + x_words + (d + 1) * stage_words
+        if words <= limit and red_words <= x_words:
+            return TailLayout(gemv, gemv, words, d, b, red_on_tokens=True)
     raise ValueError(f"the K2 tail's LDS does not fit at {rows} rows")
 
 
@@ -738,6 +748,8 @@ def build_k2_tail(
         )
         if const_expr(profile):
             _stamp(flags, bid, tid, 3)
+        if const_expr(layout.red_on_tokens):
+            gpu.barrier()
         red = floats + layout.red
         for tile in range_constexpr(tiles):
             for index in range_constexpr(2):
