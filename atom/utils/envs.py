@@ -699,7 +699,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # launches that AttnRes from build_attn_res(publish=True)); for
     # diagnosis, "front-serial" (the same flags, the front in order) and
     # "front-late" (any-order, but the front waits before its first weight
-    # copies). Empty, the default: every launch in order.
+    # copies). Empty, the default: every launch in order. "front" measures
+    # 1.0-1.6 us per layer slower than the default (S20/S40): the device-scope
+    # publish and x reads cost more than the launch gap it hides.
     "ATOM_KIMI_MONO_ANY_ORDER": lambda: frozenset(
         site
         for site in os.getenv("ATOM_KIMI_MONO_ANY_ORDER", "").split(",")
