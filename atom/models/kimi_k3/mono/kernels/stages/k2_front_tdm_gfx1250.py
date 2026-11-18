@@ -318,33 +318,36 @@ def _front_epilogue(
                     rsrc(shared_hidden),
                     (token * SHARED_COLUMNS + shared_column0) // 2 + column_pair,
                 )
-    if latent & (tid < rows * 4):
-        token = tid // 4
-        packed_word = tid % 4
-        words = [
-            fx.ptr_load(lds.group.ptr + token * 16 + packed_word * 4 + index)
-            for index in range_constexpr(4)
-        ]
-        maximum_bits = fx.Int32(0)
-        for word in words:
-            maximum_bits = fx.max(maximum_bits, word & 0x7FFF)
-            maximum_bits = fx.max(maximum_bits, (word >> 16) & 0x7FFF)
-        maximum = (maximum_bits << 16).bitcast(fx.Float32)
-        maximum = butterfly(maximum, (2, 1), fx.max, architecture=GFX1250)
-        code = moe_gfx1250._e8m0_roundup(maximum)
-        reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
-        group = row0 // 32
-        bo.buffer_store(
-            moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
-            rsrc(latent_fp4),
-            token * (LATENT // 8) + group * 4 + packed_word,
-        )
-        if packed_word == 0:
+    # a token's four packed words a thread each: 64 tokens a round
+    for latent_round in range_constexpr(-(-rows * 4 // THREADS)):
+        work = tid if latent_round == 0 else tid + THREADS * latent_round
+        if latent & (work < rows * 4):
+            token = work // 4
+            packed_word = work % 4
+            words = [
+                fx.ptr_load(lds.group.ptr + token * 16 + packed_word * 4 + index)
+                for index in range_constexpr(4)
+            ]
+            maximum_bits = fx.Int32(0)
+            for word in words:
+                maximum_bits = fx.max(maximum_bits, word & 0x7FFF)
+                maximum_bits = fx.max(maximum_bits, (word >> 16) & 0x7FFF)
+            maximum = (maximum_bits << 16).bitcast(fx.Float32)
+            maximum = butterfly(maximum, (2, 1), fx.max, architecture=GFX1250)
+            code = moe_gfx1250._e8m0_roundup(maximum)
+            reciprocal_scale = ((fx.Int32(254) - code) << 23).bitcast(fx.Float32)
+            group = row0 // 32
             bo.buffer_store(
-                fx.Int8(code),
-                rsrc(latent_scales),
-                token * (LATENT // 32) + group,
+                moe_gfx1250._pack_bf16_words(words, reciprocal_scale),
+                rsrc(latent_fp4),
+                token * (LATENT // 8) + group * 4 + packed_word,
             )
+            if packed_word == 0:
+                bo.buffer_store(
+                    fx.Int8(code),
+                    rsrc(latent_scales),
+                    token * (LATENT // 32) + group,
+                )
 
 
 def front_split_plan(rows, fp8_shared, fp4_latent, lds_words, resident=False):
