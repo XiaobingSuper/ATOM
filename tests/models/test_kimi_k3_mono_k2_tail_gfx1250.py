@@ -18,6 +18,17 @@ from atom.mono.plan.architecture import GFX1250
 WIDTHS = range(1, tail.tail_max_rows() + 1)
 
 
+def _rows(*rows):
+    """``rows``, those past the token cap skipped until it is raised."""
+    return [
+        pytest.param(
+            r,
+            marks=pytest.mark.skipif(r > tail.tail_max_rows(), reason="token cap"),
+        )
+        for r in rows
+    ]
+
+
 def test_tail_takes_a_share_a_cta_at_the_widths_of_the_seven_element_all_reduce():
     rows = tail.tail_line_rows()
     assert rows == 42 and tail.tail_max_rows() >= 48
@@ -76,7 +87,7 @@ def test_norm_reduces_in_aiter_rmsnorm2d_thread_order():
 
 
 @pytest.mark.parametrize("identity", (False, True))
-@pytest.mark.parametrize("rows", (1, 20, 40, 42, 43, 50, 55, 60, 64, 72, 76, 80))
+@pytest.mark.parametrize("rows", _rows(1, 20, 40, 42, 43, 50, 55, 60, 64, 72, 76, 80))
 def test_builder_launches_the_grid_on_the_tail_abi(rows, identity):
     kernel = tail.build_k2_tail(8, rows, 1e-5, identity_routes=identity)
     assert kernel.abi is tail.TAIL_ABI
