@@ -95,11 +95,14 @@ def _eight_f32(pointer, element):
     return values
 
 
-def _store_eight(pointer, element, values):
+def _store_eight(pointer, element, values, cache_modifier=0):
     words = (
         fx.Vector.from_elements(values, fx.Float32).to(fx.BFloat16).bitcast(fx.Int32)
     )
-    bo.buffer_store(words, pointer, element // 2)
+    if cache_modifier:
+        bo.buffer_store(words, pointer, element // 2, cache_modifier=cache_modifier)
+    else:
+        bo.buffer_store(words, pointer, element // 2)
 
 
 def _slices_sum(pointer, word, slices):
@@ -202,12 +205,14 @@ def emit_sliced_mix(
     out,
     prefix_out,
     scratch,
+    out_cache=0,
 ):
     """CTA ``block``'s part of the sliced mix: cluster ``block // cluster``'s
     tokens, rank ``block % cluster``'s columns. ``lds`` maps
     ``mix.lds_words()``'s names to FP32 LDS pointers; ``score_weight(column)``
     is the eight FP32 score weights of ``column``; candidate ``b`` of token
-    ``t`` is at ``blocks`` element ``t token_stride + b block_stride``."""
+    ``t`` is at ``blocks`` element ``t token_stride + b block_stride``;
+    ``out`` is stored with cache policy ``out_cache``."""
     count, addends, out_norm = mix.count, mix.addends, mix.out_norm
     eps, out_eps, cluster, gram = mix.eps, mix.out_eps, mix.cluster, mix.gram
     candidates = mix.candidates
@@ -378,7 +383,7 @@ def emit_sliced_mix(
             inverse = hw_rsq(norm * fx.Float32(1.0 / HIDDEN) + fx.Float32(out_eps))
             mixed = [m * inverse * g for m, g in zip(mixed, gains)]
         if live & busy:
-            _store_eight(rsrc(out), element, mixed)
+            _store_eight(rsrc(out), element, mixed, out_cache)
 
 
 def build_attn_res_sliced(

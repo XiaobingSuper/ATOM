@@ -250,6 +250,7 @@ def project(
     x_cache_policy: int = 0,
     wide: bool = True,
     token_buffers: int = 2,
+    x_gate=None,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -269,7 +270,11 @@ def project(
     a CU has in flight.
 
     ``token_buffers``: token slabs resident in LDS (``x_words`` grows with
-    it), so that many are in flight once ``x`` is first read."""
+    it), so that many are in flight once ``x`` is first read.
+
+    ``x_gate(slab)``: emitted on the wave that copies token slab ``slab``,
+    right before the copy (``slab`` a trace-time int, or the rolled loop's
+    runtime index), so ``x`` may be published a slab at a time."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -294,6 +299,7 @@ def project(
             depth,
             prologue,
             x_cache_policy,
+            x_gate,
         )
     tiles = (rows + ROWS - 1) // ROWS
     token_words = rows * ROW_STRIDE // 2
@@ -334,6 +340,8 @@ def project(
 
     def issue_tokens(slab):
         def emit(whole=False):
+            if const_expr(x_gate is not None):
+                x_gate(slab)
             load_rows(
                 x + fx.Int64(slab * SLAB * 2),
                 x_stride,
@@ -546,6 +554,7 @@ def _project_rolled(
     depth,
     prologue,
     x_cache_policy,
+    x_gate=None,
 ):
     """``project`` (wide) with its slab loop a runtime loop. Wave 0 copies
     every token slab and waves ``1 + 2 t`` and ``2 + 2 t`` task ``t``'s
@@ -582,6 +591,8 @@ def _project_rolled(
     task_row = _uniform(task_row)
 
     def issue_tokens(slab):
+        if const_expr(x_gate is not None):
+            x_gate(slab)
         load_rows(
             x + fx.Int64(slab) * fx.Int64(SLAB * 2),
             x_stride,

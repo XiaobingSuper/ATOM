@@ -10,8 +10,14 @@ import pytest
 from atom.models.kimi_k3.mono.kernels.attention import (
     kda_builder_gfx1250 as builder,
 )
+from atom.models.kimi_k3.mono.kernels.attention.k1_sliced_seam_layout import (
+    K1SeamPlan,
+)
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
+)
+from atom.models.kimi_k3.mono.kernels.stages.attn_res_sliced_layout import (
+    scratch_bytes as sliced_scratch_bytes,
 )
 
 
@@ -80,10 +86,29 @@ def test_local_scratch_covers_every_protocol_region():
         *declaration.protocol.mailbox_pairs,
         "sync",
         "x",
+        "srec",
+        "srdy",
     )
     assert all(offset % 16 == 0 for offset, _size in layout.values())
     for name, pairs in declaration.protocol.mailbox_pairs.items():
         assert layout[name][1] == pairs * 8
+    ends = [offset + size for offset, size in layout.values()]
+    starts = [offset for offset, _size in layout.values()]
+    assert all(end <= start for end, start in zip(ends, starts[1:]))
+    assert layout["srec"][1] == sliced_scratch_bytes(4, 48, builder.TDM_CLUSTER)
+    assert layout["srdy"][1] == K1SeamPlan(256).ready_pairs * 8
+
+
+def test_sliced_seam_needs_the_in_kernel_seam_and_the_tdm_projection():
+    plan = _plan()
+    replace(_spec(), sliced_seam=True).validate(plan)
+    for change in (
+        {"external_seam": True, "delta": False},
+        {"tdm_projection": False},
+        {"write_idx": 1},
+    ):
+        with pytest.raises(ValueError, match="sliced K1 seam"):
+            replace(_spec(), sliced_seam=True, **change).validate(plan)
 
 
 def test_resident_projection_reuses_each_weight_slab_across_s48_tiles():

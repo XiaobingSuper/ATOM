@@ -13,9 +13,15 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import GFX1250_BLOCKS
+from atom.models.kimi_k3.mono.kernels.attention import (
+    k1_sliced_seam_gfx1250 as sliced_seam,
+)
 from atom.models.kimi_k3.mono.kernels.attention import kda as base
 from atom.models.kimi_k3.mono.kernels.attention import (
     kda_gfx1250 as gfx_backend,
+)
+from atom.models.kimi_k3.mono.kernels.attention.k1_sliced_seam_layout import (
+    K1SeamPlan,
 )
 from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
     HIDDEN,
@@ -34,6 +40,7 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
     STATE_CHUNKS,
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+from atom.models.kimi_k3.mono.kernels.stages import attn_res_sliced_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.sources import SOURCES
 from atom.mono.device.ops import (
@@ -84,6 +91,7 @@ class ResidentBuildKey:
     external_seam: bool
     tdm_projection: bool
     fp8_projection: bool
+    sliced_seam: bool
 
 
 @dataclass(frozen=True)
@@ -214,6 +222,7 @@ def build_resident_k1(
             spec.external_seam,
             spec.tdm_projection,
             spec.fp8_projection,
+            spec.sliced_seam,
         ),
         SOURCES,
     )
@@ -222,6 +231,20 @@ def build_resident_k1(
         f"_u{spec.gemv_unit}_q{int(spec.quant_core)}"
         f"{'_xs' if spec.external_seam else ''}{'_t' if spec.tdm_projection else ''}"
         f"{'_f8' if spec.fp8_projection else ''}"
+        f"{'_ss' if spec.sliced_seam else ''}"
+    )
+    seam_plan = K1SeamPlan(declaration.blocks) if spec.sliced_seam else None
+    seam_mix = (
+        attn_res_sliced_gfx1250.SlicedMix(
+            declaration.nblocks,
+            int(spec.delta),
+            True,
+            spec.eps,
+            spec.out_eps,
+            seam_plan.cluster,
+        )
+        if spec.sliced_seam
+        else None
     )
 
     @traced
@@ -460,7 +483,42 @@ def build_resident_k1(
         # kernel.
         core_ready = part
 
-        if const_expr(not spec.external_seam):
+        def sliced_pass():
+            sliced_seam.seam_pass(
+                seam_plan,
+                seam_mix,
+                smem.red.ptr,
+                s,
+                blocks,
+                blk_sm,
+                blk_sr,
+                prefix,
+                delta,
+                ares_nw,
+                ares_qk,
+                in_nw,
+                x,
+                scratch + fx.Int64(layout["srec"][0]),
+                scratch + fx.Int64(layout["srdy"][0]),
+                generation,
+            )
+
+        def gate_slab(slab):
+            sliced_seam.gate_slab(
+                seam_plan,
+                scratch + fx.Int64(layout["srdy"][0]),
+                slab,
+                s,
+                generation,
+                lane,
+            )
+
+        if const_expr(spec.sliced_seam):  # noqa: SIM102
+            # the projection CTAs mix theirs in the projection's prologue
+            if bid < ATTENTION_CTAS:
+                sliced_pass()
+
+        if const_expr(not spec.external_seam and not spec.sliced_seam):  # noqa: SIM102
             if bid < ATTENTION_CTAS:
                 for tile in range_constexpr(len(tile_starts)):
                     token0 = tile_starts[tile]
@@ -542,7 +600,8 @@ def build_resident_k1(
                     if const_expr(spec.delta or spec.write_idx >= 0):
                         copy_items = rows * (SEAM_COLUMNS // 4)
                         for iteration in range_constexpr(
-                            (copy_items + declaration.threads - 1) // declaration.threads
+                            (copy_items + declaration.threads - 1)
+                            // declaration.threads
                         ):
                             work = tid + declaration.threads * iteration
                             if work < copy_items:
@@ -622,7 +681,9 @@ def build_resident_k1(
             # Observe every tile before issuing weights: a gfx buffer poll
             # retires behind prior vmcnt loads, so prefetching weights first
             # would serialize every spin iteration behind those loads.
-            for tile in range_constexpr(0 if spec.external_seam else len(tile_starts)):
+            for tile in range_constexpr(
+                0 if spec.external_seam or spec.sliced_seam else len(tile_starts)
+            ):
                 gfx_backend.mailbox_poll_device(
                     x_ready,
                     tile * ATTENTION_CTAS + tid % ATTENTION_CTAS,
@@ -649,6 +710,15 @@ def build_resident_k1(
                     **(
                         {"w_scale": w_in_scale, "depth": gemv_tdm.FP8_DEPTH}
                         if spec.fp8_projection
+                        else {}
+                    ),
+                    **(
+                        {
+                            "prologue": sliced_pass,
+                            "x_cache_policy": CM_DEV,
+                            "x_gate": gate_slab,
+                        }
+                        if spec.sliced_seam
                         else {}
                     ),
                 )

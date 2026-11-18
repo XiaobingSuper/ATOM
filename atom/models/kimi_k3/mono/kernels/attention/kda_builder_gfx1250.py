@@ -14,6 +14,9 @@ import math
 from dataclasses import dataclass, replace
 from importlib import import_module
 
+from atom.models.kimi_k3.mono.kernels.attention.k1_sliced_seam_layout import (
+    K1SeamPlan,
+)
 from atom.models.kimi_k3.mono.kernels.attention.mailbox_contract import (
     GFX1250_MAILBOX,
     K1_REQUIRED_CAPABILITIES,
@@ -29,7 +32,14 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import (
     KimiLdsPlan,
     LdsRegion,
 )
+from atom.models.kimi_k3.mono.kernels.stages.attn_res_sliced_layout import (
+    MAX_CTAS,
+)
+from atom.models.kimi_k3.mono.kernels.stages.attn_res_sliced_layout import (
+    scratch_bytes as sliced_scratch_bytes,
+)
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_CLUSTER,
     TDM_FP8_DEPTH,
     tdm_lds_bytes,
 )
@@ -363,6 +373,9 @@ class K1LocalBuildSpec:
     # The in-projection is ATOM's online per_1x128 FP8 (preshuffled, E8M0
     # block scales in ``w_in_scale``) rather than BF16.
     fp8_projection: bool = False
+    # The seam column-sliced over K1's own TDM clusters
+    # (``k1_sliced_seam_gfx1250``) instead of the attention CTAs' mailboxes.
+    sliced_seam: bool = False
 
     def validate(self, plan: Gfx1250KimiBuildPlan) -> None:
         if not 1 <= self.qlen <= 16 or plan.tokens % self.qlen:
@@ -379,6 +392,13 @@ class K1LocalBuildSpec:
         if self.external_seam and (self.delta or self.write_idx >= 0):
             raise ValueError(
                 "external-seam K1 cannot apply the residual delta or bank a block"
+            )
+        if self.sliced_seam and (
+            self.external_seam or not self.tdm_projection or self.write_idx >= 0
+        ):
+            raise ValueError(
+                "the sliced K1 seam needs the in-kernel seam, the TDM projection "
+                "and no banked block"
             )
         if type(self.quant_core) is not bool:
             raise TypeError("local K1 quant_core must be bool")
@@ -637,6 +657,16 @@ def local_scratch_layout(
     layout["sync"] = (_align(end), 8)
     end = layout["sync"][0] + layout["sync"][1]
     layout["x"] = (_align(end), declaration.tokens * HIDDEN * 2)
+    if declaration.blocks % TDM_CLUSTER or declaration.blocks > MAX_CTAS:
+        return layout
+    end = layout["x"][0] + layout["x"][1]
+    seam = K1SeamPlan(declaration.blocks)
+    records = sliced_scratch_bytes(
+        declaration.nblocks, declaration.tokens, seam.cluster
+    )
+    layout["srec"] = (_align(end), records)
+    end = layout["srec"][0] + records
+    layout["srdy"] = (_align(end), seam.ready_pairs * 8)
     return layout
 
 
