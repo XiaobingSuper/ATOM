@@ -1268,29 +1268,18 @@ def build_moe(
         def since(before):
             return clock() - before
 
-        def up_operands(item, stage):
-            """A gate/up wave's weights and scales of an item, from its slot."""
+        def up_operands(item, stage, rows_wave):
+            """Wave ``rows_wave``'s weights and scales of a gate/up item."""
             scale = (
                 smem.item_scales.ptr
                 + (item % ring) * SCALE_WORDS
-                + wave * STEPS * 32
+                + rows_wave * STEPS * 32
                 + lane
             )
             return (
-                [_weight_operand(stage, wave, lane, step) for step in range(STEPS)],
+                [_weight_operand(stage, rows_wave, lane, step) for step in range(STEPS)],
                 [fx.ptr_load(scale + step * 32) for step in range(STEPS)],
             )
-
-        def up_held(item, stage):
-            """``up_operands`` in the gate/up's waves, zeros in the rest: one
-            list, so a branch yields it."""
-            held = [fx.Vector.filled(16, 0, fx.Int32) for _ in range(STEPS)] + [
-                fx.Int32(0) for _ in range(STEPS)
-            ]
-            if wave < UP_WAVES:
-                weights, scales = up_operands(item, stage)
-                held = weights + scales
-            return held
 
         def deferred_epilogue(first, picks_n, task_block):
             if wave < UP_ROWS // 64:
@@ -1351,7 +1340,11 @@ def build_moe(
                             issue(k_item + ring - 1, (k_item + ring - 1) % ring)
                     k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
                     if const_expr(refill):
-                        k_held = up_held(k_item, k_stage)
+                        # Every wave reads (past the gate/up's, the last
+                        # one's rows) before the barrier that frees the slot.
+                        k_held = up_operands(
+                            k_item, k_stage, fx.min(wave, UP_WAVES - 1)
+                        )
                         _lds_barrier()
                         if k_item + ring < flat:
                             issue(k_item + ring, k_item % ring)
@@ -1362,10 +1355,11 @@ def build_moe(
                             )
                     if wave < UP_WAVES:
                         if const_expr(refill):
-                            k_weights = k_held[:STEPS]
-                            k_weight_scales = k_held[STEPS:]
+                            k_weights, k_weight_scales = k_held
                         else:
-                            k_weights, k_weight_scales = up_operands(k_item, k_stage)
+                            k_weights, k_weight_scales = up_operands(
+                                k_item, k_stage, wave
+                            )
                         # A K tile's STEPS * 16 words hold one pad dword.
                         k_latq = lds["latq"] + k_tile
                         for m in range_constexpr(tiles):
@@ -1411,7 +1405,11 @@ def build_moe(
                             issue(g_item + ring - 1, (g_item + ring - 1) % ring)
                     g_stage = smem.stages.ptr + (g_item % ring) * (SLOT_BYTES // 4)
                     if const_expr(refill):
-                        g_held = up_held(g_item, g_stage)
+                        # Every wave reads (past the gate/up's, the last
+                        # one's rows) before the barrier that frees the slot.
+                        g_held = up_operands(
+                            g_item, g_stage, fx.min(wave, UP_WAVES - 1)
+                        )
                         _lds_barrier()
                         if g_item + ring < flat:
                             issue(g_item + ring, g_item % ring)
@@ -1422,10 +1420,11 @@ def build_moe(
                         )
                     if wave < UP_WAVES:
                         if const_expr(refill):
-                            g_weights = g_held[:STEPS]
-                            g_weight_scales = g_held[STEPS:]
+                            g_weights, g_weight_scales = g_held
                         else:
-                            g_weights, g_weight_scales = up_operands(g_item, g_stage)
+                            g_weights, g_weight_scales = up_operands(
+                                g_item, g_stage, wave
+                            )
                         for m in range_constexpr(tiles):
                             if m == 0 or m * 16 < count:
                                 for step in range_constexpr(STEPS):
