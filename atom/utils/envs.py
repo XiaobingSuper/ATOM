@@ -693,6 +693,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the
     # three launches.
     "ATOM_KIMI_MONO_TAIL": lambda: os.getenv("ATOM_KIMI_MONO_TAIL", "0") == "1",
+    # gfx1250 mono o_proj all-reduce in one fabric hop: every rank's partials
+    # pushed to every rank and summed there in rank order (the same bits as
+    # the owner's sums, k2_oproj_ar_gfx1250); its banks take tp/2 times more.
+    "ATOM_KIMI_MONO_OPROJ_AR_ONESHOT": lambda: (
+        os.getenv("ATOM_KIMI_MONO_OPROJ_AR_ONESHOT", "0") == "1"
+    ),
+    # The gathering all-reduce's CTA barrier between its gathers and its
+    # pushes (k2_allreduce_gfx1250); "0" drops it.
+    "ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_GATHER_AR_PREPUSH_BARRIER", "1") == "1"
+    ),
     # Debug: run each mono layer next to the original one and log the difference
     # (atom/models/minimax_m3/mono/check.py; the gfx1250 V4.1 step: the launch
     # beside the production forward, mono/gfx1250/debug.py). Use with --enforce-eager.
