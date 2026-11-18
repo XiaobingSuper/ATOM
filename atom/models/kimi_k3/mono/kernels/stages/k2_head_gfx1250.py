@@ -86,8 +86,10 @@ class HeadMix:
     ``flags`` of which publish one ``sync`` flag each once their ``x`` columns
     are out. ``gemv_words``/``mix_words``: the i32 LDS words it stages in the
     head's ``gemv`` region and the f32 words of its own ``mix`` region.
-    ``body(lds, index, ctx)`` is mix CTA ``index``'s part, ``idle``
-    included; ``ctx`` (``_MixContext``) the head's view."""
+    ``body(lds, index, reduce, sync, epoch, tid, lane, wave, stamp, blocks,
+    prefix, score_weight, out_weight, x, prefix_out, token_stride)`` is mix
+    CTA ``index``'s part, ``idle`` included: flat, as a traced call takes
+    its values."""
 
     name: str
     ctas: int
@@ -95,19 +97,6 @@ class HeadMix:
     gemv_words: int
     mix_words: int
     body: object
-
-
-@dataclass(frozen=True)
-class _MixContext:
-    reduce: object
-    sync: object
-    epoch: object
-    tid: object
-    lane: object
-    wave: object
-    stamp: object
-    # (blocks, prefix, score_weight, out_weight, x, prefix_out, token_stride)
-    pointers: tuple
 
 
 def row_mix(rows, count, addends, eps, out_eps, ctas=MIX_CTAS, split=None):
@@ -124,8 +113,10 @@ def row_mix(rows, count, addends, eps, out_eps, ctas=MIX_CTAS, split=None):
     reductions = layout.reductions
 
     @traced
-    def body(lds, index, c):
-        blocks, prefix, score_weight, out_weight, x, prefix_out, stride = c.pointers
+    def body(
+        lds, index, reduce, sync, epoch, tid, lane, wave, stamp, blocks, prefix,
+        score_weight, out_weight, x, prefix_out, stride,
+    ):  # fmt: skip
         if index < flags:
             token = index // split
             part = index % split
@@ -136,45 +127,45 @@ def row_mix(rows, count, addends, eps, out_eps, ctas=MIX_CTAS, split=None):
                 regions,
                 token,
                 column0,
-                c.wave,
+                wave,
                 pointers,
                 stride,
                 layout,
                 skip=attention,
                 wait=False,
             )
-            osf._sum_duty(c.reduce, fx.Int32(fx.block_idx.x), c.tid)
-            c.stamp(STAMP_REDUCED)
+            osf._sum_duty(reduce, fx.Int32(fx.block_idx.x), tid)
+            stamp(STAMP_REDUCED)
             sf._mix_token(
                 lds.mix.ptr,
                 lds.gemv.ptr,
-                c.sync,
+                sync,
                 token,
                 part,
-                c.tid,
-                c.lane,
-                c.wave,
+                tid,
+                lane,
+                wave,
                 (*pointers, x, prefix_out),
                 stride,
                 layout,
-                c.stamp,
+                stamp,
                 stage=lambda: osf._attention_row(
-                    c.reduce,
+                    reduce,
                     token,
                     column0,
                     layout,
                     regions[0] + attention * layout.row_words,
-                    c.tid,
-                    c.stamp,
+                    tid,
+                    stamp,
                 ),
             )
-            sf._publish(c.sync, index, c.epoch, c.tid)
-            c.stamp(STAMP_MIX_PUBLISHED)
-            osf._land_duty(c.reduce, fx.Int32(fx.block_idx.x), c.tid)
+            sf._publish(sync, index, epoch, tid)
+            stamp(STAMP_MIX_PUBLISHED)
+            osf._land_duty(reduce, fx.Int32(fx.block_idx.x), tid)
         if index >= flags:
-            osf._sum_duty(c.reduce, fx.Int32(fx.block_idx.x), c.tid)
+            osf._sum_duty(reduce, fx.Int32(fx.block_idx.x), tid)
             sf._idle_mix(split)
-            osf._land_duty(c.reduce, fx.Int32(fx.block_idx.x), c.tid)
+            osf._land_duty(reduce, fx.Int32(fx.block_idx.x), tid)
 
     return HeadMix(
         name=f"m{split}",
@@ -242,25 +233,26 @@ def build_k2_head(
         raise ValueError(f"the K2 head runs 1 to {GFX1250_MAX_TOKENS} rows")
     if oar.triples(rows) * oar.CTA_PAIRS > THREADS:
         raise ValueError(f"the o_proj all-reduce cuts {rows} rows into a line a thread")
-    if mix is None:
-        mix = row_mix(rows, count, addends, eps, out_eps)
-    if mix.ctas > MIX_CTAS or mix.ctas % sf.CLUSTER:
+    head_mix = mix
+    if head_mix is None:
+        head_mix = row_mix(rows, count, addends, eps, out_eps)
+    if head_mix.ctas > MIX_CTAS or head_mix.ctas % sf.CLUSTER:
         raise ValueError(f"the K2 head's mix takes whole clusters of {MIX_CTAS} CTAs")
-    if mix.flags > THREADS:
+    if head_mix.flags > THREADS:
         raise ValueError("the front waits on a mix flag a thread")
     if poll_scope is None:
         poll_scope = osf.SCOPE_DEV if tp == 1 else ar.SCOPE_SYS | ar.VOLATILE
-    grid = max(FRONT_CTAS + mix.ctas, osf.OPROJ_CTAS)
+    grid = max(FRONT_CTAS + head_mix.ctas, osf.OPROJ_CTAS)
     assert grid % sf.CLUSTER == 0 and grid <= GRID
     tiles = (rows + front.ROWS - 1) // front.ROWS
     group_words = rows * 16
-    budget = (plan.lds_bytes - 1024) // 4 - group_words - mix.mix_words
+    budget = (plan.lds_bytes - 1024) // 4 - group_words - head_mix.mix_words
     split = front.front_split_plan(rows, fp8_shared, False, budget, resident=resident)
     if split is None:
         raise ValueError(f"the split-K front does not fit {rows} rows")
     gemv_words = max(
         front.front_split_lds_words(rows, split),
-        mix.gemv_words,
+        head_mix.gemv_words,
         osf.oproj_lds_words(rows),
     )
     words_a_bank = oar.bank_words(tp, rows)
@@ -270,14 +262,14 @@ def build_k2_head(
         # the o_proj's slabs, then the split front's or a mix CTA's
         gemv: fx.Array[fx.Int32, gemv_words, 16]
         group: fx.Array[fx.Int32, group_words, 16]
-        mix: fx.Array[fx.Float32, mix.mix_words, 16]
+        mix: fx.Array[fx.Float32, head_mix.mix_words, 16]
 
     if lds_bytes(Lds) > plan.lds_bytes:
         raise ValueError(f"the K2 head needs {lds_bytes(Lds)} B of LDS")
     stages = "".join("r" if whole else str(depth) for _, depth, whole in split.values())
     name = (
         f"k3_k2_gfx1250_head_tp{tp}_b{count}_a{addends}_s{rows}"
-        f"{'_f8' if fp8_shared else ''}_{mix.name}_k{stages}_q{poll_scope & 0xFF}"
+        f"{'_f8' if fp8_shared else ''}_{head_mix.name}_k{stages}_q{poll_scope & 0xFF}"
         f"{'_profile' if profile else ''}"
     )
     scratch = torch.empty(
@@ -290,7 +282,7 @@ def build_k2_head(
             else torch.device("cpu")
         ),
     )
-    flags = mix.flags
+    flags = head_mix.flags
     sources = SOURCES
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
@@ -391,30 +383,12 @@ def build_k2_head(
                 x_cache_policy=CM_DEV,
             )
             stamp(STAMP_FRONT_END)
-        if (bid >= FRONT_CTAS) & (bid < FRONT_CTAS + mix.ctas):
-            mix.body(
-                lds,
-                bid - FRONT_CTAS,
-                _MixContext(
-                    reduce,
-                    sync,
-                    epoch,
-                    tid,
-                    lane,
-                    wave,
-                    stamp,
-                    (
-                        blocks,
-                        prefix,
-                        score_weight,
-                        out_weight,
-                        x,
-                        prefix_out,
-                        token_stride,
-                    ),
-                ),
-            )
-        if bid >= FRONT_CTAS + mix.ctas:
+        if (bid >= FRONT_CTAS) & (bid < FRONT_CTAS + head_mix.ctas):
+            head_mix.body(
+                lds, bid - FRONT_CTAS, reduce, sync, epoch, tid, lane, wave, stamp,
+                blocks, prefix, score_weight, out_weight, x, prefix_out, token_stride,
+            )  # fmt: skip
+        if bid >= FRONT_CTAS + head_mix.ctas:
             osf._sum_duty(reduce, bid, tid)
             osf._land_duty(reduce, bid, tid)
         gpu.barrier()
@@ -490,4 +464,4 @@ def build_k2_head(
     def launcher(*args, **kwargs):
         return launch(*args, scratch_address, **kwargs)
 
-    return K2HeadKernel(name, launcher, (grid,), (THREADS,), mix, split, scratch)
+    return K2HeadKernel(name, launcher, (grid,), (THREADS,), head_mix, split, scratch)
