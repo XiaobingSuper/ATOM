@@ -249,7 +249,9 @@ int main() {
   const int tail_ctas = env_int("TAIL_CTAS", 0);
   const int fma_iters = env_int("FMA_ITERS", 0);
   const int tail_iters = env_int("TAIL_ITERS", 0);
-  const int lds_bytes = env_int("LDS_KB", 0) * 1024;
+  // the kernel's static LDS (4 B) and the launch's must fit one workgroup
+  const int lds_bytes = std::min<int>(env_int("LDS_KB", 0) * 1024,
+                                      static_cast<int>(prop.maxSharedMemoryPerMultiProcessor) - 256);
   const int reps = env_int("REPS", 8);
   const int replays = env_int("REPLAYS", 20);
   const bool direct = env_int("STREAM", 0) != 0;
