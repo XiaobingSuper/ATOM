@@ -31,8 +31,10 @@ from dataclasses import dataclass
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops as bo
-from flydsl.expr import const_expr, gpu
-from flydsl.expr.typing import Int32, Int64, T
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
@@ -44,7 +46,9 @@ from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_seam_front_gfx1250 as osf
 from atom.models.kimi_k3.mono.kernels.stages import k2_seam_front_gfx1250 as sf
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_SPLIT_SLAB,
     tdm_split_scratch_bytes,
+    tdm_split_slabs,
 )
 from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import _realtime
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
@@ -194,6 +198,75 @@ class K2HeadKernel:
     launch_count: int = 1
 
 
+PREFETCH_LINE = 128
+
+
+def _prefetch(base, count, offset, tid, scope):
+    """Prefetch hints for the ``count`` lines ``offset(item)`` bytes past
+    ``base``, a line a thread a round (a round's spare threads repeat the
+    last line)."""
+    for round_index in range_constexpr(-(-count // THREADS)):
+        item = fx.min(tid + THREADS * round_index, count - 1)
+        address = fx.Int64(base) + offset(item)
+        rocdl.global_prefetch(
+            llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), as_ir_value(address)).result,
+            cache_policy=ir.IntegerAttr.get(ir.IntegerType.get_signless(32), scope),
+        )
+
+
+def _streamed(split, kind, slabs):
+    """(first, count): the slabs of a CTA's quarter of K that ``kind``'s
+    projection streams once ``x`` is in, at most ``slabs`` of them."""
+    _, stages, whole = split[kind]
+    quarter = tdm_split_slabs(HIDDEN)
+    return stages, 0 if whole else max(0, min(quarter - stages, slabs))
+
+
+def _prefetch_rows(base, groups, row_bytes, slab_bytes, window, rank, tid, scope):
+    """Row-major weights (BF16, or MXFP4 pairs): slabs ``window`` of
+    ``rank``'s quarter of K over the 64-row groups from ``groups``."""
+    first, count = window
+    quarter = tdm_split_slabs(HIDDEN)
+    lines = slab_bytes // PREFETCH_LINE
+    per_row = lines * count
+
+    def offset(item):
+        row = item // per_row
+        rest = item % per_row
+        group_row = groups[0]
+        if const_expr(len(groups) == 2):
+            group_row = (row < 64).select(groups[0], groups[1])
+        return (
+            fx.Int64(group_row + row % 64) * fx.Int64(row_bytes)
+            + fx.Int64(rank * quarter + first + rest // lines) * fx.Int64(slab_bytes)
+            + fx.Int64(rest % lines * PREFETCH_LINE)
+        )
+
+    _prefetch(base, 64 * len(groups) * per_row, offset, tid, scope)
+
+
+def _prefetch_fp8(base, groups, window, rank, tid, scope):
+    """AITER's preshuffled FP8: a 16-row task's slab is one 16 x 256 B
+    block, its group's four tasks 16 rows of K apart."""
+    first, count = window
+    quarter = tdm_split_slabs(HIDDEN)
+    block = TDM_SPLIT_SLAB * front.ROWS
+    lines = block // PREFETCH_LINE
+    per_task = lines * count
+
+    def offset(item):
+        task = item // per_task
+        rest = item % per_task
+        group_row = (task < 4).select(groups[0], groups[1])
+        return (
+            fx.Int64(group_row + task % 4 * front.ROWS) * fx.Int64(HIDDEN)
+            + fx.Int64(rank * quarter + first + rest // lines) * fx.Int64(block)
+            + fx.Int64(rest % lines * PREFETCH_LINE)
+        )
+
+    _prefetch(base, 8 * per_task, offset, tid, scope)
+
+
 def build_k2_head(
     plan: Gfx1250KimiBuildPlan,
     tp: int,
@@ -207,6 +280,8 @@ def build_k2_head(
     resident: bool = True,
     mix: HeadMix | None = None,
     poll_scope: int | None = None,
+    prefetch: int = 0,
+    prefetch_scope: int = 0,
     profile: bool = False,
 ) -> K2HeadKernel:
     """``k2_oproj_seam_front_gfx1250.build_oproj_seam_front(plan, tp, proj,
@@ -217,7 +292,9 @@ def build_k2_head(
     projection whose whole weight share fits the LDS is copied whole.
     ``fp4_latent``: the latent weight is its MXFP4 planes, the launcher's
     ``latent_weight`` and its trailing ``latent_scale``
-    (``K2_HEAD_FP4_ABI``)."""
+    (``K2_HEAD_FP4_ABI``). ``prefetch``: of the slabs each front CTA streams
+    once ``x`` is in, that many hinted into the cache (``prefetch_scope``)
+    while it waits."""
     import torch
 
     if plan.architecture is not GFX1250:
@@ -278,7 +355,7 @@ def build_k2_head(
     name = (
         f"k3_k2_gfx1250_head_tp{tp}_b{count}_a{addends}_s{rows}"
         f"{'_f8' if fp8_shared else ''}{'_f4' if fp4_latent else ''}_{head_mix.name}_k{stages}_q{poll_scope & 0xFF}"
-        f"{'_profile' if profile else ''}"
+        f"{f'_p{prefetch}c{prefetch_scope}' if prefetch else ''}{'_profile' if profile else ''}"
     )
     scratch = torch.empty(
         tdm_split_scratch_bytes(FRONT_CTAS, rows),
@@ -292,6 +369,8 @@ def build_k2_head(
     )
     flags = head_mix.flags
     sources = SOURCES
+    streamed = {kind: _streamed(split, kind, prefetch) for kind in split}
+    latent_bytes = 2 if split["latent"][0] == "bf16" else 1 / 2
 
     @flyc.kernel(name=name, known_block_size=[THREADS, 1, 1])
     def kernel(
@@ -353,9 +432,46 @@ def build_k2_head(
                         SYNC_WORDS + bid * STAMPS + index,
                     )
 
+        def hint_streamed():
+            cluster = bid // gemv_tdm.TDM_CLUSTER
+            rank = bid % gemv_tdm.TDM_CLUSTER
+            latent_cluster = cluster - front.SPLIT_ROUTER_CLUSTERS
+            shared_cluster = latent_cluster - front.SPLIT_LATENT_CLUSTERS
+            shared_rows = [
+                shared_cluster * 64,
+                front.SHARED_COLUMNS + shared_cluster * 64,
+            ]
+            if const_expr(streamed["router"][1] > 0):  # noqa: SIM102
+                if cluster < front.SPLIT_ROUTER_CLUSTERS:
+                    _prefetch_rows(
+                        router_weight, [cluster * 64], HIDDEN * 2, TDM_SPLIT_SLAB * 2,
+                        streamed["router"], rank, tid, prefetch_scope,
+                    )  # fmt: skip
+            if const_expr(streamed["latent"][1] > 0):  # noqa: SIM102
+                if (latent_cluster >= 0) & (shared_cluster < 0):
+                    _prefetch_rows(
+                        latent_weight, [latent_cluster * 128, latent_cluster * 128 + 64],
+                        int(HIDDEN * latent_bytes), int(TDM_SPLIT_SLAB * latent_bytes),
+                        streamed["latent"], rank, tid, prefetch_scope,
+                    )  # fmt: skip
+            if const_expr(streamed["shared"][1] > 0):  # noqa: SIM102
+                if shared_cluster >= 0:
+                    if const_expr(fp8_shared):
+                        _prefetch_fp8(
+                            shared_weight, shared_rows, streamed["shared"], rank, tid,
+                            prefetch_scope,
+                        )  # fmt: skip
+                    else:
+                        _prefetch_rows(
+                            shared_weight, shared_rows, HIDDEN * 2, TDM_SPLIT_SLAB * 2,
+                            streamed["shared"], rank, tid, prefetch_scope,
+                        )  # fmt: skip
+
         def prologue():
             # the front's weights are in flight from here
             stamp(STAMP_ISSUED)
+            if const_expr(prefetch > 0):
+                hint_streamed()
             osf._sum_duty(reduce, bid, tid)
             stamp(STAMP_REDUCED)
             osf._land_duty(reduce, bid, tid)
