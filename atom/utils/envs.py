@@ -673,6 +673,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_ROLLED_MOE": lambda: (
         os.getenv("ATOM_KIMI_MONO_ROLLED_MOE", "1") == "1"
     ),
+    # 1: the gfx1250 fused MoE issues its latent at the launch's start and a
+    # CTA's first gate/up copies once the routes are counted, before the
+    # union scan, the picks and the down plan (build_moe(early=True), the
+    # same bits).
+    "ATOM_KIMI_MONO_MOE_EARLY": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MOE_EARLY", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: the lite finish routes a token by its whole CTA in
     # runtime loops (the same routes), reduces its shared down in one loop and
     # drops the gathered latent's dead unpack loops after a replicated front,
