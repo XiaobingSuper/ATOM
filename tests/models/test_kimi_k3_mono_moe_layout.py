@@ -151,3 +151,23 @@ def test_a_rolled_fused_moe_is_a_build_of_its_own(rows, rolled):
     kernel = build_moe(rows, rolled=rolled)
     assert kernel.name.startswith(f"k3_gfx1250_moe_s{rows}_")
     assert kernel.name.endswith("_rl") == rolled
+
+
+@pytest.mark.parametrize("rows", (10, 40))
+@pytest.mark.parametrize("rolled", (False, True))
+def test_an_early_fused_moe_is_a_build_of_its_own(rows, rolled):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    base = build_moe(rows, rolled=rolled, early=False)
+    early = build_moe(rows, rolled=rolled, early=True)
+    assert early.name == base.name + "_ea"
+    assert early.grid == base.grid
+
+
+def test_the_early_moe_switch_defaults_off(monkeypatch):
+    from atom.utils import envs
+
+    monkeypatch.delenv("ATOM_KIMI_MONO_MOE_EARLY", raising=False)
+    assert envs.ATOM_KIMI_MONO_MOE_EARLY is False
+    monkeypatch.setenv("ATOM_KIMI_MONO_MOE_EARLY", "1")
+    assert envs.ATOM_KIMI_MONO_MOE_EARLY is True

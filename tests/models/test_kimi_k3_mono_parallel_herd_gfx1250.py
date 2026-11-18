@@ -65,8 +65,8 @@ def test_a_profile_finish_stamps_past_its_scratch(herd):
     assert len(fin.PROFILE_STAMPS) <= fin.PROFILE_WORDS
 
 
-def test_a_profile_moe_holds_its_first_weights_stamp():
-    assert mt.profile_words() == mt.MOE_STATE_WORDS + 256 * 12
+def test_a_profile_moe_holds_its_first_weights_and_union_stamps():
+    assert mt.profile_words() == mt.MOE_STATE_WORDS + 256 * 16
     assert mt.build_moe(20, profile=True).name.endswith("_profile")
 
 
