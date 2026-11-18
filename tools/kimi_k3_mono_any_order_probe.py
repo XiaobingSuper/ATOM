@@ -236,6 +236,7 @@ def main():
             b.record()
             b.synchronize()
             times[name].append(a.elapsed_time(b) * 1000 / (replays * pairs))
+    timed_errors = {name: int(s[1, ..., ERRORS].sum()) for name, s in stamps.items()}
     for name, g in graphs.items():
         stamps[name].zero_()
         g.replay()
@@ -263,7 +264,9 @@ def main():
                     )
             for c in range(grid - tail_ctas, grid):
                 straggler.append(delta_us(s[0][i][c][END], s[0][i][c][ENTRY]))
-        errors = sum(s[1][i][c][ERRORS] for i in range(pairs) for c in range(grid))
+        errors = timed_errors[name] + sum(
+            s[1][i][c][ERRORS] for i in range(pairs) for c in range(grid)
+        )
         print(json.dumps({
             "config": name, "grid": grid, "pairs": pairs, "dep": dep,
             "busy_us": busy / 100, "tail_us": tail / 100, "tail_ctas": tail_ctas,
