@@ -67,7 +67,7 @@
 
 constexpr int THREADS = 256;
 constexpr int VEC_BYTES = 16 * THREADS;  // one uint4 a thread
-enum { S_ENTRY, S_PRO, S_SEEN, S_BODY, S_END, S_HWID, S_SPINS, STAMPS };
+enum { S_ENTRY, S_PRO, S_SEEN, S_BODY, S_END, S_HWID, S_SPINS, S_HDR, STAMPS };
 enum { DEP_NONE, DEP_ONE, DEP_ALL };
 
 struct Stage {
@@ -129,6 +129,10 @@ __global__ __launch_bounds__(THREADS) void stage_kernel(Stage s) {
   __shared__ int sh_epoch;
   const int tid = threadIdx.x, bid = blockIdx.x, grid = gridDim.x;
   const unsigned long long t_entry = realtime();
+  // the packet's header as the packet processor read it: the ring slot stays
+  // valid until the dispatch completes (bit 8 is the barrier bit). The ring is
+  // host memory, so only the last CTA reads it, after its own work.
+  unsigned header = 0;
   if (tid == 0) {
     const int e = ld_dev(s.counter + bid) + 1;
     st_dev(s.counter + bid, e);
@@ -187,6 +191,8 @@ __global__ __launch_bounds__(THREADS) void stage_kernel(Stage s) {
   wait_stores();
   __syncthreads();
   if (tid == 0) st_dev(s.flags_out + bid, epoch);
+  if (tid == 0 && bid == grid - 1)
+    header = *(const volatile unsigned short*)__builtin_amdgcn_dispatch_ptr();
 
   if ((acc.x ^ acc.y ^ acc.z ^ acc.w ^ __float_as_uint(f0 + f1 + f2 + f3)) == 0x9e3779b9u)
     s.sink[bid] = 1;
@@ -198,6 +204,7 @@ __global__ __launch_bounds__(THREADS) void stage_kernel(Stage s) {
     st[S_BODY] = t_body;
     st[S_HWID] = hw_id1();
     st[S_SPINS] = spins;
+    st[S_HDR] = header;
     st[S_END] = realtime();
   }
 }
@@ -422,6 +429,33 @@ int main() {
            pro_vec * VEC_BYTES / 1024, body_vec * VEC_BYTES / 1024, tail_vec * VEC_BYTES / 1024,
            tail_ctas, fma_iters, tail_iters, lds_bytes / 1024, direct ? 1 : 0, errs,
            median(c.layer_us), pct(c.layer_us, 0.0));
+    // every node's packet headers, split by how the node was launched
+    std::map<unsigned, int> headers[2];
+    for (int n = 0; n < chain; ++n)
+      ++headers[c.any[n]][static_cast<unsigned>(at(n, grid - 1, S_HDR))];
+    const char* launch[2] = {"in_order_headers", "any_order_headers"};
+    for (int kind = 0; kind < 2; ++kind) {
+      if (headers[kind].empty()) continue;
+      printf(", \"%s\": {", launch[kind]);
+      const char* sep = "";
+      for (auto& [h, count] : headers[kind]) {
+        printf("%s\"0x%x barrier=%u\": %d", sep, h, (h >> 8) & 1u, count);
+        sep = ", ";
+      }
+      printf("}");
+    }
+    // a CTA's phases: entry -> prefetch done -> input seen -> body done -> end
+    std::vector<double> phase[4];
+    for (int n = 0; n < chain; ++n)
+      for (int cta = 0; cta < grid; ++cta)
+        for (int k = 0; k < 4; ++k) {
+          const int from = k == 0 ? S_ENTRY : k == 1 ? S_PRO : k == 2 ? S_SEEN : S_BODY;
+          const int to = k == 0 ? S_PRO : k == 1 ? S_SEEN : k == 2 ? S_BODY : S_END;
+          phase[k].push_back(tick_us * (static_cast<double>(at(n, cta, to)) -
+                                        static_cast<double>(at(n, cta, from))));
+        }
+    printf(", \"cta_phase_us_p50\": [%.2f, %.2f, %.2f, %.2f]", median(phase[0]), median(phase[1]),
+           median(phase[2]), median(phase[3]));
     const char* kinds[2] = {"in_order_boundaries", "any_order_boundaries"};
     for (int kind = 0; kind < 2; ++kind) {
       if (gap[kind].empty()) continue;

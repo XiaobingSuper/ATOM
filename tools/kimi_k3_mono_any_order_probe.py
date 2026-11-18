@@ -244,7 +244,7 @@ def main():
 
     for name in graphs:
         s = stamps[name].cpu().tolist()  # [role][pair][cta][word]
-        gap, lag, control, straggler = [], [], [], []
+        gap, lag, control, straggler, spread, span = [], [], [], [], [], []
         for i in range(1, pairs):
             for x in range(nxcd):
                 ctas = range(x, grid, nxcd)
@@ -252,6 +252,9 @@ def main():
                     (s[0][i][c][END] for c in ctas),
                     key=lambda t: delta_us(t, s[0][i][x][ENTRY]),
                 )
+                entries = [delta_us(s[0][i][c][ENTRY], s[0][i][x][ENTRY]) for c in ctas]
+                spread.append(max(entries) - min(entries))
+                span.append(delta_us(p_end, s[0][i][x][ENTRY]) - min(entries))
                 gap.append(min(delta_us(s[1][i][c][ENTRY], p_end) for c in ctas))
                 lag.append(max(delta_us(s[1][i][c][END], p_end) for c in ctas))
                 if i + 1 < pairs:
@@ -277,6 +280,8 @@ def main():
             "lag_us_p50": round(statistics.median(lag), 3),
             "control_gap_us_p50": round(statistics.median(control), 3) if control else None,
             "straggler_us_p50": round(statistics.median(straggler), 3) if straggler else None,
+            "producer_entry_spread_us_p50": round(statistics.median(spread), 3),
+            "producer_span_us_p50": round(statistics.median(span), 3),
             "errors": errors, "launch_failures": len(any_order_launch.failures),
         }), flush=True)  # fmt: skip
 
