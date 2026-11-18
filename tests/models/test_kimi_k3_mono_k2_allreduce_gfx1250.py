@@ -53,6 +53,21 @@ def test_six_element_gathers_never_load_past_a_routed_row(rows):
             assert index == w + shift and start + index == column + w
 
 
+@pytest.mark.parametrize("rows", range(1, 81))
+def test_seven_element_gathers_never_load_past_a_routed_row(rows):
+    # _seven's 16 B window: from the pair at or before the line's first
+    # element; a row is LINE7_ROUTED whole lines, its last on an odd element
+    assert ar.LINE7_ROUTED * ar.LINE7_ELEMENTS == LATENT
+    for line in range(ar.LINE7_ROUTED):
+        element = line * ar.LINE7_ELEMENTS
+        start = element // 2
+        assert start + ar.LINE_WORDS <= ar.ROUTED_WORDS
+        assert 2 * start <= element and element + 7 <= 2 * (start + ar.LINE_WORDS)
+    # nor past the partials: their last line ends on the buffer's last pair
+    last = (ar.allreduce7_lines(rows) - 1) * ar.LINE7_ELEMENTS
+    assert last // 2 + ar.LINE_WORDS <= rows * (LATENT + HIDDEN) // 2
+
+
 def test_peer_banks_hold_two_epochs_of_every_source():
     assert ar.allreduce_peer_bytes(8, 40) == 2 * 8 * ar.allreduce_lines(40) * 16
     assert ar.allreduce_peer_bytes(8, 48) > ar.allreduce_peer_bytes(8, 40)
