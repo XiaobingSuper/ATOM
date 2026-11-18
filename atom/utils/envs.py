@@ -764,6 +764,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_FUSED_MOE_REFILL": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_REFILL", "0")
     ),
+    # Kimi-K3 gfx1250 mono: the fused MoE runs a task's first M tile's
+    # epilogue in the next task's first K tile, past its weights' issue.
+    "ATOM_KIMI_MONO_FUSED_MOE_DEFER": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_DEFER", "0")
+    ),
+    # Kimi-K3 gfx1250 mono: the fused MoE loads its global latent K tiles'
+    # fragments an item ahead (1: past the resident K tiles, 2: at a task's
+    # start); 0 loads them at the WMMA.
+    "ATOM_KIMI_MONO_FUSED_MOE_PREFETCH": lambda: int(
+        os.getenv("ATOM_KIMI_MONO_FUSED_MOE_PREFETCH", "0")
+    ),
     # Kimi-K3 gfx1250 mono: K2's gathering all-reduce, routed RMSNorm and
     # replicated finalize as one resident launch (k2_tail_gfx1250, the same
     # bits) where the gathering all-reduce runs a line a thread; 0 keeps the

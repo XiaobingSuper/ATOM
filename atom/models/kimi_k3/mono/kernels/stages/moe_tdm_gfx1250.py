@@ -925,6 +925,8 @@ def build_moe(
     ring: int | None = None,
     resident: int | None = None,
     refill: bool | None = None,
+    defer: bool | None = None,
+    prefetch: int | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -952,16 +954,35 @@ def build_moe(
     ``refill`` (default ``ATOM_KIMI_MONO_FUSED_MOE_REFILL``): a rolled build
     frees an item's slot once its weights are in registers -- a second
     barrier there -- and refills it before the item's math, a ring's whole
-    depth ahead."""
+    depth ahead.
+
+    ``defer`` (default ``ATOM_KIMI_MONO_FUSED_MOE_DEFER``): a rolled build
+    leaves a task's first M tile's epilogue (its SiTU in ``red``) to the next
+    task's first K tile, past that tile's issue, so the ring is refilled
+    first; the last task's runs past the loop. Its flag still goes out a K
+    tile into the next task (``publish_at`` at least 1).
+
+    ``prefetch`` (default ``ATOM_KIMI_MONO_FUSED_MOE_PREFETCH``), where a
+    token's last K tiles are read from global memory: the first M tile's
+    latent fragments of such a K tile are loaded an item ahead -- the first
+    of a task's before its global K tiles (1) or at its start (2)."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if refill is None:
         refill = envs.ATOM_KIMI_MONO_FUSED_MOE_REFILL
     refill = bool(refill) and rolled
+    if defer is None:
+        defer = envs.ATOM_KIMI_MONO_FUSED_MOE_DEFER
+    defer = bool(defer) and rolled
+    if defer and publish_at < 1:
+        raise ValueError("a deferred epilogue needs its flag published past K tile 0")
+    if prefetch is None:
+        prefetch = envs.ATOM_KIMI_MONO_FUSED_MOE_PREFETCH
     routes = rows * TOPK
     # Past 48 rows every token's latent and a ring of four do not fit: a
     # token's last K tiles are read from global memory (L2), the ring kept.
     ring, resident = _moe_fit(rows, ring, resident)
+    prefetch = prefetch if rolled and resident < LATENT // K_TILE else 0
     # The items issued past the one consumed: a refill build refills the
     # consumed item's own slot, a ring's whole depth on.
     lead = ring if refill else ring - 1
@@ -995,6 +1016,8 @@ def build_moe(
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
         + ("_e" if refill else "")
+        + ("_d" if defer else "")
+        + (f"_pf{prefetch}" if prefetch else "")
         + ("_rl" if rolled else "")
         + ("_profile" if profile else "")
     )
@@ -1259,6 +1282,33 @@ def build_moe(
                 held = weights + scales
             return held
 
+        def deferred_epilogue(first, picks_n, task_block):
+            if wave < UP_ROWS // 64:
+                _epilogue(
+                    lds,
+                    inter,
+                    0,
+                    lds["picks"] + first,
+                    picks_n,
+                    task_block,
+                    wave,
+                    0,
+                    lane,
+                    in_row=True,
+                    pairs=UP_ROWS // 64,
+                    activated=True,
+                )
+
+        def global_fragments(token, g_tile):
+            return [
+                _latent_fragment(latent, token, g_tile * STEPS + step, lane)
+                for step in range(STEPS)
+            ]
+
+        # The task whose first M tile's epilogue is deferred.
+        deferred_start = fx.Int32(0)
+        deferred_count = fx.Int32(0)
+        deferred_block = fx.Int32(0)
         up_start = clock()
         n = fx.Int32(0)
         while n < mine:
@@ -1273,6 +1323,8 @@ def build_moe(
                 for m in range(tiles)
             ]
             accumulators = [fx.Vector.filled(16, 0.0, fx.Float32) for _ in range(tiles)]
+            if const_expr(prefetch == 2):
+                g_next = global_fragments(tokens[0], fx.Int32(resident))
             if const_expr(rolled):
                 for k_tile in range(fx.Int32(0), fx.Int32(resident), unroll=1):
                     k_item = n * k_tiles + k_tile
@@ -1293,6 +1345,11 @@ def build_moe(
                         _lds_barrier()
                         if k_item + ring < flat:
                             issue(k_item + ring, k_item % ring)
+                    if const_expr(defer):  # noqa: SIM102
+                        if (k_tile == 0) & (n > 0):
+                            deferred_epilogue(
+                                deferred_start, deferred_count, deferred_block
+                            )
                     if wave < UP_WAVES:
                         if const_expr(refill):
                             k_weights = k_held[:STEPS]
@@ -1322,6 +1379,8 @@ def build_moe(
                                             + step
                                         ),
                                     )
+            if const_expr(prefetch == 1):
+                g_next = global_fragments(tokens[0], fx.Int32(resident))
             if const_expr(rolled and resident < k_tiles):
                 for g_tile in range(
                     fx.Int32(resident), fx.Int32(k_tiles), unroll=1
@@ -1346,6 +1405,11 @@ def build_moe(
                         _lds_barrier()
                         if g_item + ring < flat:
                             issue(g_item + ring, g_item % ring)
+                    if const_expr(prefetch):
+                        g_now = g_next
+                        g_next = global_fragments(
+                            tokens[0], fx.min(g_tile + 1, k_tiles - 1)
+                        )
                     if wave < UP_WAVES:
                         if const_expr(refill):
                             g_weights = g_held[:STEPS]
@@ -1357,7 +1421,9 @@ def build_moe(
                                 for step in range_constexpr(STEPS):
                                     accumulators[m] = _wmma(
                                         g_weights[step],
-                                        _latent_fragment(
+                                        g_now[step]
+                                        if prefetch and m == 0
+                                        else _latent_fragment(
                                             latent,
                                             tokens[m],
                                             g_tile * STEPS + step,
@@ -1429,7 +1495,7 @@ def build_moe(
             before = clock()
             if const_expr(rolled):
                 up_tiles = fx.min((count + 15) // 16, tiles)
-                for up_m in range(fx.Int32(0), up_tiles, unroll=1):
+                for up_m in range(fx.Int32(1 if defer else 0), up_tiles, unroll=1):
                     if wave < UP_WAVES:
                         chosen = [accumulators[0][e] for e in range(16)]
                         for other in range_constexpr(1, tiles):
@@ -1460,6 +1526,18 @@ def build_moe(
                             activated=True,
                         )
                     _lds_barrier()
+                if const_expr(defer):
+                    if wave < UP_WAVES:
+                        fx.ptr_store(
+                            fx.Vector.from_elements(
+                                _situ([accumulators[0][e] for e in range(16)]),
+                                fx.Float32,
+                            ),
+                            lds["red"] + (wave * GFX1250.wave_size + lane) * 8,
+                        )
+                    deferred_start = start
+                    deferred_count = count
+                    deferred_block = block
             for m in range_constexpr(0 if rolled else tiles):
                 if m == 0 or m * 16 < count:
                     # Each wave its own SiTU: 6 waves' share, not 3's.
@@ -1488,6 +1566,10 @@ def build_moe(
             up_epilogue = up_epilogue + since(before)
             pending = slot * FLAG_WORDS + block
             n = n + 1
+        if const_expr(defer):
+            _lds_barrier()
+            if mine > 0:
+                deferred_epilogue(deferred_start, deferred_count, deferred_block)
         rocdl.s_wait_storecnt(0)
         _lds_barrier()
         if (tid == 0) & (pending >= 0):
