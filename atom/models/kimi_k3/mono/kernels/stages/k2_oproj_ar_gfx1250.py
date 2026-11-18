@@ -423,6 +423,22 @@ def _push_owner(stage, owner_base, rank, rows, own, bank, epoch, row0, owner, it
         )
 
 
+def oproj_lds_words(rows: int) -> tuple[int, int, int]:
+    """The GEMV's, the accumulators' and the line stage's LDS words."""
+    tiles = -(-rows // 16)
+    return (
+        sum(tdm_lds_words(rows, 2, True, depth=gemv_tdm.FP8_DEPTH)),
+        2 * tiles * ACCUMULATOR_WORDS,
+        triples(rows) * LINE_TOKENS * CTA_PAIRS,
+    )
+
+
+def oproj_overlays(rows: int) -> bool:
+    """Where the three do not fit side by side (past 64 rows) the accumulators
+    overlay the GEMV's LDS, written once every wave is past its last read."""
+    return 4 * sum(oproj_lds_words(rows)) > GFX1250.max_workgroup_lds_bytes
+
+
 def build_oproj_allreduce(
     plan: Gfx1250KimiBuildPlan,
     tp: int,
@@ -459,14 +475,8 @@ def build_oproj_allreduce(
         # the CTA's pairs ``[token][pair]``, cut into lines once all are in
         stage: fx.Array[fx.Int32, triples(rows) * LINE_TOKENS * CTA_PAIRS, 16]
 
-    # Where they do not fit side by side (past 64 rows) the accumulators
-    # overlay the GEMV's LDS, written once every wave is past its last read.
-    gemv_words = sum(tdm_lds_words(rows, 2, True, depth=gemv_tdm.FP8_DEPTH))
-    red_words = 2 * tiles * ACCUMULATOR_WORDS
-    stage_words = triples(rows) * LINE_TOKENS * CTA_PAIRS
-    overlay = (
-        4 * (gemv_words + red_words + stage_words) > GFX1250.max_workgroup_lds_bytes
-    )
+    gemv_words, red_words, stage_words = oproj_lds_words(rows)
+    overlay = oproj_overlays(rows)
 
     @fx.struct
     class GemvLds:

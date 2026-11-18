@@ -121,6 +121,19 @@ def test_o_proj_all_reduce_takes_a_line_a_thread_a_round():
     assert oar.triples(64) * oar.CTA_PAIRS <= 2 * oar.THREADS
 
 
+def test_o_proj_accumulators_overlay_the_gemv_only_where_they_must():
+    from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
+
+    limit = oar.GFX1250.max_workgroup_lds_bytes
+    for rows in range(1, 81):
+        gemv, red, stage = oar.oproj_lds_words(rows)
+        side_by_side = 4 * (gemv + red + stage)
+        assert oar.oproj_overlays(rows) == (side_by_side > limit)
+        assert 4 * (max(gemv, red) + stage) <= limit
+    assert not any(oar.oproj_overlays(rows) for rows in range(1, 65))
+    assert all(oar.oproj_overlays(rows) for rows in (72, 76, 80))
+
+
 @pytest.mark.parametrize("rows", _rows(40, 48, *WIDE))
 @pytest.mark.parametrize("oneshot", (False, True))
 def test_o_proj_all_reduce_builds_to_64_rows(rows, oneshot):
