@@ -30,6 +30,7 @@ from atom.models.kimi_k3.mono.kernels.attention import (
 from atom.models.kimi_k3.mono.kernels.execution_plan import (
     Gfx1250KimiBuildPlan,
 )
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import (
     fresh_prefetch_gfx1250 as fresh,
 )
@@ -182,6 +183,7 @@ def _grid_barrier(scratch, ticket, blocks):
     if tid == 0:
         arrived = protocol_device.epoch_load_system_acquire(scratch)
         while arrived < target:
+            energy.wait_pause(default=None)
             arrived = protocol_device.epoch_load_system_acquire(scratch)
     protocol_device.epoch_fence_system_acquire()
     gpu.barrier()
@@ -428,6 +430,7 @@ def build_packed_finish(
     unpack = not (rolled and replicated_front)
     if replicated_front:
         name += fresh.suffix("finish") + ("" if unpack else fresh.suffix("moe"))
+    name += energy.suffix()
 
     sources = SOURCES
     # It is the CTA before the routing ones, and its shared-down tasks (one,

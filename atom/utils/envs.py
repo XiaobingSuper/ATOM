@@ -702,6 +702,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # all-reduce CTA its share of the fused MoE's rows, their route weights
     # and the shared rows), "gather" (the gathering all-reduce's CTAs alike),
     # the default; 0 leaves all of them out.
+    # Kimi-K3 gfx1250 mono: how the kernels' waits idle, a "."-separated set
+    # (empty, the default: as before): wait<N>, ar<N>, lead; see
+    # kernels/stages/energy_gfx1250.py.
+    "ATOM_KIMI_MONO_ENERGY": lambda: os.getenv("ATOM_KIMI_MONO_ENERGY", ""),
     "ATOM_KIMI_MONO_XPF": lambda: frozenset(
         site
         for site in os.getenv("ATOM_KIMI_MONO_XPF", "gather").split(",")

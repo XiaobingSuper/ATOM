@@ -47,6 +47,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, MAX_ROWS, TOPK
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
@@ -86,7 +87,6 @@ from atom.mono.device.ops import (
     ld_dev,
     load_ptr64,
     rsrc,
-    spin_pause,
     st_dev,
     traced,
     uniform,
@@ -368,7 +368,7 @@ def _poll_lines7_bounded(mine, ats, tag, flags, bid, bound):
     words = _load_lines(mine, ats)
     polls = fx.Int32(0)
     while _stale7(words, len(ats), tag) & (polls < bound):
-        spin_pause()
+        energy.ar_pause()
         words = _load_lines(mine, ats)
         polls = polls + 1
     if polls >= bound:
@@ -729,7 +729,7 @@ def _wait_flags(flags, tid, ctas, epoch):
     if tid < ctas:
         flag = fx.Int32(ld_dev(flags, tid))
         while flag != epoch:
-            rocdl.s_sleep(1)
+            energy.wait_pause()
             flag = fx.Int32(ld_dev(flags, tid))
 
 
@@ -776,7 +776,7 @@ def _wait_flags_bounded(flags, tid, bid, ctas, epoch, bound):
         flag = fx.Int32(ld_dev(flags, tid))
         polls = fx.Int32(0)
         while (flag != epoch) & (polls < bound):
-            rocdl.s_sleep(1)
+            energy.wait_pause()
             flag = fx.Int32(ld_dev(flags, tid))
             polls = polls + 1
         if polls >= bound:
@@ -841,6 +841,7 @@ def build_k2_tail(
         + ("" if poll_bound is None else f"_b{poll_bound}")
         + ("_profile" if profile else "")
         + fresh.suffix("tail")
+        + energy.suffix()
     )
     sources = SOURCES
 

@@ -32,13 +32,13 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
 from atom.models.kimi_k3.mono.config import HIDDEN, LATENT, TOPK
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.mono.device.ops import (
     bf2_f32,
     bf16_round,
     load_ptr64,
     rsrc,
-    spin_pause,
     st_dev,
     traced,
 )
@@ -157,7 +157,7 @@ def _poll_lines(mine, ats, epoch):
     ``epoch + 2``, and each 16 B load sees a copy whole."""
     words = _load_lines(mine, ats)
     while _stale(words, len(ats), epoch):
-        spin_pause()
+        energy.ar_pause()
         words = _load_lines(mine, ats)
     return words
 
@@ -417,7 +417,7 @@ def _build_gather_allreduce6(tp: int, rows: int) -> K2AllReduceKernel:
         raise ValueError(f"the gathering all-reduce takes a line a thread at {rows}")
     routed_lines = -(-rows * LATENT // LINE_ELEMENTS)
     bank_words = tp * lines * LINE_WORDS
-    name = f"k3_k2_gfx1250_gather_allreduce_tp{tp}_s{rows}"
+    name = f"k3_k2_gfx1250_gather_allreduce_tp{tp}_s{rows}{energy.suffix()}"
 
     @fx.struct
     class Lds:
@@ -549,7 +549,7 @@ def _poll_lines7(mine, ats, tag):
     """``_poll_lines`` of seven-element lines, tagged in their top 16 bits."""
     words = _load_lines(mine, ats)
     while _stale7(words, len(ats), tag):
-        spin_pause()
+        energy.ar_pause()
         words = _load_lines(mine, ats)
     return words
 
@@ -673,7 +673,7 @@ def build_gather_allreduce(
     name = (
         f"k3_k2_gfx1250_gather_allreduce7_tp{tp}_s{rows}"
         f"{'' if prepush_barrier else '_nb'}{'_profile' if profile else ''}"
-        f"{fresh.suffix('gather')}"
+        f"{fresh.suffix('gather')}{energy.suffix()}"
     )
 
     @fx.struct

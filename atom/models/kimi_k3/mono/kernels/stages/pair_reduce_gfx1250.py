@@ -30,8 +30,9 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import Int32, Int64, T, as_ir_value
 
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
-from atom.mono.device.ops import bf2_f32, load_ptr64, rsrc, spin_pause, traced
+from atom.mono.device.ops import bf2_f32, load_ptr64, rsrc, traced
 from atom.mono.runtime.abi import KernelAbi
 
 THREADS = 256
@@ -107,7 +108,7 @@ def poll_pairs(mine, words, epoch):
     re-loaded together while any is stale."""
     pairs = _load_pairs(mine, words)
     while _stale(pairs, epoch):
-        spin_pause()
+        energy.ar_pause()
         pairs = _load_pairs(mine, words)
     return [fx.Int32(pair[0]) for pair in pairs]
 

@@ -20,6 +20,10 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T, as_ir_value
 
+from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
+    REPLAY_GROUP,
+    REPLAY_TABLE,
+)
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
     GATE_K,
     HIDDEN,
@@ -27,6 +31,7 @@ from atom.models.kimi_k3.mono.kernels.attention.layout import (
     KdaMatrixContract,
 )
 from atom.models.kimi_k3.mono.kernels.attention.protocol import ATTENTION_CTAS
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
     ACCUMULATOR_ELEMENTS,
@@ -37,10 +42,6 @@ from atom.models.kimi_k3.mono.kernels.stages.gemv_gfx1250 import (
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
     K_PER_CHUNK,
     PACK_ELEMENTS,
-)
-from atom.models.kimi_k3.mono.kernels.attention.kda_builder_gfx1250 import (
-    REPLAY_GROUP,
-    REPLAY_TABLE,
 )
 from atom.mono.device.ops import (
     CM_DEV,
@@ -1232,6 +1233,7 @@ def kda_head(c, request, head, share=None):
         ]
         + gate_pairs,
         c["tag"],
+        lead=energy.lead(),
     )
     if const_expr(split > 1):
         c["head_gates"] = polled[len(polled) - len(gate_pairs) :]
@@ -1363,6 +1365,7 @@ def kda_gates(c, k, request, head):
     values = mailbox_poll_many_device(
         [(qk, base + index) for index in indices],
         c["tag"],
+        lead=energy.lead(),
     )
     for iteration in range_constexpr(len(indices)):
         fx.ptr_store(_f32_of(values[iteration]), c["qkl"] + indices[iteration])
@@ -1633,17 +1636,18 @@ def mailbox_poll_device(pointer, index, expected_tag):
 
     pair = mailbox_load_device(pointer, index)
     while pair[1] != fx.Int32(expected_tag):
-        rocdl.s_sleep(1)
+        energy.wait_pause()
         pair = mailbox_load_device(pointer, index)
     return pair[0]
 
 
 @traced
-def mailbox_poll_many_device(items, expected_tag):
+def mailbox_poll_many_device(items, expected_tag, lead=False):
     """Poll ``(pointer, index)`` pairs with every load in flight at once.
 
     Polling them one by one costs one dependent L2 round trip per pair even
-    when all of them are already published."""
+    when all of them are already published. ``lead`` (every thread of the CTA
+    calls it): wave 0 polls its pairs alone, the others wait at a barrier."""
 
     def stale(pairs):
         flags = [pair[1] != fx.Int32(expected_tag) for pair in pairs]
@@ -1652,9 +1656,16 @@ def mailbox_poll_many_device(items, expected_tag):
             result = result | flag
         return result
 
+    if const_expr(lead):
+        if fx.thread_idx.x < 32:
+            pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
+            while stale(pairs):
+                energy.wait_pause()
+                pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
+        gpu.barrier()
     pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
     while stale(pairs):
-        rocdl.s_sleep(1)
+        energy.wait_pause()
         pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
     return [pair[0] for pair in pairs]
 

@@ -14,6 +14,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from atom.models.kimi_k3.mono.config import MAX_ROWS
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     EXPERTS,
     LATENT,
@@ -753,12 +754,12 @@ def stage_herd_token(c, rows, token):
     words = load_pairs()
     if const_expr(limit is None):
         while stale(words):
-            rocdl.s_sleep(1)
+            energy.wait_pause()
             words = load_pairs()
     else:
         polls = fx.Int32(0)
         while stale(words) & (polls < limit):
-            rocdl.s_sleep(1)
+            energy.wait_pause()
             polls = polls + 1
             words = load_pairs()
     if const_expr("stamp" in c):
@@ -854,7 +855,7 @@ def stage_herd_finalize(c, rows):
 
     words = load_pairs()
     while stale(words):
-        rocdl.s_sleep(1)
+        energy.wait_pause()
         words = load_pairs()
     if const_expr("stamp" in c):
         c["stamp"]("herd_in")

@@ -38,6 +38,7 @@ from flydsl.expr.typing import Int32, Int64, T
 
 from atom.models.kimi_k3.mono.config import HIDDEN
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import fresh_prefetch_gfx1250 as fresh
 from atom.models.kimi_k3.mono.kernels.stages import gemv_gfx1250, tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
@@ -53,7 +54,6 @@ from atom.mono.device.ops import (
     bf16_round,
     load_ptr64,
     rsrc,
-    spin_pause,
     st_dev,
     traced,
 )
@@ -168,7 +168,7 @@ def _poll_lines(mine, words, epoch):
     re-loaded together while any is stale, as their tokens' pair words."""
     lines = _load_lines(mine, words)
     while _stale(lines, epoch):
-        spin_pause()
+        energy.ar_pause()
         lines = _load_lines(mine, words)
     return [[fx.Int32(line[j]) for j in range(LINE_TOKENS)] for line in lines]
 
@@ -461,7 +461,7 @@ def build_oproj_allreduce(
     name = (
         f"k3_k2_gfx1250_oproj_ar_tp{tp}_s{rows}{'_os' if oneshot else ''}"
         f"{'_profile' if profile else ''}{fresh.suffix('oproj')}"
-        f"{tdm_timeline.suffix()}"
+        f"{tdm_timeline.suffix()}{energy.suffix()}"
     )
     sources = SOURCES
     timeline = tdm_timeline.key()

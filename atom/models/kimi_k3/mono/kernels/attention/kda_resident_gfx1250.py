@@ -36,6 +36,7 @@ from atom.models.kimi_k3.mono.kernels.attention.protocol import (
     STATE_CHUNKS,
 )
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
@@ -316,6 +317,7 @@ def build_resident_k1(
         f"{f'_sk{split_stages}' if split_stages else ''}{gemv_tdm.cold_suffix()}"
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
+        f"{energy.suffix()}"
         f"{'' if _gate_ilp() else '_nogi'}"
         f"{tdm_timeline.suffix()}"
     )

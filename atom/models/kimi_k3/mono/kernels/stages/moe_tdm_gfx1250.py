@@ -38,6 +38,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int64, T
 
 from atom.models.kimi_k3.mono.config import SITU_BETA, SITU_LINEAR_BETA
+from atom.models.kimi_k3.mono.kernels.stages import energy_gfx1250 as energy
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages.moe_expert_gfx1250 import (
     _activation_fragment,
@@ -840,7 +841,7 @@ def _bounded_wait(flags, slot, tag, state, bid):
     while ((v[0] != tag) | (v[1] != tag) | (v[2] != tag) | (v[3] != tag)) & (
         polls < POLL_LIMIT
     ):
-        rocdl.s_sleep(1)
+        energy.wait_pause()
         polls = polls + 1
         v = fx.Vector(ld_dev(flags, slot * FLAG_WORDS, 4))
     if polls >= POLL_LIMIT:
@@ -979,7 +980,7 @@ def build_moe(
         scan: fx.Array[fx.Int32, WAVES, 16]
 
     name = (
-        f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
+        f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}{energy.suffix()}"
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
         + ("_rl" if rolled else "")
