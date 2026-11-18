@@ -44,7 +44,12 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_expert_gfx1250 import (
     _weight_scale_word,
     _wmma,
 )
-from atom.models.kimi_k3.mono.kernels.stages.moe_gfx1250 import _block_exclusive_scan32
+from atom.models.kimi_k3.mono.kernels.stages.moe_gfx1250 import (
+    _ballot32,
+    _block_exclusive_scan32,
+    _popcount32,
+    _wave_inclusive_scan32,
+)
 from atom.models.kimi_k3.mono.kernels.stages.moe_layout import (
     EXPERTS,
     LATENT,
@@ -107,10 +112,16 @@ def _out_cm(fused):
 
 
 @traced
-def _union(ids, rows, tid, lane, wave, lds, threads=THREADS, cache_modifier=0):
+def _union(
+    ids, rows, tid, lane, wave, lds, threads=THREADS, cache_modifier=0, mark=None,
+    on_counted=None,
+):
     """The step's ascending expert union and its picks, in LDS: ``slot[e]``
     an expert's union index, ``expert[u]``, ``start[u]``/``count[u]`` its run
-    in ``picks`` (token * TOPK + k). Returns the union size."""
+    in ``picks`` (token * TOPK + k). Returns the union size. ``mark(i)``
+    (optional, profiling): called once the routes are counted (0) and once
+    the union is scanned (1). ``on_counted()`` (optional): called once
+    ``count[e]`` is in LDS, before the union is scanned."""
     routes = rows * TOPK
     count, slot, start = lds["count"], lds["slot"], lds["start"]
     # The routes' loads go out first, their latency under the zeroing.
@@ -141,6 +152,10 @@ def _union(ids, rows, tid, lane, wave, lds, threads=THREADS, cache_modifier=0):
         )
         rank.append((expert, taken))
     gpu.barrier()
+    if const_expr(mark is not None):
+        mark(0)
+    if const_expr(on_counted is not None):
+        on_counted()
     per = (EXPERTS + threads - 1) // threads
     first = tid * per
     present, picks = fx.Int32(0), fx.Int32(0)
@@ -170,6 +185,8 @@ def _union(ids, rows, tid, lane, wave, lds, threads=THREADS, cache_modifier=0):
         union_base = union_base + (counted[index] > 0).select(fx.Int32(1), fx.Int32(0))
         pick_base = pick_base + counted[index]
     gpu.barrier()
+    if const_expr(mark is not None):
+        mark(1)
     for index in range_constexpr(len(rank)):
         at = tid + index * threads
         if at < routes:
@@ -768,7 +785,7 @@ POLL_LIMIT = 1 << 16
 
 def profile_words() -> int:
     """A ``profile`` MoE's ``state`` words."""
-    return MOE_STATE_WORDS + 256 * 12
+    return MOE_STATE_WORDS + 256 * 16
 
 
 @dataclass(frozen=True)
@@ -886,6 +903,7 @@ def build_moe(
     publish_at: int = 1,
     up_units: int = UP_UNITS,
     rolled: bool | None = None,
+    early: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -902,15 +920,26 @@ def build_moe(
     gate/up done, down done, down tiles) and its flag waits (2 words a CTA:
     100 MHz ticks, expert switches) past those; then (3 words a CTA) its
     core cycles in gate/up ring waits, epilogues and down ring waits, its
-    gate/up cycles (a word a CTA), and the stamp once its first weights are
-    issued (a word a CTA): ``profile_words()`` in all.
+    gate/up cycles (a word a CTA), the stamp once its first weights are
+    issued (a word a CTA), and (4 words a CTA) its stamps once the routes
+    are counted, the union scanned and the latent issued:
+    ``profile_words()`` in all.
 
     ``rolled`` (default ``ATOM_KIMI_MONO_ROLLED_MOE``): a task's K tiles, its
     M tiles' epilogues, a down tile's M tiles and the ring's first copies run
     as runtime loops, and a switch stages its picks' rows a round an
-    iteration, so a cold launch fetches one body of each."""
+    iteration, so a cold launch fetches one body of each.
+
+    ``early`` (default ``ATOM_KIMI_MONO_MOE_EARLY``): the latent's copy goes
+    out at the launch's start and a CTA's first gate/up task's first copies
+    as soon as the routes are counted, before the union is scanned, its
+    picks placed and the down tiles planned (the same bits)."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
+    if early is None:
+        early = envs.ATOM_KIMI_MONO_MOE_EARLY
+    # (the body's ``early`` counts its early down tiles)
+    early_copies = early
     routes = rows * TOPK
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
@@ -946,6 +975,7 @@ def build_moe(
     name = (
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + ("_rl" if rolled else "")
+        + ("_ea" if early_copies else "")
         + ("_profile" if profile else "")
     )
     sources = SOURCES
@@ -990,6 +1020,10 @@ def build_moe(
         def publish(word):
             st_dev(tag, flags, word)
 
+        def mark(i):
+            if tid == 0:
+                st_dev(fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 12 + bid * 4 + i)
+
         def issue_latent():
             if wave == WEIGHT_ISSUER:
                 gemv_tdm.load_rows(
@@ -1015,12 +1049,96 @@ def build_moe(
                     width=LATENT_SCALES // 2,
                 )
 
+        def issue_up(buffer, scale_buffer, expert, task, tile):
+            """``issue``'s gate/up copies of task ``task`` (of ``expert``), K
+            tile ``tile``, for ``first_copies``."""
+            group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
+            if wave == WEIGHT_ISSUER:
+                gemv_tdm.load_rows(
+                    w13
+                    + fx.Int64(group0) * (LATENT * 8)
+                    + fx.Int64(tile * GROUP_TILE_BYTES),
+                    LATENT * 4,
+                    buffer,
+                    UP_GROUPS,
+                    UP_GROUPS,
+                    padded=False,
+                    cache_policy=1,
+                    whole=True,
+                    width=GROUP_TILE_BYTES // 2,
+                )
+            # n32k4: (expert, 32-row group, K step, row) words; a task's
+            # row groups are 28 K steps (3584 bytes) apart.
+            row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
+            if wave == SCALE_ISSUER:
+                gemv_tdm.load_rows(
+                    w13s
+                    + fx.Int64(row_group0 * (LATENT // 128) + tile * STEPS) * 128,
+                    LATENT // 128 * 64,
+                    scale_buffer,
+                    UP_WAVES,
+                    UP_WAVES,
+                    padded=False,
+                    cache_policy=1,
+                    whole=True,
+                    width=STEPS * 64,
+                )
+
+        def first_copies():
+            """``early_copies``: the CTA's first task's first ``ring - 1`` K
+            tiles, by its issuers once the routes are counted: its expert is
+            the union's ``bid // blocks``-th, found by each issuer wave from
+            ``count`` on its own (``per`` experts a lane, a scan over lanes)."""
+            if (wave == WEIGHT_ISSUER) | (wave == SCALE_ISSUER):
+                nth = bid // blocks
+                per = EXPERTS // GFX1250.wave_size
+                routed = [
+                    fx.ptr_load(lds["count"] + lane * per + index) > 0 for index in range(per)
+                ]
+                present = fx.Int32(0)
+                for index in range_constexpr(per):
+                    present = present + routed[index].select(fx.Int32(1), fx.Int32(0))
+                after = _wave_inclusive_scan32(present, lane)
+                before = after - present
+                holder = _ballot32((before <= nth) & (nth < after))
+                seen, found = before, fx.Int32(0)
+                for index in range_constexpr(per):
+                    found = (routed[index] & (seen == nth)).select(lane * per + index, found)
+                    seen = seen + routed[index].select(fx.Int32(1), fx.Int32(0))
+                expert0 = (holder != 0).select(
+                    readlane(found, _popcount32(holder - fx.Uint32(1))), fx.Int32(-1)
+                )
+                if expert0 >= 0:
+                    for ahead in range_constexpr(ring - 1):
+                        issue_up(
+                            smem.stages.ptr + ahead * (SLOT_BYTES // 4),
+                            smem.item_scales.ptr + ahead * SCALE_WORDS,
+                            expert0,
+                            bid,
+                            ahead,
+                        )
+                    if const_expr(profile):  # noqa: SIM102
+                        if tid == WEIGHT_ISSUER * GFX1250.wave_size:
+                            st_dev(
+                                fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid
+                            )
+
         if const_expr(fused is not None):
+            if const_expr(early_copies):
+                raise ValueError("a fused launch issues its own latent and first copies")
             # The latent is the front's: in flight while the routes come in.
             issue_latent()
             fused["wait_routes"]()
+        if const_expr(early_copies):
+            # In flight under the union; a CTA with no gate/up task waits it
+            # out before its down rows reuse this LDS.
+            issue_latent()
         union = uniform(
-            _union(ids, rows, tid, lane, wave, lds, cache_modifier=_out_cm(fused))
+            _union(
+                ids, rows, tid, lane, wave, lds, cache_modifier=_out_cm(fused),
+                mark=mark if profile else None,
+                on_counted=first_copies if early_copies else None,
+            )
         )
         tasks = union * blocks
         ups = tasks // 256
@@ -1137,24 +1255,37 @@ def build_moe(
         # weights: a TDM counter drains in order, so the first item's wait
         # covers them. A CTA with no gate/up task (whose down tiles reuse
         # this LDS) loads none.
-        if const_expr(fused is None):
+        if const_expr(fused is None and not early_copies):  # noqa: SIM102
             if mine > 0:
                 issue_latent()
-        if const_expr(fused is not None):
+        if const_expr(fused is not None or early_copies):  # noqa: SIM102
             if mine == 0:
                 # Its down rows land where the latent does.
                 rocdl.s_wait_tensorcnt(0)
-        if const_expr(rolled):
-            for first_item in range(fx.Int32(0), fx.Int32(ring - 1), unroll=1):
-                if first_item < flat:
-                    issue(first_item, first_item)
+        if const_expr(profile):
+            mark(2)
+
+        def first_issues():
+            if const_expr(rolled):
+                for first_item in range(fx.Int32(0), fx.Int32(ring - 1), unroll=1):
+                    if first_item < flat:
+                        issue(first_item, first_item)
+            else:
+                for ahead in range_constexpr(ring - 1):
+                    if ahead < flat:
+                        issue(fx.Int32(ahead), ahead)
+            if const_expr(profile):  # noqa: SIM102
+                if tid == 0:
+                    st_dev(
+                        fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid
+                    )
+
+        if const_expr(early_copies):
+            # A CTA with a gate/up task sent its first ones once routes were counted.
+            if mine == 0:
+                first_issues()
         else:
-            for ahead in range_constexpr(ring - 1):
-                if ahead < flat:
-                    issue(fx.Int32(ahead), ahead)
-        if const_expr(profile):  # noqa: SIM102
-            if tid == 0:
-                st_dev(fx.Int32(_realtime()), state, MOE_STATE_WORDS + 256 * 11 + bid)
+            first_issues()
         # Read only now: a wave waits on this load where it reads it, and the
         # flags' tag is not needed before the first task's flag.
         if const_expr(fused is None):
