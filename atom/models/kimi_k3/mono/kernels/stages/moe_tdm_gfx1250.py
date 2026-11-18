@@ -770,6 +770,11 @@ WEIGHT_ISSUER = WAVES - 2
 SCALE_ISSUER = WAVES - 1
 assert UP_WAVES * STEPS * 32 == DOWN_STEPS * 8 * 32 == SCALE_WORDS
 FLAG_WORDS = UP_BLOCKS
+# The folded gate/up layout (``build_moe(folded=True)``, ``fold_gate_up``): a
+# task's K tile one contiguous block -- its 12 groups' 4 KB, then its 6 row
+# groups' 512 B of scales -- the LDS image its two copies leave, in one copy;
+# a down tile (``fold_down``) its 48 KB then its 3 KB of scales, the same size.
+FOLD_BYTES = SLOT_BYTES + SCALE_WORDS * 4
 # What the fused MoE balances CTAs by: a down tile (48 KB) is 3 units, a
 # gate/up task (7 tiles' bytes) 15 -- measured, not its bytes' 21: counted at
 # its bytes, the CTAs with one fewer task took so many down tiles they ran
@@ -788,6 +793,43 @@ def profile_words() -> int:
     return MOE_STATE_WORDS + 256 * 16
 
 
+def fold_gate_up(w13, w13s, chunk: int = 32):
+    """``w13`` (AITER's preshuffle: an expert's 48 16-row groups, each its 7
+    K tiles of 4 KB) and ``w13s`` (n32k4: an expert's 24 32-row groups, each
+    its 7 K tiles of 512 B) as the folded layout: (expert, task, K tile) of
+    ``FOLD_BYTES`` -- the task's 12 groups' K tile, then its 6 row groups'.
+    The same bytes, moved; ``chunk`` experts at a time."""
+    import torch
+
+    tiles = LATENT // K_TILE
+    experts = w13.numel() * w13.element_size() // (2 * 384 * LATENT // 2)
+    weights = w13.reshape(-1).view(torch.uint8).view(experts, UP_BLOCKS, UP_GROUPS, tiles, GROUP_TILE_BYTES)
+    scales = w13s.reshape(-1).view(torch.uint8).view(experts, UP_BLOCKS, UP_WAVES, tiles, STEPS * 128)
+    out = torch.empty((experts, UP_BLOCKS, tiles, FOLD_BYTES), dtype=torch.uint8, device=w13.device)
+    for e in range(0, experts, chunk):
+        part = slice(e, min(e + chunk, experts))
+        out[part, :, :, :SLOT_BYTES] = weights[part].permute(0, 1, 3, 2, 4).reshape(
+            -1, UP_BLOCKS, tiles, SLOT_BYTES
+        )
+        out[part, :, :, SLOT_BYTES:] = scales[part].permute(0, 1, 3, 2, 4).reshape(
+            -1, UP_BLOCKS, tiles, SCALE_WORDS * 4
+        )
+    return out
+
+
+def fold_down(w2, w2s):
+    """``w2`` (an expert's 14 down tiles of 48 KB, each contiguous) and
+    ``w2s`` (n32k4: an expert's 14 tiles' 3 KB, each contiguous) as the
+    folded layout: (expert, tile) of ``FOLD_BYTES``, the tile's weights then
+    its scales. The same bytes, moved."""
+    import torch
+
+    experts = w2.numel() * w2.element_size() // (DOWN_TILES * SLOT_BYTES)
+    weights = w2.reshape(-1).view(torch.uint8).view(experts, DOWN_TILES, SLOT_BYTES)
+    scales = w2s.reshape(-1).view(torch.uint8).view(experts, DOWN_TILES, SCALE_WORDS * 4)
+    return torch.cat((weights, scales), dim=-1)
+
+
 @dataclass(frozen=True)
 class MoeKernel:
     name: str
@@ -796,6 +838,9 @@ class MoeKernel:
     # its LDS struct and kernel body, for a launch that runs it as a part
     lds: object = None
     body: object = None
+    # its ``w13``/``w2`` the folded layouts (``fold_gate_up``/``fold_down``),
+    # its ``w13s``/``w2s`` unread
+    folded: bool = False
 
 
 def _realtime():
@@ -904,6 +949,8 @@ def build_moe(
     up_units: int = UP_UNITS,
     rolled: bool | None = None,
     early: bool | None = None,
+    folded: bool | None = None,
+    one_issuer: bool | None = None,
 ) -> MoeKernel:
     """The routed experts of ``rows`` tokens in one resident 256-CTA launch,
     with no grid barrier and no queue: every CTA works out the same static,
@@ -933,16 +980,34 @@ def build_moe(
     ``early`` (default ``ATOM_KIMI_MONO_MOE_EARLY``): the latent's copy goes
     out at the launch's start and a CTA's first gate/up task's first copies
     as soon as the routes are counted, before the union is scanned, its
-    picks placed and the down tiles planned (the same bits)."""
+    picks placed and the down tiles planned (the same bits).
+
+    ``folded`` (default ``ATOM_KIMI_MONO_MOE_FOLDED``): ``w13`` and ``w2``
+    are ``fold_gate_up``'s and ``fold_down``'s layouts and an item is one copy
+    of its weights and scales (``w13s``, ``w2s`` unread); a ring stage holds
+    an item's scales past its weights (the same bits). ``one_issuer``
+    (default ``ATOM_KIMI_MONO_MOE_ONE_ISSUER``; unfolded): the weights' wave
+    issues the scales' copies too, in order after them. Either way the
+    latent's scales go out on the weights' wave, so an item's wait covers
+    them."""
     if rolled is None:
         rolled = envs.ATOM_KIMI_MONO_ROLLED_MOE
     if early is None:
         early = envs.ATOM_KIMI_MONO_MOE_EARLY
+    if folded is None:
+        folded = envs.ATOM_KIMI_MONO_MOE_FOLDED
+    if one_issuer is None:
+        one_issuer = envs.ATOM_KIMI_MONO_MOE_ONE_ISSUER
+    one_issuer = one_issuer and not folded
+    # the wave issuing the scales' copies, and an item's copies on its weights' wave
+    scale_wave = WEIGHT_ISSUER if folded or one_issuer else SCALE_ISSUER
+    item_copies = 2 if one_issuer else 1
     # (the body's ``early`` counts its early down tiles)
     early_copies = early
     routes = rows * TOPK
     lds_bytes = 4 * (
         RING * (SLOT_BYTES // 4 + SCALE_WORDS)
+        + (16 if folded else 0)
         + rows * (LATENT_TDM_WORDS + LATENT_SCALES // 4)
         + UP_WAVES * GFX1250.wave_size * 8
         + 2 * EXPERTS
@@ -955,12 +1020,14 @@ def build_moe(
     blocks = UP_BLOCKS
     k_tiles = LATENT // K_TILE
     ring = RING
-    ring_words = ring * SLOT_BYTES // 4
+    # a stage's words: an item's weights, and with ``folded`` its scales past them
+    stage_words = SLOT_BYTES // 4 + (SCALE_WORDS if folded else 0)
+    ring_words = ring * stage_words
 
     @fx.struct
     class Lds:
         stages: fx.Array[fx.Int32, ring_words, 16]
-        item_scales: fx.Array[fx.Int32, ring * SCALE_WORDS, 16]
+        item_scales: fx.Array[fx.Int32, 16 if folded else ring * SCALE_WORDS, 16]
         latq: fx.Array[fx.Int32, rows * LATENT_TDM_WORDS, 16]
         latsc: fx.Array[fx.Int32, rows * LATENT_SCALES // 4, 16]
         red: fx.Array[fx.Float32, UP_WAVES * GFX1250.wave_size * 8, 16]
@@ -976,6 +1043,8 @@ def build_moe(
         f"k3_gfx1250_moe_s{rows}_p{publish_at}_u{up_units}"
         + ("_rl" if rolled else "")
         + ("_ea" if early_copies else "")
+        + ("_fo" if folded else "")
+        + ("_oi" if one_issuer else "")
         + ("_profile" if profile else "")
     )
     sources = SOURCES
@@ -1037,7 +1106,7 @@ def build_moe(
                     width=LATENT // 4,
                     pad_every=LATENT_PAD_EVERY,
                 )
-            if wave == SCALE_ISSUER:
+            if wave == scale_wave:
                 gemv_tdm.load_rows(
                     scales,
                     LATENT_SCALES // 2,
@@ -1049,40 +1118,69 @@ def build_moe(
                     width=LATENT_SCALES // 2,
                 )
 
+        def stage_at(stage):
+            return smem.stages.ptr + stage * stage_words
+
+        if const_expr(folded):
+
+            def scales_at(stage):
+                return smem.stages.ptr + stage * stage_words + SLOT_BYTES // 4
+
+        else:
+
+            def scales_at(stage):
+                return smem.item_scales.ptr + stage * SCALE_WORDS
+
         def issue_up(buffer, scale_buffer, expert, task, tile):
             """``issue``'s gate/up copies of task ``task`` (of ``expert``), K
-            tile ``tile``, for ``first_copies``."""
-            group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
-            if wave == WEIGHT_ISSUER:
-                gemv_tdm.load_rows(
-                    w13
-                    + fx.Int64(group0) * (LATENT * 8)
-                    + fx.Int64(tile * GROUP_TILE_BYTES),
-                    LATENT * 4,
-                    buffer,
-                    UP_GROUPS,
-                    UP_GROUPS,
-                    padded=False,
-                    cache_policy=1,
-                    whole=True,
-                    width=GROUP_TILE_BYTES // 2,
-                )
-            # n32k4: (expert, 32-row group, K step, row) words; a task's
-            # row groups are 28 K steps (3584 bytes) apart.
-            row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
-            if wave == SCALE_ISSUER:
-                gemv_tdm.load_rows(
-                    w13s
-                    + fx.Int64(row_group0 * (LATENT // 128) + tile * STEPS) * 128,
-                    LATENT // 128 * 64,
-                    scale_buffer,
-                    UP_WAVES,
-                    UP_WAVES,
-                    padded=False,
-                    cache_policy=1,
-                    whole=True,
-                    width=STEPS * 64,
-                )
+            tile ``tile``, for ``first_copies``; ``folded``: one copy."""
+            if const_expr(folded):
+                if wave == WEIGHT_ISSUER:
+                    gemv_tdm.load_rows(
+                        w13
+                        + (fx.Int64(expert * UP_BLOCKS + task % blocks) * k_tiles + fx.Int64(tile))
+                        * FOLD_BYTES,
+                        FOLD_BYTES // 2,
+                        buffer,
+                        1,
+                        1,
+                        padded=False,
+                        cache_policy=1,
+                        whole=True,
+                        width=FOLD_BYTES // 2,
+                    )
+            else:
+                group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
+                if wave == WEIGHT_ISSUER:
+                    gemv_tdm.load_rows(
+                        w13
+                        + fx.Int64(group0) * (LATENT * 8)
+                        + fx.Int64(tile * GROUP_TILE_BYTES),
+                        LATENT * 4,
+                        buffer,
+                        UP_GROUPS,
+                        UP_GROUPS,
+                        padded=False,
+                        cache_policy=1,
+                        whole=True,
+                        width=GROUP_TILE_BYTES // 2,
+                    )
+                # n32k4: (expert, 32-row group, K step, row) words; a task's
+                # row groups are 28 K steps (3584 bytes) apart.
+                row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
+                if wave == scale_wave:
+                    gemv_tdm.load_rows(
+                        w13s
+                        + fx.Int64(row_group0 * (LATENT // 128) + tile * STEPS) * 128,
+                        LATENT // 128 * 64,
+                        scale_buffer,
+                        UP_WAVES,
+                        UP_WAVES,
+                        padded=False,
+                        cache_policy=1,
+                        whole=True,
+                        width=STEPS * 64,
+                    )
 
         def first_copies():
             """``early_copies``: the CTA's first task's first ``ring - 1`` K
@@ -1111,8 +1209,8 @@ def build_moe(
                 if expert0 >= 0:
                     for ahead in range_constexpr(ring - 1):
                         issue_up(
-                            smem.stages.ptr + ahead * (SLOT_BYTES // 4),
-                            smem.item_scales.ptr + ahead * SCALE_WORDS,
+                            stage_at(ahead),
+                            scales_at(ahead),
                             expert0,
                             bid,
                             ahead,
@@ -1173,81 +1271,104 @@ def build_moe(
             return (i < early).select(8 + slot - first_slot, 24 + slot - late_slot)
 
         def issue(item, stage):
-            buffer = smem.stages.ptr + stage * (SLOT_BYTES // 4)
-            scale_buffer = smem.item_scales.ptr + stage * SCALE_WORDS
+            buffer = stage_at(stage)
+            scale_buffer = scales_at(stage)
             if item < up_items:
-                n = item // k_tiles
-                task = bid + n * 256
-                expert = readlane(experts, n)
-                group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
-                if wave == WEIGHT_ISSUER:
-                    gemv_tdm.load_rows(
-                        w13
-                        + fx.Int64(group0) * (LATENT * 8)
-                        + fx.Int64(item % k_tiles * GROUP_TILE_BYTES),
-                        LATENT * 4,
+                if const_expr(folded):
+                    issue_up(
                         buffer,
-                        UP_GROUPS,
-                        UP_GROUPS,
-                        padded=False,
-                        cache_policy=1,
-                        whole=True,
-                        width=GROUP_TILE_BYTES // 2,
-                    )
-                # n32k4: (expert, 32-row group, K step, row) words; a task's
-                # row groups are 28 K steps (3584 bytes) apart.
-                row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
-                if wave == SCALE_ISSUER:
-                    gemv_tdm.load_rows(
-                        w13s
-                        + fx.Int64(
-                            row_group0 * (LATENT // 128) + item % k_tiles * STEPS
-                        )
-                        * 128,
-                        LATENT // 128 * 64,
                         scale_buffer,
-                        UP_WAVES,
-                        UP_WAVES,
-                        padded=False,
-                        cache_policy=1,
-                        whole=True,
-                        width=STEPS * 64,
+                        readlane(experts, item // k_tiles),
+                        bid + item // k_tiles * 256,
+                        item % k_tiles,
                     )
+                else:
+                    n = item // k_tiles
+                    task = bid + n * 256
+                    expert = readlane(experts, n)
+                    group0 = expert * (2 * 384 // 16) + task % blocks * UP_GROUPS
+                    if wave == WEIGHT_ISSUER:
+                        gemv_tdm.load_rows(
+                            w13
+                            + fx.Int64(group0) * (LATENT * 8)
+                            + fx.Int64(item % k_tiles * GROUP_TILE_BYTES),
+                            LATENT * 4,
+                            buffer,
+                            UP_GROUPS,
+                            UP_GROUPS,
+                            padded=False,
+                            cache_policy=1,
+                            whole=True,
+                            width=GROUP_TILE_BYTES // 2,
+                        )
+                    # n32k4: (expert, 32-row group, K step, row) words; a task's
+                    # row groups are 28 K steps (3584 bytes) apart.
+                    row_group0 = expert * (2 * 384 // 32) + task % blocks * UP_WAVES
+                    if wave == scale_wave:
+                        gemv_tdm.load_rows(
+                            w13s
+                            + fx.Int64(
+                                row_group0 * (LATENT // 128) + item % k_tiles * STEPS
+                            )
+                            * 128,
+                            LATENT // 128 * 64,
+                            scale_buffer,
+                            UP_WAVES,
+                            UP_WAVES,
+                            padded=False,
+                            cache_policy=1,
+                            whole=True,
+                            width=STEPS * 64,
+                        )
             else:
                 slot, tile = down_tile(item - up_items)
                 expert = readlane(experts, expert_lane(item - up_items, slot))
-                if wave == WEIGHT_ISSUER:
-                    gemv_tdm.load_rows(
-                        w2
-                        + fx.Int64(expert * DOWN_TASKS + tile * GROUPS)
-                        * GROUP_DOWN_BYTES,
-                        GROUP_DOWN_BYTES // 2,
-                        buffer,
-                        GROUPS,
-                        GROUPS,
-                        padded=False,
-                        cache_policy=1,
-                        whole=True,
-                        width=GROUP_DOWN_BYTES // 2,
-                    )
-                if wave == SCALE_ISSUER:
-                    gemv_tdm.load_rows(
-                        w2s
-                        + fx.Int64((expert * (LATENT // 32) + tile * 8) * DOWN_STEPS)
-                        * 128,
-                        DOWN_STEPS * 64,
-                        scale_buffer,
-                        8,
-                        8,
-                        padded=False,
-                        cache_policy=1,
-                        whole=True,
-                        width=DOWN_STEPS * 64,
-                    )
+                if const_expr(folded):
+                    if wave == WEIGHT_ISSUER:
+                        gemv_tdm.load_rows(
+                            w2 + (fx.Int64(expert) * DOWN_TILES + fx.Int64(tile)) * FOLD_BYTES,
+                            FOLD_BYTES // 2,
+                            buffer,
+                            1,
+                            1,
+                            padded=False,
+                            cache_policy=1,
+                            whole=True,
+                            width=FOLD_BYTES // 2,
+                        )
+                else:
+                    if wave == WEIGHT_ISSUER:
+                        gemv_tdm.load_rows(
+                            w2
+                            + fx.Int64(expert * DOWN_TASKS + tile * GROUPS)
+                            * GROUP_DOWN_BYTES,
+                            GROUP_DOWN_BYTES // 2,
+                            buffer,
+                            GROUPS,
+                            GROUPS,
+                            padded=False,
+                            cache_policy=1,
+                            whole=True,
+                            width=GROUP_DOWN_BYTES // 2,
+                        )
+                    if wave == scale_wave:
+                        gemv_tdm.load_rows(
+                            w2s
+                            + fx.Int64((expert * (LATENT // 32) + tile * 8) * DOWN_STEPS)
+                            * 128,
+                            DOWN_STEPS * 64,
+                            scale_buffer,
+                            8,
+                            8,
+                            padded=False,
+                            cache_policy=1,
+                            whole=True,
+                            width=DOWN_STEPS * 64,
+                        )
 
         def wait_for(item):
             if item + ring - 2 < flat:
-                rocdl.s_wait_tensorcnt(ring - 2)
+                rocdl.s_wait_tensorcnt(item_copies * (ring - 2))
             else:
                 rocdl.s_wait_tensorcnt(0)
 
@@ -1331,11 +1452,10 @@ def build_moe(
                         publish(pending)
                     if k_item + ring - 1 < flat:
                         issue(k_item + ring - 1, (k_item + ring - 1) % ring)
-                    k_stage = smem.stages.ptr + (k_item % ring) * (SLOT_BYTES // 4)
+                    k_stage = stage_at(k_item % ring)
                     if wave < UP_WAVES:
                         k_scale = (
-                            smem.item_scales.ptr
-                            + (k_item % ring) * SCALE_WORDS
+                            scales_at(k_item % ring)
                             + wave * STEPS * 32
                             + lane
                         )
@@ -1382,14 +1502,13 @@ def build_moe(
                         publish(pending)
                 if item + ring - 1 < flat:
                     issue(item + ring - 1, (item + ring - 1) % ring)
-                stage = smem.stages.ptr + (item % ring) * (SLOT_BYTES // 4)
+                stage = stage_at(item % ring)
                 # One branch a wave (6 and 7 hold no rows), then every K step's
                 # weights and scales loaded ahead of the first tile's WMMA chain:
                 # a tile's own branch held the loads behind each WMMA.
                 if wave < UP_WAVES:
                     item_scale = (
-                        smem.item_scales.ptr
-                        + (item % ring) * SCALE_WORDS
+                        scales_at(item % ring)
                         + wave * STEPS * 32
                         + lane
                     )
@@ -1561,10 +1680,9 @@ def build_moe(
             down_wait = down_wait + since(before)
             if item + ring - 1 < flat:
                 issue(item + ring - 1, (item + ring - 1) % ring)
-            stage = smem.stages.ptr + (item % ring) * (SLOT_BYTES // 4)
+            stage = stage_at(item % ring)
             item_scale = (
-                smem.item_scales.ptr
-                + (item % ring) * SCALE_WORDS
+                scales_at(item % ring)
                 + wave * DOWN_STEPS * 32
                 + lane
             )
@@ -1712,4 +1830,4 @@ def build_moe(
             ids, latent, scales, w13, w13s, w2, w2s, inter, grouped, flags, state
         ).launch(grid=(256,), block=(THREADS,), stream=stream)
 
-    return MoeKernel(name, launch, (256,), Lds, body)
+    return MoeKernel(name, launch, (256,), Lds, body, folded)

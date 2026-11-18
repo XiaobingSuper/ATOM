@@ -721,6 +721,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_KIMI_MONO_MOE_EARLY": lambda: (
         os.getenv("ATOM_KIMI_MONO_MOE_EARLY", "0") == "1"
     ),
+    # Kimi-K3 gfx1250 mono: 1: the runner keeps each bound layer's routed
+    # expert weights and scales a second time in the fused MoE's folded
+    # layouts (an item's weights then its scales, one contiguous block:
+    # moe_tdm_gfx1250.fold_gate_up / fold_down, about 2 GB a layer at inter
+    # 384) and the fused MoE reads them, an item in one copy
+    # (build_moe(folded=True), the same bits).
+    "ATOM_KIMI_MONO_MOE_FOLDED": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MOE_FOLDED", "0") == "1"
+    ),
+    # Kimi-K3 gfx1250 mono: 1: the fused MoE's weights' wave issues its
+    # scales' copies too (build_moe(one_issuer=True), the same bits).
+    "ATOM_KIMI_MONO_MOE_ONE_ISSUER": lambda: (
+        os.getenv("ATOM_KIMI_MONO_MOE_ONE_ISSUER", "0") == "1"
+    ),
     # Kimi-K3 gfx1250 mono: the lite finish routes a token by its whole CTA in
     # runtime loops (the same routes), reduces its shared down in one loop and
     # drops the gathered latent's dead unpack loops after a replicated front,

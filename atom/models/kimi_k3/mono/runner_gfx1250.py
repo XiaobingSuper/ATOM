@@ -109,6 +109,8 @@ from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import (
     INTER_ROW_WORDS,
     MOE_STATE_WORDS,
     build_moe,
+    fold_down,
+    fold_gate_up,
 )
 from atom.models.kimi_k3.mono.kernels.token_tiling import GFX1250_MAX_TOKENS
 from atom.models.kimi_k3.mono.plan import _width, kda_metadata, width_key
@@ -523,6 +525,8 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             len(self.routed) - len(self.ffn_layers),
             len(self.ffn_layers),
         )
+        if envs.ATOM_KIMI_MONO_MOE_FOLDED:
+            self.fold_gate_up_weights()
         # A layer whose o_proj the kernel cannot read keeps AITER's GEMM and
         # all-reduce, alone.
         self.oproj_weights = {}
@@ -814,6 +818,24 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             grouped_moe,
             fused_moe,
             tail,
+        )
+
+    def fold_gate_up_weights(self) -> None:
+        """Each bound layer's routed expert weights and scales in the folded
+        MoE's layouts (``fold_gate_up``, ``fold_down``), copies of their own
+        made here, before any graph: ``folded_experts`` (w13, w2) by the
+        address of the layer's ``w13``."""
+        folded = self.__dict__.setdefault("folded_experts", {})
+        for layer_id, weight in self.routed.items():
+            experts = self.inner.layers[layer_id].block_sparse_moe.experts
+            folded[weight.w13.data_ptr()] = (
+                fold_gate_up(weight.w13, experts.w13_weight_scale),
+                fold_down(weight.w2, experts.w2_weight_scale),
+            )
+        logger.info(
+            "Kimi-K3 gfx1250 mono: %d layers' routed experts folded (%.1f GB)",
+            len(folded),
+            sum(a.numel() + b.numel() for a, b in folded.values()) / 1e9,
         )
 
     def _fused_moe_for(self, rows: int):
@@ -1143,9 +1165,17 @@ class K3Gfx1250MonoDecodeRunner(K3MonoDecodeRunner):
             ids.data_ptr(),
             buffers["latent_fp4"].data_ptr(),
             buffers["latent_scales"].data_ptr(),
-            weight.w13.data_ptr(),
+            (
+                self.folded_experts[weight.w13.data_ptr()][0]
+                if local.fused_moe.folded
+                else weight.w13
+            ).data_ptr(),
             moe.experts.w13_weight_scale.data_ptr(),
-            weight.w2.data_ptr(),
+            (
+                self.folded_experts[weight.w13.data_ptr()][1]
+                if local.fused_moe.folded
+                else weight.w2
+            ).data_ptr(),
             moe.experts.w2_weight_scale.data_ptr(),
             buffers["fused_inter"].data_ptr(),
             buffers["fused_grouped"].data_ptr(),

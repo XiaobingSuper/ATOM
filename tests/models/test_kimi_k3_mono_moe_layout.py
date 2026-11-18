@@ -171,3 +171,82 @@ def test_the_early_moe_switch_defaults_off(monkeypatch):
     assert envs.ATOM_KIMI_MONO_MOE_EARLY is False
     monkeypatch.setenv("ATOM_KIMI_MONO_MOE_EARLY", "1")
     assert envs.ATOM_KIMI_MONO_MOE_EARLY is True
+
+
+@pytest.mark.parametrize("rows", (10, 40))
+def test_folded_and_one_issuer_fused_moes_are_builds_of_their_own(rows):
+    from atom.models.kimi_k3.mono.kernels.stages.moe_tdm_gfx1250 import build_moe
+
+    base = build_moe(rows, rolled=True, folded=False, one_issuer=False)
+    folded = build_moe(rows, rolled=True, folded=True, one_issuer=False)
+    one_issuer = build_moe(rows, rolled=True, folded=False, one_issuer=True)
+    assert folded.name == base.name + "_fo" and folded.folded
+    assert one_issuer.name == base.name + "_oi" and not one_issuer.folded
+    assert not base.folded
+    assert build_moe(rows, rolled=True, early=True, folded=True).name == base.name + "_ea_fo"
+
+
+@pytest.mark.parametrize("name", ("ATOM_KIMI_MONO_MOE_FOLDED", "ATOM_KIMI_MONO_MOE_ONE_ISSUER"))
+def test_the_folded_and_one_issuer_moe_switches_default_off(monkeypatch, name):
+    from atom.utils import envs
+
+    monkeypatch.delenv(name, raising=False)
+    assert getattr(envs, name) is False
+    monkeypatch.setenv(name, "1")
+    assert getattr(envs, name) is True
+
+
+def test_the_folded_gate_up_block_is_the_bytes_its_two_copies_read():
+    import torch
+
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    experts, tiles = 3, ml.LATENT // mt.K_TILE
+    gen = torch.Generator().manual_seed(0)
+    w13 = torch.randint(0, 256, (experts, 2 * 384, ml.LATENT // 2), dtype=torch.uint8, generator=gen)
+    w13s = torch.randint(0, 256, (experts, 2 * 384, ml.LATENT // 32), dtype=torch.uint8, generator=gen)
+    folded = mt.fold_gate_up(w13, w13s, chunk=2).reshape(-1)
+    weights, scales = w13.reshape(-1), w13s.reshape(-1)
+    group = tiles * mt.GROUP_TILE_BYTES
+    scale_row = tiles * mt.STEPS * 128
+    for expert in range(experts):
+        for task in range(mt.UP_BLOCKS):
+            for tile in range(tiles):
+                block = ((expert * mt.UP_BLOCKS + task) * tiles + tile) * mt.FOLD_BYTES
+                for g in range(mt.UP_GROUPS):
+                    src = (expert * mt.UP_BLOCKS * mt.UP_GROUPS + task * mt.UP_GROUPS + g) * group
+                    src += tile * mt.GROUP_TILE_BYTES
+                    dst = block + g * mt.GROUP_TILE_BYTES
+                    assert torch.equal(
+                        folded[dst : dst + mt.GROUP_TILE_BYTES], weights[src : src + mt.GROUP_TILE_BYTES]
+                    )
+                for w in range(mt.UP_WAVES):
+                    src = (expert * mt.UP_BLOCKS * mt.UP_WAVES + task * mt.UP_WAVES + w) * scale_row
+                    src += tile * mt.STEPS * 128
+                    dst = block + mt.SLOT_BYTES + w * mt.STEPS * 128
+                    assert torch.equal(folded[dst : dst + mt.STEPS * 128], scales[src : src + mt.STEPS * 128])
+
+
+def test_the_folded_down_tile_is_its_weights_then_its_scales():
+    import torch
+
+    from atom.models.kimi_k3.mono.kernels.stages import moe_tdm_gfx1250 as mt
+
+    experts = 2
+    gen = torch.Generator().manual_seed(1)
+    w2 = torch.randint(0, 256, (experts, ml.LATENT, 384 // 2), dtype=torch.uint8, generator=gen)
+    w2s = torch.randint(0, 256, (experts, ml.LATENT, 384 // 32), dtype=torch.uint8, generator=gen)
+    folded = mt.fold_down(w2, w2s).reshape(-1)
+    weights, scales = w2.reshape(-1), w2s.reshape(-1)
+    scale_bytes = mt.SCALE_WORDS * 4
+    for expert in range(experts):
+        for tile in range(mt.DOWN_TILES):
+            index = expert * mt.DOWN_TILES + tile
+            block = index * mt.FOLD_BYTES
+            assert torch.equal(
+                folded[block : block + mt.SLOT_BYTES], weights[index * mt.SLOT_BYTES : (index + 1) * mt.SLOT_BYTES]
+            )
+            assert torch.equal(
+                folded[block + mt.SLOT_BYTES : block + mt.FOLD_BYTES],
+                scales[index * scale_bytes : (index + 1) * scale_bytes],
+            )
