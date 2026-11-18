@@ -331,3 +331,23 @@ def test_wide_declaration_carries_one_tile_of_accumulators(cap80):
     assert declaration.lds.accumulator_tiles == 1
     assert len(declaration.token_tiles) == 5
     assert builder.declare_local(_plan(64), qlen=8, fp8=True).lds.accumulator_tiles == 4
+
+
+def test_projection_loads_a_tiles_token_operands_at_a_time_only_past_64_rows():
+    from atom.models.kimi_k3.mono.kernels.attention import kda_resident_gfx1250
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+
+    assert gemv_tdm.TILEWISE_ROWS == builder.WHOLE_ACCUMULATOR_ROWS == 64
+    for rows in range(1, 81):
+        options = kda_resident_gfx1250.tile_operands(rows)
+        assert options == ({"tilewise": True} if rows > 64 else {})
+
+
+@pytest.mark.parametrize("rows", (1, 48, 64))
+def test_tile_at_a_time_token_operands_refuse_rows_to_64(rows):
+    from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
+
+    with pytest.raises(ValueError, match="past 64 rows"):
+        gemv_tdm.project(
+            None, None, 7168, rows, None, 6284, 7168, [0, 16], 0, 0, tilewise=True
+        )

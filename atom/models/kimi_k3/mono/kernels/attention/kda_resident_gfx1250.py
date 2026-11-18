@@ -213,6 +213,12 @@ def _head_split(heads: int, blocks: int) -> int:
     return split if heads * split <= blocks else 1
 
 
+def tile_operands(rows: int) -> dict:
+    """``gemv_tdm.project``'s token-operand option for K1's in-projection:
+    a tile's operands at a time past 64 rows (five tiles), else today's."""
+    return {"tilewise": True} if rows > gemv_tdm.TILEWISE_ROWS else {}
+
+
 def build_resident_k1(
     plan: Gfx1250KimiBuildPlan,
     declaration: K1KernelDeclaration,
@@ -817,6 +823,7 @@ def build_resident_k1(
                         if spec.fp8_projection
                         else {}
                     ),
+                    **tile_operands(s),
                 )
                 gpu.barrier()
             else:

@@ -71,6 +71,8 @@ SLAB = TDM_SLAB
 ROW_STRIDE = TDM_ROW_STRIDE
 DEPTH = TDM_DEPTH
 FP8_DEPTH = TDM_FP8_DEPTH
+# ``project``'s tile-at-a-time token operands: only past this many rows
+TILEWISE_ROWS = 64
 WAVES = 8
 WAVE_COLUMNS = SLAB // WAVES
 WAVE_STEPS = WAVE_COLUMNS // K_PER_MMA
@@ -349,6 +351,7 @@ def project(
     x_cache_policy: int = 0,
     wide: bool = True,
     token_buffers: int = 2,
+    tilewise: bool = False,
 ):
     """``x[rows, k] @ w[task_rows[i]:+16, k]^T`` for each task, as v8 f32 WMMA
     accumulators ``[task][16-token tile]``. ``w`` has ``w_rows`` rows of ``k``
@@ -368,7 +371,11 @@ def project(
     a CU has in flight.
 
     ``token_buffers``: token slabs resident in LDS (``x_words`` grows with
-    it), so that many are in flight once ``x`` is first read."""
+    it), so that many are in flight once ``x`` is first read.
+
+    ``tilewise`` (rolled, past 64 rows): a slab's token operands loaded a tile
+    at a time, before that tile's WMMAs, not every tile's up front -- 16
+    VGPRs live instead of 16 a tile."""
 
     if k % SLAB:
         raise ValueError(f"TDM GEMV needs K divisible by {SLAB}, got {k}")
@@ -377,6 +384,10 @@ def project(
     if fp8 and slabs > GFX1250.wave_size:
         raise ValueError(f"FP8 TDM GEMV holds one slab's scales a lane, K={k}")
     tasks = len(task_rows)
+    if tilewise and rows <= TILEWISE_ROWS:
+        raise ValueError(
+            f"tile-at-a-time token operands serve past {TILEWISE_ROWS} rows"
+        )
     if _ROLLED_UNROLL and wide and token_buffers == 2 and 1 + 2 * tasks <= WAVES:
         return _project_rolled(
             lds,
@@ -393,6 +404,7 @@ def project(
             depth,
             prologue,
             x_cache_policy,
+            tilewise,
         )
     tiles = (rows + ROWS - 1) // ROWS
     token_words = rows * ROW_STRIDE // 2
@@ -615,6 +627,17 @@ def _rolled_roles(role, s, slabs, tasks, depth, issue_tokens, issue_weight):
         _rolled_weight_step((role + s) & 1, s, slabs, depth, issue_weight)
 
 
+def _tile_operand(tokens, tile, rows, wave, lane):
+    """Token tile ``tile``'s operands of a slab, its rows past ``rows``
+    repeating its last."""
+    return _operand(
+        tokens,
+        tile * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tile * ROWS) - 1),
+        wave,
+        lane,
+    )
+
+
 def _rolled_last_tile(accs, pend, tasks, tiles):
     """The last token tile's WMMAs of the slab whose operands ``pend`` holds:
     each task's weights a step, then the tile's activations."""
@@ -645,6 +668,7 @@ def _project_rolled(
     depth,
     prologue,
     x_cache_policy,
+    tilewise=False,
 ):
     """``project`` (wide) with its slab loop a runtime loop. Wave 0 copies
     every token slab and waves ``1 + 2 t`` and ``2 + 2 t`` task ``t``'s
@@ -793,16 +817,13 @@ def _project_rolled(
         ]
         slab_tokens = lds + (s % 2) * token_words
         activations = [
-            _operand(
-                slab_tokens,
-                tl * ROWS + fx.min(lane % ROWS, min(ROWS, rows - tl * ROWS) - 1),
-                wave,
-                lane,
-            )
+            None if tilewise else _tile_operand(slab_tokens, tl, rows, wave, lane)
             for tl in range(tiles)
         ]
         updated = _rolled_last_tile(accs, pend, tasks, tiles)
         for tl in range_constexpr(tiles - 1):
+            if const_expr(tilewise):
+                activations[tl] = _tile_operand(slab_tokens, tl, rows, wave, lane)
             for tk in range_constexpr(tasks):
                 acc = updated[tk * tiles + tl]
                 for st in range_constexpr(WAVE_STEPS):
@@ -810,6 +831,10 @@ def _project_rolled(
                         slab_weights[tk][st], activations[tl][st], acc, GFX1250
                     )
                 updated[tk * tiles + tl] = acc
+        if const_expr(tilewise):
+            activations[tiles - 1] = _tile_operand(
+                slab_tokens, tiles - 1, rows, wave, lane
+            )
         pend = [
             slab_weights[tk][st] for tk in range(tasks) for st in range(WAVE_STEPS)
         ] + list(activations[tiles - 1])
