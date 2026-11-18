@@ -925,7 +925,7 @@ def build_moe(
     ring: int | None = None,
     resident: int | None = None,
     refill: bool | None = None,
-    defer: bool | None = None,
+    defer: int | None = None,
     prefetch: int | None = None,
     latent_first: bool | None = None,
 ) -> MoeKernel:
@@ -961,7 +961,10 @@ def build_moe(
     leaves a task's first M tile's epilogue (its SiTU in ``red``) to the next
     task's first K tile, past that tile's issue, so the ring is refilled
     first; the last task's runs past the loop. Its flag still goes out a K
-    tile into the next task (``publish_at`` at least 1).
+    tile into the next task (``publish_at`` at least 1). ``defer=2``: the
+    issuing waves, idle past their issue, run it (the 6 MMA waves' SiTU
+    still left in ``red``) -- the issuer of weights two of its three
+    64-row blocks, the other one.
 
     ``prefetch`` (default ``ATOM_KIMI_MONO_FUSED_MOE_PREFETCH``), where a
     token's last K tiles are read from global memory: the first M tile's
@@ -978,7 +981,7 @@ def build_moe(
     refill = bool(refill) and rolled
     if defer is None:
         defer = envs.ATOM_KIMI_MONO_FUSED_MOE_DEFER
-    defer = bool(defer) and rolled
+    defer = int(defer) if rolled else 0
     if defer and publish_at < 1:
         raise ValueError("a deferred epilogue needs its flag published past K tile 0")
     if prefetch is None:
@@ -1024,7 +1027,7 @@ def build_moe(
         + (f"_r{ring}" if ring != RING else "")
         + (f"_k{resident}" if resident != k_tiles else "")
         + ("_e" if refill else "")
-        + ("_d" if defer else "")
+        + (f"_d{defer}" if defer else "")
         + (f"_pf{prefetch}" if prefetch else "")
         + ("_lf" if latent_first else "")
         + ("_rl" if rolled else "")
@@ -1281,22 +1284,34 @@ def build_moe(
                 [fx.ptr_load(scale + step * 32) for step in range(STEPS)],
             )
 
+        def deferred_block_epilogue(first, picks_n, task_block, pair):
+            _epilogue(
+                lds,
+                inter,
+                0,
+                lds["picks"] + first,
+                picks_n,
+                task_block,
+                pair,
+                0,
+                lane,
+                in_row=True,
+                pairs=UP_ROWS // 64,
+                activated=True,
+            )
+
         def deferred_epilogue(first, picks_n, task_block):
-            if wave < UP_ROWS // 64:
-                _epilogue(
-                    lds,
-                    inter,
-                    0,
-                    lds["picks"] + first,
-                    picks_n,
-                    task_block,
-                    wave,
-                    0,
-                    lane,
-                    in_row=True,
-                    pairs=UP_ROWS // 64,
-                    activated=True,
-                )
+            if const_expr(defer == 2):
+                assert UP_ROWS // 64 == 3 and WEIGHT_ISSUER + 1 == SCALE_ISSUER
+                if wave >= WEIGHT_ISSUER:
+                    deferred_block_epilogue(
+                        first, picks_n, task_block, wave - WEIGHT_ISSUER
+                    )
+                if wave == WEIGHT_ISSUER:
+                    deferred_block_epilogue(first, picks_n, task_block, fx.Int32(2))
+            else:
+                if wave < UP_ROWS // 64:
+                    deferred_block_epilogue(first, picks_n, task_block, wave)
 
         def global_fragments(token, g_tile):
             return [

@@ -765,7 +765,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_REFILL", "0")
     ),
     # Kimi-K3 gfx1250 mono: the fused MoE runs a task's first M tile's
-    # epilogue in the next task's first K tile, past its weights' issue.
+    # epilogue in the next task's first K tile, past its weights' issue (1:
+    # on the MMA waves, 2: on the two issuing waves).
     "ATOM_KIMI_MONO_FUSED_MOE_DEFER": lambda: int(
         os.getenv("ATOM_KIMI_MONO_FUSED_MOE_DEFER", "0")
     ),
