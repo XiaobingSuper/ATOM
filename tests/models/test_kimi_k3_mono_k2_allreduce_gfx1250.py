@@ -8,7 +8,7 @@ from atom.models.kimi_k3.mono.config import HIDDEN, LATENT
 from atom.models.kimi_k3.mono.kernels.stages import k2_allreduce_gfx1250 as ar
 
 
-WIDE = (50, 55, 60, 64)
+WIDE = (50, 55, 60, 64, 72, 73, 74, 76, 80)
 
 
 def _rows(*rows):
@@ -66,7 +66,13 @@ def test_gathering_all_reduce_takes_a_line_a_thread(rows):
     kernel = ar.build_gather_allreduce(8, rows)
     assert kernel.abi is ar.GATHER_ALLREDUCE_ABI
     lines = ar.allreduce7_lines(rows)
-    if lines <= ar.MAX_CTAS * ar.THREADS:
+    if rows > 73:
+        # seven-element lines in rounds, the routed ones all in round 0
+        assert kernel.grid == (ar.MAX_CTAS,) and kernel.block == (ar.THREADS,)
+        assert "_gather_allreduce7r2_" in kernel.name
+        assert rows * ar.LINE7_ROUTED <= ar.MAX_CTAS * ar.THREADS
+        assert lines <= 2 * ar.MAX_CTAS * ar.THREADS
+    elif lines <= ar.MAX_CTAS * ar.THREADS:
         # seven-element lines; a CTA's routed lines all of one token
         assert lines * ar.LINE7_ELEMENTS == rows * (LATENT + HIDDEN)
         assert kernel.block == (ar.THREADS,)
@@ -109,7 +115,7 @@ def test_o_proj_all_reduce_takes_a_line_a_thread_a_round():
     from atom.models.kimi_k3.mono.kernels.stages import k2_oproj_ar_gfx1250 as oar
 
     assert all(oar.line_rounds(rows) == 1 for rows in range(1, 49))
-    assert all(oar.line_rounds(rows) == 2 for rows in range(49, 65))
+    assert all(oar.line_rounds(rows) == 2 for rows in range(49, 81))
     assert oar.triples(64) * oar.CTA_PAIRS <= 2 * oar.THREADS
 
 

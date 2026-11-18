@@ -56,9 +56,13 @@ def test_lds_regions_fit_and_never_overlap_while_live(rows):
     stage = 2 * tdm_task_words()
     stages = layout.depth + 1
     assert layout.words == weights + stages * stage
-    # the epilogue's sums sit on weight stages the last slab does not read
     tiles = -(-rows // 16)
     red_end = layout.red + 2 * tiles * tail.ACCUMULATOR_WORDS
+    if layout.red_on_tokens:
+        # five tiles: the sums over the token slabs, read by then
+        assert tiles == 5 and layout.red == layout.gemv and red_end <= weights
+        return
+    # the epilogue's sums sit on weight stages the last slab does not read
     assert weights <= layout.red and red_end <= layout.words
     last = weights + (tail.SLABS - 1) % stages * stage
     assert red_end <= last or layout.red >= last + stage
@@ -72,7 +76,7 @@ def test_norm_reduces_in_aiter_rmsnorm2d_thread_order():
 
 
 @pytest.mark.parametrize("identity", (False, True))
-@pytest.mark.parametrize("rows", (1, 20, 40, 42, 43, 50, 55, 60, 64))
+@pytest.mark.parametrize("rows", (1, 20, 40, 42, 43, 50, 55, 60, 64, 72, 76, 80))
 def test_builder_launches_the_grid_on_the_tail_abi(rows, identity):
     kernel = tail.build_k2_tail(8, rows, 1e-5, identity_routes=identity)
     assert kernel.abi is tail.TAIL_ABI

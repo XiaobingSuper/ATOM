@@ -82,7 +82,7 @@ def test_fp8_shared_down_is_the_grouped_moe_finish_only():
         build_packed_finish(_plan(40), fp8_shared_down=True)
 
 
-@pytest.mark.parametrize("rows", _rows(20, 40, 48, 50, 55, 60, 63, 64))
+@pytest.mark.parametrize("rows", _rows(20, 40, 48, 50, 55, 60, 63, 64, 72, 76, 80))
 def test_precomputed_herd_scratch_holds_every_output_apart(rows):
     from atom.models.kimi_k3.mono.kernels.stages.k2_finish_persistent_gfx1250 import (
         herd_scratch_layout,
@@ -135,7 +135,7 @@ def test_herd_finalize_keeps_its_48_row_layout_and_grows_past_it():
         moe_gfx1250.herd_finalize_words(cap + 1)
 
 
-@pytest.mark.parametrize("rows", _rows(48, 62, 63, 64))
+@pytest.mark.parametrize("rows", _rows(48, 62, 63, 64, 72, 80))
 @pytest.mark.parametrize("parallel", (False, True))
 def test_the_herd_cta_s_shared_down_tasks_find_takers(rows, parallel):
     candidate = build_packed_finish(
