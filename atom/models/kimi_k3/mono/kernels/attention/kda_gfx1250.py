@@ -17,6 +17,7 @@ from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as rocdl_dialect
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr.rocdl import cluster as hw_cluster
 from flydsl.expr.typing import T, as_ir_value
 
 from atom.models.kimi_k3.mono.kernels.attention.layout import (
@@ -54,6 +55,8 @@ from atom.mono.device.ops import (
 from atom.mono.plan.architecture import GFX1250
 
 LOG2E = 1.0 / math.log(2.0)
+# buffer cache policy scope field SCOPE_SE
+CM_CLUSTER = 8
 HEADS = 12
 HEAD_DIM = GATE_K
 STATE_CHUNKS = 8
@@ -794,6 +797,56 @@ def _head_norm_exchange(c, request, head, share):
 
 
 @traced
+def _head_norm_exchange_cluster(c, request, head, share):
+    """``_head_norm_exchange`` through the shares' hardware cluster: the own
+    sums stored at SE scope and drained, the cluster barrier signalled at
+    once, waited on only before the others' sums are read."""
+
+    L, tid = c["L"], c["tid"]
+    split = c["head_split"]
+    own = STATE_CHUNKS // split
+    onrm = rsrc(_scratch_region(c, "onrm"))
+    base = (request * HEADS + head) * L * STATE_CHUNKS
+    if tid < L * own:
+        token = tid // own
+        chunk = share * own + tid % own
+        square_sum = fx.Float32(0.0)
+        for row in range_constexpr(ROWS):
+            written = fx.ptr_load(c["ol"] + token * HEAD_DIM + chunk * ROWS + row)
+            square_sum = square_sum + written * written
+        fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + chunk)
+        bo.buffer_store(
+            square_sum,
+            onrm,
+            (base + token * STATE_CHUNKS + chunk) * 2,
+            cache_modifier=CM_CLUSTER,
+        )
+    # Wave 0 signals for the CTA, so every publisher must sit in it.
+    if const_expr(L * own > GFX1250.wave_size):
+        gpu.barrier()
+    rocdl.s_wait_storecnt(0)
+    hw_cluster.cluster_signal_once_per_wg()
+    others = STATE_CHUNKS - own
+    item = fx.min(tid, L * others - 1)
+    token = item // others
+    index = item % others
+    chunk = (index < share * own).select(index, index + own)
+    hw_cluster.cluster_wait()
+    square_sum = fx.Float32(
+        bo.buffer_load(
+            onrm,
+            (base + token * STATE_CHUNKS + chunk) * 2,
+            vec_width=1,
+            dtype=T.f32,
+            cache_modifier=CM_CLUSTER,
+        )
+    )
+    if tid < L * others:
+        fx.ptr_store(square_sum, c["head_onrm"] + token * STATE_CHUNKS + chunk)
+    gpu.barrier()
+
+
+@traced
 def kda_head(c, request, head, share=None):
     """One plain-decode request/head without cross-CTA QK/ONRM handoffs.
 
@@ -973,7 +1026,10 @@ def kda_head(c, request, head, share=None):
     kda_recur_head(c, metadata, request, head)
     tdm_timeline.stamp(tdm_timeline.HEAD_RECUR)
     if const_expr(split > 1):
-        _head_norm_exchange(c, request, head, share)
+        if const_expr(c.get("head_cluster", False)):
+            _head_norm_exchange_cluster(c, request, head, share)
+        else:
+            _head_norm_exchange(c, request, head, share)
         tdm_timeline.stamp(tdm_timeline.HEAD_EXCHANGED)
         for stores_conv, conv, new_values in deferred:
             if stores_conv:

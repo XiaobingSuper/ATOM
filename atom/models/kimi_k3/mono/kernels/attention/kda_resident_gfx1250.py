@@ -37,6 +37,7 @@ from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
 from atom.models.kimi_k3.mono.kernels.stages import gemv_tdm_gfx1250 as gemv_tdm
 from atom.models.kimi_k3.mono.kernels.stages import tdm_timeline
 from atom.models.kimi_k3.mono.kernels.stages.gemv_layout import (
+    TDM_CLUSTER,
     TDM_SPLIT_GROUP,
     TDM_SPLIT_TILE_WORDS,
     tdm_split_out_word,
@@ -189,6 +190,20 @@ def _gate_ilp() -> bool:
     return envs.ATOM_KIMI_MONO_K1_GATE_ILP
 
 
+def _head_cluster(spec, head_split: int, head_tasks: int, blocks: int) -> bool:
+    """The cluster-local norm exchange, where a split head's shares (adjacent
+    tasks from ``kda0``) all land in one TDM launch cluster and every cluster
+    with a head share runs only head shares (one barrier each)."""
+    return (
+        envs.ATOM_KIMI_MONO_K1_HEAD_CLUSTER
+        and spec.tdm_projection
+        and head_split in (2, 4)
+        and spec.kda0 % TDM_CLUSTER == 0
+        and head_tasks % TDM_CLUSTER == 0
+        and head_tasks <= blocks
+    )
+
+
 def _auto_head_split(heads: int, blocks: int) -> int:
     """The most of 4, 2 CTAs a head whose parts all fit the grid at once."""
     return next((count for count in (4, 2) if heads * count <= blocks), 1)
@@ -229,6 +244,7 @@ def build_resident_k1(
         _state_prefetch(),
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
+        envs.ATOM_KIMI_MONO_K1_HEAD_CLUSTER,
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
@@ -259,6 +275,9 @@ def build_resident_k1(
     whole_heads = qlen == 1 or task_count > declaration.blocks
     head_split = (
         _head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
+    )
+    head_cluster = whole_heads and _head_cluster(
+        spec, head_split, (s // qlen) * HEADS * head_split, declaration.blocks
     )
     auto_split = (
         _auto_head_split((s // qlen) * HEADS, declaration.blocks) if whole_heads else 1
@@ -295,6 +314,7 @@ def build_resident_k1(
         _state_prefetch(),
         head_split,
         _gate_ilp(),
+        head_cluster,
     )
     timeline = tdm_timeline.key()
     name = (
@@ -306,6 +326,7 @@ def build_resident_k1(
         f"{'' if _head_preload() else '_nohp'}{'' if _state_prefetch() else '_nosp'}"
         f"{f'_hs{head_split}' if head_split != auto_split else ''}"
         f"{'' if _gate_ilp() else '_nogi'}"
+        f"{'_hc' if head_cluster else ''}"
         f"{tdm_timeline.suffix()}"
     )
 
@@ -935,6 +956,7 @@ def build_resident_k1(
             "head_preload": _head_preload(),
             "head_split": head_split,
             "gate_ilp": _gate_ilp(),
+            "head_cluster": head_cluster,
             "red": smem.red.ptr,
             "tls": smem.tls.ptr,
             "fa": recurrence.fa.ptr,
