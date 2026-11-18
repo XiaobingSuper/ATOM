@@ -484,11 +484,26 @@ def front_split_tasks(
     )
 
 
+# The BF16 weight slabs in flight: four, or past 75 rows (where their token
+# slabs leave no room for a fifth stage) three.
+FRONT_DEPTH = 4
+FRONT_DEEP_ROWS = 75
+
+
+def front_depth(rows: int) -> int:
+    return FRONT_DEPTH if rows <= FRONT_DEEP_ROWS else FRONT_DEPTH - 1
+
+
+def front_lds_words(rows: int, depth: int) -> int:
+    """The replicated front's LDS words: its GEMV's and the token groups'."""
+    return sum(tdm_lds_words(rows, 2, depth=depth)) + rows * 16
+
+
 def build_replicated_front(
     plan: Gfx1250KimiBuildPlan,
     fp8_shared: bool = False,
     wide: bool = True,
-    depth: int = 4,
+    depth: int | None = None,
     fp4_latent: bool = False,
     split: bool | None = None,
 ) -> K2ReplicatedFrontKernel:
@@ -512,6 +527,8 @@ def build_replicated_front(
     if PAIRS > plan.blocks:
         raise ValueError(f"replicated K2 front needs {PAIRS} CTAs")
     rows = plan.tokens
+    if depth is None:
+        depth = front_depth(rows)
     tiles = (rows + ROWS - 1) // ROWS
     staged = sum(tdm_lds_words(rows, 2, depth=depth))
     assert staged - tdm_lds_words(rows, 2)[0] >= 2 * tiles * ACCUMULATOR_WORDS

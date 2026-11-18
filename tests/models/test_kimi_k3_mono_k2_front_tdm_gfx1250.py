@@ -1,3 +1,5 @@
+import sys
+
 import pytest
 
 from atom.models.kimi_k3.mono.kernels.execution_plan import Gfx1250KimiBuildPlan
@@ -78,3 +80,42 @@ def test_herd_candidates_feed_only_the_grouped_moe_finish():
         _plan(16), include_routed=False, replicated_front=True, herd=True
     )
     assert kernel.name.endswith("_rf_herd")
+
+
+@pytest.fixture
+def cap80(monkeypatch):
+    """The gfx1250 token cap raised to 80 rows wherever it was imported."""
+    for module in list(sys.modules.values()):
+        names = getattr(module, "__dict__", {})
+        if str(names.get("__name__", "")).startswith("atom.") and (
+            "GFX1250_MAX_TOKENS" in names
+        ):
+            monkeypatch.setattr(module, "GFX1250_MAX_TOKENS", 80)
+
+
+def test_front_keeps_four_weight_slabs_in_flight_to_75_rows():
+    limit = 320 * 1024
+    for rows in range(1, 81):
+        depth = front.front_depth(rows)
+        assert depth == (4 if rows <= 75 else 3)
+        assert 4 * front.front_lds_words(rows, depth) <= limit
+    # where a fifth stage stops fitting
+    assert 4 * front.front_lds_words(75, 4) <= limit
+    assert 4 * front.front_lds_words(76, 4) > limit
+    assert 4 * front.front_lds_words(80, 3) == 304640
+
+
+@pytest.mark.parametrize("rows", (48, 64))
+def test_front_to_64_rows_is_todays_depth_4_build(rows):
+    assert front.build_replicated_front(_plan(rows)).name == (
+        front.build_replicated_front(_plan(rows), depth=4).name
+    )
+    assert "_d4_" in front.build_replicated_front(_plan(rows), fp8_shared=True).name
+
+
+@pytest.mark.parametrize(("rows", "depth"), ((72, 4), (75, 4), (76, 3), (80, 3)))
+@pytest.mark.parametrize("fp8_shared", (False, True))
+def test_wide_front_builds_at_its_depth(cap80, rows, depth, fp8_shared):
+    kernel = front.build_replicated_front(_plan(rows), fp8_shared=fp8_shared)
+    assert f"_d{depth}_s{rows}" in kernel.name
+    assert kernel.grid == (front.PAIRS,)
