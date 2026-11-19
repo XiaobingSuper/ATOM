@@ -45,6 +45,64 @@ from atom.model_ops.minimax_m3.prefill_policy import (
 TOPK = 16
 
 
+def test_parallel_prefill_nvfp4_scratch_matches_mixed_long_prefill(monkeypatch):
+    """The narrow NVFP4 output table cannot also hold all partial winners."""
+    qlens = [1823, 30848]
+    prefixes = [163712, 128]
+    total_q = sum(qlens)
+    max_block = max(
+        (prefix + qlen + SPARSE_BLOCK_SIZE - 1) // SPARSE_BLOCK_SIZE
+        for qlen, prefix in zip(qlens, prefixes)
+    )
+    num_groups = (
+        max_block + PREFILL_TOPK_MAX_BLOCK_SIZE_K - 1
+    ) // PREFILL_TOPK_MAX_BLOCK_SIZE_K
+    num_partial = num_groups * TOPK
+    sparse_bt = torch.empty(
+        (total_q, TOPK * m.NVFP4_PAGES_PER_BLOCK), dtype=torch.int32
+    )
+    allocated = []
+    real_empty = torch.empty
+
+    def record_empty(*shape, **kwargs):
+        out = real_empty(*shape, **kwargs)
+        allocated.append(out)
+        return out
+
+    monkeypatch.setattr(m.torch, "empty", record_empty)
+    score = real_empty((1, total_q, max_block), device="meta")
+    topk_idx = real_empty((1, total_q, TOPK), device="meta", dtype=torch.int32)
+    row_starts = real_empty((3,), device="meta", dtype=torch.int32)
+    row_prefix = real_empty((2,), device="meta", dtype=torch.int32)
+    block_table = real_empty((2, max_block), device="meta", dtype=torch.int32)
+
+    class NoLaunch:
+        def __getitem__(self, _grid):
+            return lambda *_args, **_kwargs: None
+
+    monkeypatch.setattr(m, "_prefill_partial_topk_kernel", NoLaunch())
+    monkeypatch.setattr(m, "_prefill_merge_topk_kernel", NoLaunch())
+    m._launch_parallel_prefill_selector(
+        score,
+        topk_idx,
+        row_starts,
+        row_prefix,
+        block_table,
+        (sparse_bt, sparse_bt, max_block, sparse_bt.stride(0)),
+        max(qlens),
+        TOPK,
+        0,
+        1,
+        m.NVFP4_PAGES_PER_BLOCK,
+        m.NVFP4_PAGES_PER_BLOCK,
+    )
+
+    assert max_block == 1294
+    assert num_groups == 2
+    assert allocated[-1].shape == (1, total_q, num_partial)
+    assert allocated[-1].dtype == torch.int64
+
+
 @pytest.mark.parametrize(
     "arch,dtype,want",
     [

@@ -1109,8 +1109,20 @@ def _launch_parallel_prefill_selector(
     num_groups = triton.cdiv(max_block, PREFILL_TOPK_MAX_BLOCK_SIZE_K)
     block_size_t = triton.next_power_of_2(topk)
     sparse_bt, sparse_ctx, stride_bt_b, stride_sbt_n = emit_args
-    partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
-    assert num_groups * block_size_t <= partial_keys.shape[2]
+    num_partial = num_groups * block_size_t
+    partial_shape = (num_idx_heads, total_q, num_partial)
+    # The page-16 table has enough storage to double as the partial-key
+    # workspace. The NVFP4 page-128 table is 8x narrower, so keep its output
+    # geometry and allocate the missing selector scratch independently.
+    if (
+        sparse_bt.numel() * sparse_bt.element_size()
+        >= num_idx_heads * total_q * num_partial * 8
+    ):
+        partial_keys = sparse_bt.view(torch.int64).view(num_idx_heads, total_q, -1)
+    else:
+        partial_keys = torch.empty(
+            partial_shape, dtype=torch.int64, device=sparse_bt.device
+        )
     _prefill_partial_topk_kernel[(rows_per_req, batch * num_idx_heads, num_groups)](
         score,
         partial_keys,
@@ -1127,7 +1139,6 @@ def _launch_parallel_prefill_selector(
         num_warps=1,
     )
 
-    num_partial = num_groups * block_size_t
     _prefill_merge_topk_kernel[(rows_per_req, batch, num_idx_heads)](
         partial_keys,
         topk_idx,
