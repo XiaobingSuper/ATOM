@@ -239,6 +239,7 @@ def build_resident_k1(
         _state_prefetch(),
         envs.ATOM_KIMI_MONO_K1_HEAD_SPLIT,
         _gate_ilp(),
+        energy.suffix(),
     )
     cached = _BUILDS.get(cache_key)
     if cached is not None:
