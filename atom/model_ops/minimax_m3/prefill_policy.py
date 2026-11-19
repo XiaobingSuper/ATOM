@@ -215,7 +215,8 @@ def prefill_score_config(
     return PrefillScoreConfig(
         block_size_q=tile_q,
         chunk_blocks=_cdiv(max_block, chunks),
-        num_warps=4,
+        # The 4-warp build (505 VGPRs, SGPRs spilled to VGPR lanes) hangs the GPU at long prefill.
+        num_warps=8,
         num_stages=1,
         store_group=1,
         prefetch_pages=False,

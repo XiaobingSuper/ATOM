@@ -38,7 +38,8 @@ def q256(chunk_blocks: int) -> PrefillScoreConfig:
     return PrefillScoreConfig(
         block_size_q=256,
         chunk_blocks=chunk_blocks,
-        num_warps=4,
+        # Four warps hangs long gfx1250 prefill; keep the mandatory workaround pinned.
+        num_warps=8,
         num_stages=1,
         store_group=1,
         prefetch_pages=False,

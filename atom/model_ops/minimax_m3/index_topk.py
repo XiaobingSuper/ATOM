@@ -42,6 +42,8 @@ from .decode_score_policy import (
     use_transposed_decode_score,
 )
 
+from atom.model_ops.minimax_m3.nvfp4_kernels.nvfp4 import nvfp4_load_even_odd
+
 try:
     # aiter's chunk-narrowing per-row selector: same forced-block pins and tie
     # direction as the Triton one below, same selection on every shape tried.
@@ -86,7 +88,12 @@ def _prefill_score_launch_config(dtype: torch.dtype) -> tuple[int, int]:
     # For FP8 on wave32, a single pipeline stage cuts LDS/register pressure
     # enough that four warps outperform eight on long-context prefill. Keep
     # the BF16 configuration separate: it does not have the same tradeoff.
-    return (4, 1) if dtype in _FP8_DTYPES else (8, SCORE_NUM_STAGES)
+    if dtype in _FP8_DTYPES:
+        return 4, 1
+    if dtype == torch.uint8:
+        # The FP4 index payload: avoid gfx1250 VGPR spills.
+        return 8, 1
+    return 8, SCORE_NUM_STAGES
 
 
 # Bounds on the decode score split, one per end of the batch range. MIN_BLOCKS
@@ -108,6 +115,9 @@ DECODE_SCORE_MIN_BLOCKS = 3
 # (`SPARSE_BLOCK_SIZE // ASM_PAGE_SIZE`); `tests/test_minimax_m3_page_geometry.py`
 # asserts that rather than leaving it to a comment.
 PAGES_PER_SPARSE_BLOCK = 8
+# Pages per logical 128-block of the NVFP4 sparse KV pool (page 128): the
+# emitted table is then the FlyDSL paged decode's page-128 table.
+NVFP4_PAGES_PER_BLOCK = 1
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +131,11 @@ PAGES_PER_SPARSE_BLOCK = 8
 # KV cache view [num_phys16*NUM_KV_HEADS, 1, ...], which is also why the 8 pages
 # of one 128-block are NUM_KV_HEADS apart rather than adjacent. NUM_KV_HEADS ==
 # 1 reduces to the original per-token emit.
+#
+# pages_per_block == block_page_stride == 1 emits the page-128 table of the
+# NVFP4 sparse KV pool instead (one page a block, `NVFP4_PAGES_PER_BLOCK`):
+# exactly `sparse_attn_nvfp4.nvfp4_page_table`, a row at or below length 0
+# included (length 0, no page).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _emit_sparse_block_table_row(
@@ -146,6 +161,11 @@ def _emit_sparse_block_table_row(
     # The selector already caps selection at self_blk; the upper bound is
     # defensive, and keeps an out-of-range id from indexing the block table.
     bt_valid = (bt_blk >= 0) & (bt_blk <= self_blk)
+    if pages_per_block == 1:
+        # The NVFP4 table: a row before its request's first token (a graph pad
+        # request shorter than the verify window) selects nothing, whatever
+        # its list holds.
+        bt_valid = bt_valid & (causal_len > 0)
     bt_is_tail = bt_valid & (bt_blk == self_blk)
     bt_is_full = bt_valid & (bt_blk < self_blk)
     bt_n_full = tl.sum(bt_is_full.to(tl.int32), axis=0)
@@ -185,6 +205,9 @@ def _emit_sparse_block_table_row(
     bt_ctx = tl.where(
         bt_has_tail, bt_ctx, tl.minimum(bt_n_valid * block_size, causal_len)
     )
+    if pages_per_block == 1:
+        # ... and attends nothing.
+        bt_ctx = tl.maximum(bt_ctx, 0)
     tl.store(sctx_ptr, bt_ctx)
 
 
@@ -449,7 +472,8 @@ def _index_block_score_page(
 @triton.jit
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim] (FP4: payload [.., D/2])
+    iks_ptr,  # FP4 only: index-K scales [num_blocks, 128, D/16] (else unused)
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     cu_seqlens,  # [batch+1] query start offsets
@@ -465,6 +489,8 @@ def _index_block_score_kernel(
     stride_ik_blk,
     stride_ik_pos,
     stride_ik_d,
+    stride_iks_blk,
+    stride_iks_pos,
     stride_s_h,
     stride_s_n,
     stride_s_k,
@@ -474,6 +500,7 @@ def _index_block_score_kernel(
     STORE_GROUP: tl.constexpr = 1,
     PREFETCH_PAGES: tl.constexpr = False,
     POST_REDUCE_SCALE: tl.constexpr = False,
+    IS_FP4: tl.constexpr = False,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -500,6 +527,26 @@ def _index_block_score_kernel(
         mask=(_q_ptrs_0[:, None] < (q_len)),
         other=0.0,
     )
+    if IS_FP4:
+        # Even / odd head dims as fp16, matching the FP4 cache's de-interleaved
+        # load: the score is the even-dim dot plus the odd-dim dot.
+        h2 = tl.arange(0, head_dim // 2) * 2
+        q_base = (
+            q_ptr
+            + seq_start * stride_q_n
+            + pid_h * stride_q_h
+            + _q_ptrs_0[:, None] * stride_q_n
+        )
+        q_m = _q_ptrs_0[:, None] < q_len
+        q_e = tl.load(q_base + h2[None, :] * stride_q_d, mask=q_m, other=0.0).to(
+            tl.float16
+        )
+        q_o = tl.load(q_base + (h2 + 1)[None, :] * stride_q_d, mask=q_m, other=0.0).to(
+            tl.float16
+        )
+    else:
+        q_e = q
+        q_o = q
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -516,93 +563,141 @@ def _index_block_score_kernel(
     if blk_lo >= blk_end:
         return
     blk_hi = min(blk_lo + chunk_blocks, blk_end)
-    q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
-    q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
-    if STORE_GROUP == 1:
+    if IS_FP4:
         for blk in tl.range(blk_lo, blk_hi):
+            i = blk * BLOCK_SIZE_K
             page = tl.load(bt_row + blk).to(tl.int64)
-            score = _index_block_score_page(
-                q,
-                ik_cache_ptr,
-                page,
-                blk,
-                off_q,
-                off_k,
-                off_d,
-                q_start,
-                sm_scale_log2e,
-                stride_ik_blk,
-                stride_ik_pos,
-                stride_ik_d,
-                BLOCK_SIZE_K,
-                POST_REDUCE_SCALE,
-            )
-            s_ptrs = (
-                score_ptr + pid_h * stride_s_h + q_row * stride_s_n + blk * stride_s_k
-            )
-            tl.store(s_ptrs, score, mask=q_store_mask)
-    else:
-        tl.static_assert(STORE_GROUP == 4)
-        slots = tl.arange(0, STORE_GROUP)
-        num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
-        for group in tl.range(0, num_groups):
-            group_start = blk_lo + group * STORE_GROUP
-            if PREFETCH_PAGES:
-                pages = (
-                    tl.load(bt_row + group_start).to(tl.int64),
-                    tl.load(
-                        bt_row + group_start + 1,
-                        mask=group_start + 1 < blk_hi,
-                        other=0,
-                    ).to(tl.int64),
-                    tl.load(
-                        bt_row + group_start + 2,
-                        mask=group_start + 2 < blk_hi,
-                        other=0,
-                    ).to(tl.int64),
-                    tl.load(
-                        bt_row + group_start + 3,
-                        mask=group_start + 3 < blk_hi,
-                        other=0,
-                    ).to(tl.int64),
+            pos = i + off_k
+            # index-K for this page: [BLOCK_SIZE_D, BLOCK_SIZE_K] (transposed)
+            # we don't need masked load for K, because KV cache ensures
+            # allocation is multiple of BLOCK_SIZE_K.
+            # for tokens beyond seqlen, they will be masked in qk later.
+            if IS_FP4:
+                k_e, k_o = nvfp4_load_even_odd(
+                    ik_cache_ptr,
+                    iks_ptr,
+                    page * stride_ik_blk + off_k * stride_ik_pos,
+                    page * stride_iks_blk + off_k * stride_iks_pos,
+                    off_k >= 0,
+                    head_dim,
                 )
-            scores = tl.full((BLOCK_SIZE_Q, STORE_GROUP), float("-inf"), tl.float32)
-            for slot in tl.static_range(0, STORE_GROUP):
-                blk = group_start + slot
-                if blk < blk_hi:
-                    if PREFETCH_PAGES:
-                        page = pages[slot]
-                    else:
-                        page = tl.load(bt_row + blk).to(tl.int64)
-                    score = _index_block_score_page(
-                        q,
-                        ik_cache_ptr,
-                        page,
-                        blk,
-                        off_q,
-                        off_k,
-                        off_d,
-                        q_start,
-                        sm_scale_log2e,
-                        stride_ik_blk,
-                        stride_ik_pos,
-                        stride_ik_d,
-                        BLOCK_SIZE_K,
-                        POST_REDUCE_SCALE,
-                    )
-                    scores = tl.where(slots[None, :] == slot, score[:, None], scores)
-            blocks = group_start + slots
+                qk = (
+                    tl.dot(q_e, tl.trans(k_e), out_dtype=tl.float32)
+                    + tl.dot(q_o, tl.trans(k_o), out_dtype=tl.float32)
+                ) * sm_scale_log2e
+            else:
+                k = tl.load(
+                    ik_cache_ptr
+                    + page * stride_ik_blk
+                    + off_k[None, :] * stride_ik_pos
+                    + off_d[:, None] * stride_ik_d,
+                )
+                if k.dtype.is_fp8():
+                    qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
+                else:
+                    qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
+            # apply causal mask as needed
+            if q_start < i + BLOCK_SIZE_K:
+                qk = tl.where(off_q[:, None] >= pos[None, :], qk, float("-inf"))
+            # one sparse block per K-tile -> max over the 128 positions
+            score = tl.max(qk, axis=1)  # [BLOCK_SIZE_Q]
             s_ptrs = (
                 score_ptr
                 + pid_h * stride_s_h
-                + q_row[:, None] * stride_s_n
-                + blocks[None, :] * stride_s_k
+                + (seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q))
+                * stride_s_n
+                + blk * stride_s_k
             )
-            tl.store(
-                s_ptrs,
-                scores,
-                mask=q_store_mask[:, None] & (blocks[None, :] < blk_hi),
-            )
+            q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+            tl.store(s_ptrs, score, mask=q_store_mask)
+    else:
+        q_row = seq_start + pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
+        q_store_mask = (pid_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)) < q_len
+        if STORE_GROUP == 1:
+            for blk in tl.range(blk_lo, blk_hi):
+                page = tl.load(bt_row + blk).to(tl.int64)
+                score = _index_block_score_page(
+                    q,
+                    ik_cache_ptr,
+                    page,
+                    blk,
+                    off_q,
+                    off_k,
+                    off_d,
+                    q_start,
+                    sm_scale_log2e,
+                    stride_ik_blk,
+                    stride_ik_pos,
+                    stride_ik_d,
+                    BLOCK_SIZE_K,
+                    POST_REDUCE_SCALE,
+                )
+                s_ptrs = (
+                    score_ptr + pid_h * stride_s_h + q_row * stride_s_n + blk * stride_s_k
+                )
+                tl.store(s_ptrs, score, mask=q_store_mask)
+        else:
+            tl.static_assert(STORE_GROUP == 4)
+            slots = tl.arange(0, STORE_GROUP)
+            num_groups = tl.cdiv(blk_hi - blk_lo, STORE_GROUP)
+            for group in tl.range(0, num_groups):
+                group_start = blk_lo + group * STORE_GROUP
+                if PREFETCH_PAGES:
+                    pages = (
+                        tl.load(bt_row + group_start).to(tl.int64),
+                        tl.load(
+                            bt_row + group_start + 1,
+                            mask=group_start + 1 < blk_hi,
+                            other=0,
+                        ).to(tl.int64),
+                        tl.load(
+                            bt_row + group_start + 2,
+                            mask=group_start + 2 < blk_hi,
+                            other=0,
+                        ).to(tl.int64),
+                        tl.load(
+                            bt_row + group_start + 3,
+                            mask=group_start + 3 < blk_hi,
+                            other=0,
+                        ).to(tl.int64),
+                    )
+                scores = tl.full((BLOCK_SIZE_Q, STORE_GROUP), float("-inf"), tl.float32)
+                for slot in tl.static_range(0, STORE_GROUP):
+                    blk = group_start + slot
+                    if blk < blk_hi:
+                        if PREFETCH_PAGES:
+                            page = pages[slot]
+                        else:
+                            page = tl.load(bt_row + blk).to(tl.int64)
+                        score = _index_block_score_page(
+                            q,
+                            ik_cache_ptr,
+                            page,
+                            blk,
+                            off_q,
+                            off_k,
+                            off_d,
+                            q_start,
+                            sm_scale_log2e,
+                            stride_ik_blk,
+                            stride_ik_pos,
+                            stride_ik_d,
+                            BLOCK_SIZE_K,
+                            POST_REDUCE_SCALE,
+                        )
+                        scores = tl.where(slots[None, :] == slot, score[:, None], scores)
+                blocks = group_start + slots
+                s_ptrs = (
+                    score_ptr
+                    + pid_h * stride_s_h
+                    + q_row[:, None] * stride_s_n
+                    + blocks[None, :] * stride_s_k
+                )
+                tl.store(
+                    s_ptrs,
+                    scores,
+                    mask=q_store_mask[:, None] & (blocks[None, :] < blk_hi),
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -746,7 +841,7 @@ def _score_chunk_blocks(max_block: int, q_tiles: int, batch: int, heads: int, de
 def _decode_score_chunks(batch: int, max_block: int) -> int:
     """Chunks one decode score row is split across.
 
-    A count, not a size: the grid is (request, chunk), so this IS the second
+    A count, not a size: the grid is (chunk, request), so this IS the first
     grid dim and it must stay shape-constant for a cuda graph to replay it.
     Enough chunks that a long context is not serialized inside a handful of
     CTAs. This shared legacy policy uses DECODE_SCORE_MIN_BLOCKS to amortize
@@ -809,8 +904,17 @@ def _require_packable(max_block: int) -> None:
         )
 
 
-def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
-    """Buffers for the fused page-16 emit, as (what to return, what to pass).
+def _alloc_emit(
+    total_q,
+    num_idx_heads,
+    topk,
+    block_table,
+    emit,
+    device,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
+):
+    """Buffers for the fused page-16 emit (``pages_per_block`` pages a block:
+    1 for the NVFP4 page-128 table), as (what to return, what to pass).
 
     One row per (query token, kv-head): the ASM/gluon path collapses kv-head
     into the row dim, so the rows are total_q * num_idx_heads and the page ids
@@ -827,7 +931,7 @@ def _alloc_emit(total_q, num_idx_heads, topk, block_table, emit, device):
         return None, (dummy, dummy, 0, 0)
     rows = total_q * num_idx_heads
     sparse_bt = torch.empty(
-        (rows, topk * PAGES_PER_SPARSE_BLOCK), dtype=torch.int32, device=device
+        (rows, topk * pages_per_block), dtype=torch.int32, device=device
     )
     sparse_ctx = torch.empty((rows,), dtype=torch.int32, device=device)
     args = (sparse_bt, sparse_ctx, block_table.stride(0), sparse_bt.stride(0))
@@ -997,6 +1101,7 @@ def _launch_parallel_prefill_selector(
     init_blocks,
     local_blocks,
     block_page_stride,
+    pages_per_block,
 ):
     """Select exact top-k, using sparse_bt as the partial-key workspace."""
     num_idx_heads, total_q, max_block = score.shape
@@ -1041,7 +1146,7 @@ def _launch_parallel_prefill_selector(
         SPARSE_BLOCK=SPARSE_BLOCK_SIZE,
         BLOCK_SIZE_T=block_size_t,
         MERGE_SIZE=triton.next_power_of_2(num_partial),
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         num_warps=1,
     )
@@ -1130,6 +1235,7 @@ def _launch_sparse_block_table_emit(
     rows_per_req,
     decode_max_q,
     block_page_stride,
+    pages_per_block,
 ):
     """Emit the sparse table after a selector that cannot fuse the write."""
     sbt, sctx, bt_stride0, sbt_stride0 = emit_args
@@ -1148,7 +1254,7 @@ def _launch_sparse_block_table_emit(
         SPARSE_BLOCK_SIZE,
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         # A cache may pack several planes into a physical block, making its
         # stride wider than the number of pages this logical block emits.
         block_page_stride=block_page_stride,
@@ -1177,6 +1283,7 @@ def _launch_select(
     emit,
     block_page_stride,
     n_valid_column_per_row=None,
+    pages_per_block=PAGES_PER_SPARSE_BLOCK,
 ):
     """The one selection pass, launched the same way by both phases.
 
@@ -1208,6 +1315,7 @@ def _launch_select(
                 num_idx_heads=num_idx_heads,
                 rows_per_req=rows_per_req,
                 decode_max_q=decode_max_q,
+                pages_per_block=pages_per_block,
                 block_page_stride=block_page_stride,
             )
         return
@@ -1232,6 +1340,7 @@ def _launch_select(
             init_blocks,
             local_blocks,
             block_page_stride,
+            pages_per_block,
         )
         return
 
@@ -1256,7 +1365,7 @@ def _launch_select(
         NUM_KV_HEADS=num_idx_heads,
         DECODE_MAX_Q=decode_max_q,
         BLOCK_SIZE_K=block_size_k,
-        pages_per_block=PAGES_PER_SPARSE_BLOCK,
+        pages_per_block=pages_per_block,
         block_page_stride=block_page_stride,
         EMIT_SPARSE_BT=emit,
         num_warps=num_warps,
@@ -1414,7 +1523,8 @@ def _topk_index_packed_kernel(
 @triton.jit
 def _decode_index_score_tiled_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
-    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
+    ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim] (FP4: payload [.., D/2])
+    iks_ptr,  # FP4 only: index-K scales [num_blocks, 128, D/16] (else unused)
     score_ptr,  # out: [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
     seq_lens,  # [batch]
@@ -1427,6 +1537,8 @@ def _decode_index_score_tiled_kernel(
     stride_ik_blk,
     stride_ik_pos,
     stride_ik_d,
+    stride_iks_blk,
+    stride_iks_pos,
     stride_s_h,
     stride_s_b,
     stride_s_k,
@@ -1436,9 +1548,13 @@ def _decode_index_score_tiled_kernel(
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    IS_FP4: tl.constexpr = False,
 ):
-    pid_b = tl.program_id(0)
-    pid_chunk = tl.program_id(1)
+    # Chunk on the fastest grid axis: workgroups go to the XCDs round-robin by
+    # linear id, so with the request there a batch of 8 put every chunk of a
+    # request on one XCD and the longest request set the time (2.3x at bs 8).
+    pid_chunk = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     seq_len = tl.load(seq_lens + pid_b)
     # The request's last query row is the one that sees the most blocks.
@@ -1466,6 +1582,19 @@ def _decode_index_score_tiled_kernel(
         mask=d_mask[:, None] & n_valid[None, :],
         other=0.0,
     )
+    if IS_FP4:
+        # [D/2, N] even / odd head dims as fp16 (see the prefill scorer).
+        h2 = tl.arange(0, BLOCK_SIZE_D // 2) * 2
+        q_base = q_ptr + row[None, :] * stride_q_n + head[None, :] * stride_q_h
+        q_e = tl.load(
+            q_base + h2[:, None] * stride_q_d, mask=n_valid[None, :], other=0.0
+        ).to(tl.float16)
+        q_o = tl.load(
+            q_base + (h2 + 1)[:, None] * stride_q_d, mask=n_valid[None, :], other=0.0
+        ).to(tl.float16)
+    else:
+        q_e = q
+        q_o = q
     # Row `tok` sits at absolute position seq_len - MAX_Q + tok, so its causal
     # cutoff is one past that. Every column has its own.
     causal_len = seq_len - MAX_Q + tok + 1
@@ -1474,18 +1603,33 @@ def _decode_index_score_tiled_kernel(
 
     for blk in tl.range(chunk_start, chunk_end):
         page = tl.load(bt_row + blk).to(tl.int64)
-        k = tl.load(
-            ik_cache_ptr
-            + page * stride_ik_blk
-            + off_k[:, None] * stride_ik_pos
-            + off_d[None, :] * stride_ik_d,
-            mask=d_mask[None, :],
-            other=0.0,
-        )
-        # Keep the query at its own precision and lift the key to meet it, the
-        # way the gemv path did -- prefill instead rounds the query down to the
-        # cache dtype, and the two phases are meant to keep scoring differently.
-        qk = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * sm_scale_log2e
+        if IS_FP4:
+            # FP4 is gated on head_dim == BLOCK_SIZE_D == 128 (no d mask needed).
+            k_e, k_o = nvfp4_load_even_odd(
+                ik_cache_ptr,
+                iks_ptr,
+                page * stride_ik_blk + off_k * stride_ik_pos,
+                page * stride_iks_blk + off_k * stride_iks_pos,
+                off_k >= 0,
+                BLOCK_SIZE_D,
+            )
+            qk = (
+                tl.dot(k_e, q_e, out_dtype=tl.float32)
+                + tl.dot(k_o, q_o, out_dtype=tl.float32)
+            ) * sm_scale_log2e
+        else:
+            k = tl.load(
+                ik_cache_ptr
+                + page * stride_ik_blk
+                + off_k[:, None] * stride_ik_pos
+                + off_d[None, :] * stride_ik_d,
+                mask=d_mask[None, :],
+                other=0.0,
+            )
+            # Keep the query at its own precision and lift the key to meet it,
+            # the way the gemv path did -- prefill instead rounds the query down
+            # to the cache dtype, and the two phases keep scoring differently.
+            qk = tl.dot(k.to(q.dtype), q, out_dtype=tl.float32) * sm_scale_log2e
         pos = blk * BLOCK_SIZE_K + off_k
         qk = tl.where(pos[:, None] < causal_len[None, :], qk, float("-inf"))
         score = tl.max(qk, axis=0)
@@ -1510,6 +1654,7 @@ def _decode_index_score_tiled_kernel(
 def _decode_index_score_transposed_kernel(
     q_ptr,
     ik_cache_ptr,
+    iks_ptr,  # unused: transposed path is selected only for non-FP4 caches
     score_ptr,
     block_table_ptr,
     seq_lens,
@@ -1522,6 +1667,8 @@ def _decode_index_score_transposed_kernel(
     stride_ik_blk,
     stride_ik_pos,
     stride_ik_d,
+    stride_iks_blk,  # unused; keeps the tiled/transposed launch ABI aligned
+    stride_iks_pos,  # unused; keeps the tiled/transposed launch ABI aligned
     stride_s_h,
     stride_s_b,
     stride_s_k,
@@ -1531,9 +1678,11 @@ def _decode_index_score_transposed_kernel(
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
+    IS_FP4: tl.constexpr = False,  # always false for this kernel
 ):
-    pid_b = tl.program_id(0)
-    pid_chunk = tl.program_id(1)
+    # Match the tiled path: spread chunks across XCDs on the fastest axis.
+    pid_chunk = tl.program_id(0)
+    pid_b = tl.program_id(1)
 
     seq_len = tl.load(seq_lens + pid_b)
     num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
@@ -1608,8 +1757,14 @@ def minimax_m3_index_topk(
     emit_sparse_block_table: bool = False,
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_kv_scale: torch.Tensor | None = None,
+    emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Index block-score + top-k selection. block_size_q == 1 (per-token).
+
+    With ``index_kv_scale`` (``--index-cache-dtype fp4``) ``index_kv_cache`` is the
+    FP4 payload ``[num_blocks, 128, head_dim // 2]`` uint8 and ``index_kv_scale``
+    its E4M3 block scales ``[num_blocks, 128, head_dim // 16]`` (see index_fp4).
 
     Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
     (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
@@ -1633,6 +1788,11 @@ def minimax_m3_index_topk(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+    ``emit_pages_per_block`` (with ``block_page_stride``) =
+    ``NVFP4_PAGES_PER_BLOCK`` emits the NVFP4 pool's page-128 table
+    ``[total_q * num_kv_heads, topk]`` instead, the one
+    ``sparse_attn_nvfp4.nvfp4_page_table`` builds. Rows past
+    ``cu_seqlens_q[-1]`` are not written, as for the page-16 table.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -1676,9 +1836,12 @@ def minimax_m3_index_topk(
     )
     score_num_warps = score_config.num_warps or score_num_warps
     score_num_stages = score_config.num_stages or score_num_stages
+    is_fp4 = index_kv_scale is not None
+    iks = index_kv_scale if is_fp4 else index_kv_cache
     _index_block_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
+        iks,
         score,
         block_table,
         cu_seqlens_q,
@@ -1694,6 +1857,8 @@ def minimax_m3_index_topk(
         index_kv_cache.stride(0),
         index_kv_cache.stride(1),
         index_kv_cache.stride(2),
+        iks.stride(0),
+        iks.stride(1),
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -1703,6 +1868,7 @@ def minimax_m3_index_topk(
         STORE_GROUP=score_config.store_group,
         PREFETCH_PAGES=score_config.prefetch_pages,
         POST_REDUCE_SCALE=score_config.post_reduce_scale,
+        IS_FP4=is_fp4,
         num_warps=score_num_warps,
         num_stages=score_num_stages,
     )
@@ -1711,7 +1877,13 @@ def minimax_m3_index_topk(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
     )
     emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        emit_pages_per_block,
     )
     _launch_select(
         score,
@@ -1732,6 +1904,7 @@ def minimax_m3_index_topk(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=emit_pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
 
@@ -1752,8 +1925,12 @@ def minimax_m3_index_topk_decode(
     max_query_len: int = 1,  # query tokens per request (num_spec+1); 1 == plain decode
     block_page_stride: int = PAGES_PER_SPARSE_BLOCK,
     n_valid_column_per_row: torch.Tensor | None = None,
+    index_kv_scale: torch.Tensor | None = None,
+    emit_pages_per_block: int = PAGES_PER_SPARSE_BLOCK,
 ):
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
+
+    ``index_kv_scale``: FP4 index cache, as in :func:`minimax_m3_index_topk`.
 
     Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     For spec-decode (``max_query_len = num_spec+1``) each of the ``max_query_len``
@@ -1778,6 +1955,8 @@ def minimax_m3_index_topk_decode(
     selector eligible -- the row width decides whether it is actually cheaper
     (`_aiter_selector_wins`); omitted, the Triton one runs, which derives the
     same bound in registers.
+    ``emit_pages_per_block``: as in :func:`minimax_m3_index_topk`; rows past
+    ``len(seq_lens) * max_query_len`` are not written.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -1798,7 +1977,13 @@ def minimax_m3_index_topk_decode(
         (num_idx_heads, total_q, topk), dtype=torch.int32, device=idx_q.device
     )
     emit_out, emit_args = _alloc_emit(
-        total_q, num_idx_heads, topk, block_table, emit_sparse_block_table, idx_q.device
+        total_q,
+        num_idx_heads,
+        topk,
+        block_table,
+        emit_sparse_block_table,
+        idx_q.device,
+        emit_pages_per_block,
     )
 
     score = torch.empty(
@@ -1806,16 +1991,27 @@ def minimax_m3_index_topk_decode(
         dtype=torch.float32,
         device=idx_q.device,
     )
-    num_score_chunks = _native_decode_score_chunks(batch, max_block)
+    is_fp4 = index_kv_scale is not None
+    iks = index_kv_scale if is_fp4 else index_kv_cache
+    num_score_chunks = (
+        _decode_score_chunks(batch, max_block)
+        if is_fp4
+        else _native_decode_score_chunks(batch, max_block)
+    )
     arch = get_gfx_runtime()
     score_kernel = (
-        _decode_index_score_transposed_kernel
-        if use_transposed_decode_score(arch, batch, max_block, max_query_len)
-        else _decode_index_score_tiled_kernel
+        _decode_index_score_tiled_kernel
+        if is_fp4
+        else (
+            _decode_index_score_transposed_kernel
+            if use_transposed_decode_score(arch, batch, max_block, max_query_len)
+            else _decode_index_score_tiled_kernel
+        )
     )
-    score_kernel[(batch, num_score_chunks)](
+    score_kernel[(num_score_chunks, batch)](
         idx_q,
         index_kv_cache,
+        iks,
         score,
         block_table,
         seq_lens,
@@ -1828,6 +2024,8 @@ def minimax_m3_index_topk_decode(
         index_kv_cache.stride(0),
         index_kv_cache.stride(1),
         index_kv_cache.stride(2),
+        iks.stride(0),
+        iks.stride(1),
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -1835,8 +2033,12 @@ def minimax_m3_index_topk_decode(
         NUM_IDX_HEADS=num_idx_heads,
         MAX_Q=max_query_len,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
+        IS_FP4=is_fp4,
         num_warps=decode_score_num_warps(arch, batch, max_block, max_query_len),
-        num_stages=DECODE_SCORE_NUM_STAGES,
+        # The FP4 decode spills heavily at the default stage count on gfx1250.
+        num_stages=(
+            1 if is_fp4 and get_gfx() == "gfx1250" else DECODE_SCORE_NUM_STAGES
+        ),
     )
 
     _launch_select(
@@ -1858,5 +2060,6 @@ def minimax_m3_index_topk_decode(
         emit=emit_sparse_block_table,
         block_page_stride=block_page_stride,
         n_valid_column_per_row=n_valid_column_per_row,
+        pages_per_block=emit_pages_per_block,
     )
     return (topk_idx, *emit_out) if emit_out else topk_idx
