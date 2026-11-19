@@ -1668,7 +1668,9 @@ def mailbox_poll_many_device(items, expected_tag, lead=False):
         return result
 
     if const_expr(lead):
-        if fx.thread_idx.x < 32:
+        # a scalar branch: a divergent one saves exec in SGPRs the K1 lacks
+        wave = rocdl.readfirstlane(T.i32, as_ir_value(fx.Int32(fx.thread_idx.x // 32)))
+        if fx.Int32(wave) == fx.Int32(0):
             pairs = [mailbox_load_device(pointer, index) for pointer, index in items]
             while stale(pairs):
                 energy.wait_pause()
