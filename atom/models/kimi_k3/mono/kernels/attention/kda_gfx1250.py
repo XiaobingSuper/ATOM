@@ -743,7 +743,7 @@ def kda_recur_head_chunk(c, k, request, head):
             output = output + p[(t, j)] * values[j]
         outputs.append(live.select(_bf16_round(output), fx.Float32(0.0)))
     if const_expr(replayed):
-        _chunk_u_stores(c, k, values, my_row, live, row0, rows)
+        _chunk_u_stores(c, k, values, live, row0, rows)
     else:
         for t in range_constexpr(L):
             row_values = lane_all_gather(
@@ -808,18 +808,19 @@ def _span_dot(a, b, span):
 
 
 @traced
-def _chunk_u_stores(c, k, values, row, live, row0, rows):
-    """The tokens' u records (bf16, ``replay_u_store``'s), a row's from one of
-    its lanes, the outputs' lanes: one guarded block for every token."""
-    if live & (c["lane"] % (GFX1250.wave_size // rows) == 0):
-        destination = rsrc(k["rec"]["u"])
-        at = k["replay"]["rbase"] * HEAD_DIM + row0 + row
-        for token in range_constexpr(len(values)):
-            bo.buffer_store(
-                fx.Float32(values[token]).to(fx.BFloat16),
-                destination,
-                at + token * HEAD_DIM,
-            )
+def _chunk_u_stores(c, k, values, live, row0, rows):
+    """The tokens' u records as ``replay_u_store`` lays them out: token t's
+    rows gathered to lane t, whose one vector store (16 B at eight rows)
+    writes them, not a 2 B store a row; one guarded block for every token."""
+    lane = c["lane"]
+    mine = [fx.Float32(0.0)] * rows
+    for token in range_constexpr(len(values)):
+        gathered = lane_all_gather(
+            values[token], rows, LANE_OFFSETS, lane, architecture=GFX1250
+        )
+        mine = [(lane == token).select(g, m) for g, m in zip(gathered, mine)]
+    if live & (lane < len(values)):
+        replay_u_store(c, k, lane, mine, row0)
 
 
 @traced
