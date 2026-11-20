@@ -322,9 +322,9 @@ class MiniMaxM3MLP(nn.Module):
         reduces_partials = getattr(
             self.gate_up_proj, "splitk_consumer_max_m", 0
         ) > 0 and (_linear_consumes_per_token_fp8(self.gate_up_proj))
-        if self.swiglu_quant_supported and _linear_consumes_per_token_fp8(
-            self.down_proj
-        ):
+        if getattr(
+            self, "swiglu_quant_supported", False
+        ) and _linear_consumes_per_token_fp8(self.down_proj):
             swiglu_quant = (
                 swiglu_oai_split_reducing_quant
                 if reduces_partials
