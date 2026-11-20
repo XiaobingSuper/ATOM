@@ -42,8 +42,7 @@ _ATOM_ENV_VARS = [
     "ATOM_LOG_MORE",
     "ATOM_DISABLE_MMAP",
     "ATOM_ONLINE_QUANT_STREAMING",
-    "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8",
-    "ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8",
+    "ATOM_MINIMAX_M3_SWIGLU_MXFP8",
     "ATOM_DISABLE_VLLM_PLUGIN",
     "ATOM_USE_CUSTOM_ALL_GATHER",
     "ATOM_ENABLE_RELAXED_MTP",
@@ -148,11 +147,8 @@ class TestEnvsDefaults:
     def test_online_quant_streaming_default_disabled(self):
         assert _get_envs().ATOM_ONLINE_QUANT_STREAMING is False
 
-    def test_minimax_m3_shared_swiglu_mxfp8_default_disabled(self):
-        assert _get_envs().ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8 is False
-
-    def test_minimax_m3_dense_swiglu_mxfp8_default_disabled(self):
-        assert _get_envs().ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8 is False
+    def test_minimax_m3_swiglu_mxfp8_default_disabled(self):
+        assert _get_envs().ATOM_MINIMAX_M3_SWIGLU_MXFP8 is False
 
     def test_disable_vllm_plugin_default(self):
         assert _get_envs().ATOM_DISABLE_VLLM_PLUGIN is False
@@ -304,18 +300,9 @@ class TestEnvsOverrides:
     @pytest.mark.parametrize(
         "value,expected", [("1", True), ("true", True), ("0", False)]
     )
-    def test_minimax_m3_shared_swiglu_mxfp8_override(
-        self, monkeypatch, value, expected
-    ):
-        monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", value)
-        assert _get_envs().ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8 is expected
-
-    @pytest.mark.parametrize(
-        "value,expected", [("1", True), ("true", True), ("0", False)]
-    )
-    def test_minimax_m3_dense_swiglu_mxfp8_override(self, monkeypatch, value, expected):
-        monkeypatch.setenv("ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8", value)
-        assert _get_envs().ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8 is expected
+    def test_minimax_m3_swiglu_mxfp8_override(self, monkeypatch, value, expected):
+        monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", value)
+        assert _get_envs().ATOM_MINIMAX_M3_SWIGLU_MXFP8 is expected
 
     def test_disable_vllm_plugin_enabled(self, monkeypatch):
         monkeypatch.setenv("ATOM_DISABLE_VLLM_PLUGIN", "1")
@@ -404,9 +391,9 @@ def test_minimax_m3_gluon_ar_mxfp8_is_documented():
     assert "**ATOM_MINIMAX_M3_GLUON_AR_MXFP8**" in doc
 
 
-def test_minimax_m3_dense_swiglu_mxfp8_is_documented():
+def test_minimax_m3_swiglu_mxfp8_is_documented():
     doc = (Path(__file__).parents[1] / "docs" / "environment_variables.md").read_text()
-    assert "**ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8**" in doc
+    assert "**ATOM_MINIMAX_M3_SWIGLU_MXFP8**" in doc
 
 
 @pytest.mark.parametrize(

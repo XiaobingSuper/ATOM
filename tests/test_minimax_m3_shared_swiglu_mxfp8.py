@@ -80,7 +80,6 @@ def _record_swiglu(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def _mlp(
     *,
     enabled: bool,
-    dense_enabled: bool = False,
     native_group_rows: int | None = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
@@ -89,8 +88,7 @@ def _mlp(
         swiglu_alpha=1.702,
         swiglu_beta=1.0,
         swiglu_limit=7.0,
-        fuse_shared_swiglu_mxfp8=enabled,
-        fuse_dense_swiglu_mxfp8=dense_enabled,
+        fuse_swiglu_mxfp8=enabled,
     )
 
 
@@ -119,19 +117,6 @@ def test_shared_fusion_requires_opt_in_and_eligible_input(
     assert calls == [expected]
     _, scale = mlp.down_proj.calls[0]
     assert (scale is not None) is (expected == "fused")
-
-
-def test_dense_fusion_uses_the_same_native_mxfp8_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls = _record_swiglu(monkeypatch)
-    monkeypatch.setattr(m3_model, "swiglu_oai_mxfp8_supported", lambda _: True)
-    mlp = _mlp(enabled=False, dense_enabled=True)
-
-    MiniMaxM3MLP.forward(mlp, torch.randn(3, 64))
-
-    assert calls == ["fused"]
-    assert mlp.down_proj.calls[0][1] is not None
 
 
 def test_ineligible_down_projection_keeps_existing_path(
@@ -164,12 +149,12 @@ def test_native_down_projection_contract_is_conservative() -> None:
 
 
 @pytest.mark.parametrize(("value", "enabled"), [("0", False), ("1", True)])
-def test_only_shared_expert_construction_reads_fusion_flag(
+def test_shared_expert_construction_reads_common_fusion_flag(
     monkeypatch: pytest.MonkeyPatch,
     value: str,
     enabled: bool,
 ) -> None:
-    monkeypatch.setenv("ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8", value)
+    monkeypatch.setenv("ATOM_MINIMAX_M3_SWIGLU_MXFP8", value)
     monkeypatch.setattr(m3_model, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(m3_model, "ReplicatedLinear", lambda *args, **kwargs: object())
     monkeypatch.setattr(
@@ -197,4 +182,4 @@ def test_only_shared_expert_construction_reads_fusion_flag(
 
     m3_model.MiniMaxM3MoE(config, layer_id=0)
 
-    assert mlp_calls[0]["fuse_shared_swiglu_mxfp8"] is enabled
+    assert mlp_calls[0]["fuse_swiglu_mxfp8"] is enabled
