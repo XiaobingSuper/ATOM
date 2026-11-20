@@ -262,6 +262,7 @@ class MiniMaxM3MLP(nn.Module):
         prefix: str = "",
         hidden_act: str | None = None,
         fuse_shared_swiglu_mxfp8: bool = False,
+        fuse_dense_swiglu_mxfp8: bool = False,
     ) -> None:
         super().__init__()
         # An MXFP4 down_proj cannot take an unaligned K (its per-rank
@@ -305,13 +306,19 @@ class MiniMaxM3MLP(nn.Module):
         self.fuse_shared_swiglu_mxfp8 = (
             fuse_shared_swiglu_mxfp8 and swiglu_oai_mxfp8_arch_supported()
         )
+        self.fuse_dense_swiglu_mxfp8 = (
+            fuse_dense_swiglu_mxfp8 and swiglu_oai_mxfp8_arch_supported()
+        )
 
     def forward(
         self, x: torch.Tensor, x_scale: torch.Tensor | None = None
     ) -> torch.Tensor:
         gate_up = self.gate_up_proj(x, x_scale=x_scale)
         if (
-            self.fuse_shared_swiglu_mxfp8
+            (
+                getattr(self, "fuse_shared_swiglu_mxfp8", False)
+                or getattr(self, "fuse_dense_swiglu_mxfp8", False)
+            )
             and _linear_consumes_native_mxfp8(self.down_proj)
             and swiglu_oai_mxfp8_supported(gate_up)
         ):
@@ -759,6 +766,7 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.mlp",
+                fuse_dense_swiglu_mxfp8=(envs.ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8),
             )
 
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

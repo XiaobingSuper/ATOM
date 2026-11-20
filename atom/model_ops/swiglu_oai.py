@@ -351,7 +351,7 @@ def swiglu_oai_split_mxfp8(
     scales = torch.empty(
         (rows, groups), dtype=torch.float8_e8m0fnu, device=gate_up.device
     )
-    block_groups = 16
+    block_groups = 32 if groups >= 96 else 16
     _swiglu_oai_mxfp8_kernel[(rows, triton.cdiv(groups, block_groups))](
         gate_up,
         out,

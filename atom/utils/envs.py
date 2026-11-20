@@ -1076,6 +1076,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8": lambda: _flag_env(
         "ATOM_MINIMAX_M3_SHARED_SWIGLU_MXFP8"
     ),
+    # Fuse MiniMax-M3 dense-MLP SwiGLU-OAI with the native group32 MXFP8
+    # activation quant consumed by its down projection.
+    "ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_DENSE_SWIGLU_MXFP8"
+    ),
     # Gate/Up interleave mode for MoE weight preshuffle and kernel gate_mode.
     # "0" (default) = SEPARATED layout; "1" = INTERLEAVE layout.
     "ATOM_MOE_GU_ITLV": lambda: os.getenv("ATOM_MOE_GU_ITLV", "0") == "1",

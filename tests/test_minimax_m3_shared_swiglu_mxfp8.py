@@ -77,7 +77,12 @@ def _record_swiglu(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return calls
 
 
-def _mlp(*, enabled: bool, native_group_rows: int | None = 1) -> SimpleNamespace:
+def _mlp(
+    *,
+    enabled: bool,
+    dense_enabled: bool = False,
+    native_group_rows: int | None = 1,
+) -> SimpleNamespace:
     return SimpleNamespace(
         gate_up_proj=_GateUp(),
         down_proj=_DownProj(native_group_rows=native_group_rows),
@@ -85,6 +90,7 @@ def _mlp(*, enabled: bool, native_group_rows: int | None = 1) -> SimpleNamespace
         swiglu_beta=1.0,
         swiglu_limit=7.0,
         fuse_shared_swiglu_mxfp8=enabled,
+        fuse_dense_swiglu_mxfp8=dense_enabled,
     )
 
 
@@ -113,6 +119,19 @@ def test_shared_fusion_requires_opt_in_and_eligible_input(
     assert calls == [expected]
     _, scale = mlp.down_proj.calls[0]
     assert (scale is not None) is (expected == "fused")
+
+
+def test_dense_fusion_uses_the_same_native_mxfp8_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _record_swiglu(monkeypatch)
+    monkeypatch.setattr(m3_model, "swiglu_oai_mxfp8_supported", lambda _: True)
+    mlp = _mlp(enabled=False, dense_enabled=True)
+
+    MiniMaxM3MLP.forward(mlp, torch.randn(3, 64))
+
+    assert calls == ["fused"]
+    assert mlp.down_proj.calls[0][1] is not None
 
 
 def test_ineligible_down_projection_keeps_existing_path(
