@@ -2,6 +2,7 @@
 # Tests for atom/utils/envs.py — lazy env var evaluation
 
 import logging
+from pathlib import Path
 
 import pytest
 
