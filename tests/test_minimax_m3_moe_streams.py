@@ -108,6 +108,8 @@ def _glue_moe(log, epilogue, routed, scale=2.0):
     moe._routed_plus_shared = lambda h, s, before_add=None: (
         m3_model.MiniMaxM3MoE._routed_plus_shared(moe, h, s, before_add)
     )
+    moe._front_fusion = False
+    moe._route_and_experts = lambda h: m3_model.MiniMaxM3MoE._route_and_experts(moe, h)
     moe.gate = MagicMock(side_effect=lambda _: (log.append("gate"), "logits")[1])
     moe.experts = MagicMock(side_effect=lambda **_: (log.append("experts"), routed)[1])
     return moe
@@ -390,6 +392,8 @@ def _fold_moe(log: list[str], fold: _Fold, monkeypatch: pytest.MonkeyPatch):
     moe._shared_fold_forward = lambda h: m3_model.MiniMaxM3MoE._shared_fold_forward(
         moe, h
     )
+    moe._front_fusion = False
+    moe._route_and_experts = lambda h: m3_model.MiniMaxM3MoE._route_and_experts(moe, h)
     hidden = MagicMock()
     hidden.shape = (8, 64)
     hidden.view.return_value = hidden
@@ -427,3 +431,30 @@ def test_declined_shared_fold_adds_the_shared_mlp_then_skips_the_fold(
     m3_model.MiniMaxM3MoE.dual_stream_moe_forward(moe, hidden)
     assert len(fold.calls) == 1
     moe.single_stream_moe_forward.assert_called_once_with(hidden)
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_front_fusion_routes_through_the_fused_router(fused: bool) -> None:
+    """ATOM_MINIMAX_M3_MOE_FRONT_FUSION: the routed branch hands the gate's
+    weight to the experts' fused router instead of running the gate GEMM."""
+    log: list[str] = []
+    routed = MagicMock()
+    moe = SimpleNamespace(
+        _front_fusion=fused,
+        fuse_shared_experts=False,
+        routed_scaling_factor=1.0,
+    )
+    moe._routed_scale = lambda: m3_model.MiniMaxM3MoE._routed_scale(moe)
+    moe._scale_routed = lambda r: m3_model.MiniMaxM3MoE._scale_routed(moe, r)
+    moe._route_and_experts = lambda h: m3_model.MiniMaxM3MoE._route_and_experts(moe, h)
+    moe.gate = MagicMock(side_effect=lambda _: (log.append("gate"), "logits")[1])
+    moe.gate.weight = "gate_weight"
+    moe.experts = MagicMock(side_effect=lambda **_: (log.append("experts"), routed)[1])
+    moe.experts.forward_fused_router = MagicMock(
+        side_effect=lambda h, w: (log.append(f"fused {w}"), routed)[1]
+    )
+
+    actual = m3_model.MiniMaxM3MoE.routed_expert_forward(moe, "hidden")
+
+    assert actual is routed
+    assert log == (["fused gate_weight"] if fused else ["gate", "experts"])

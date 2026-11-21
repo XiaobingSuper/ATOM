@@ -710,6 +710,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tiles GEMM2, its output is added in the gather-reduce. Not bitwise the
     # separate shared MLP. Default off for A/B.
     "ATOM_MINIMAX_M3_SHARED_FOLD": lambda: _flag_env("ATOM_MINIMAX_M3_SHARED_FOLD"),
+    # MiniMax-M3: the router GEMM and the biased sigmoid top-k run as one
+    # aiter launch (gfx1250 FlyDSL `flydsl_moe_router_topk`) in place of the
+    # gate GEMM + topk_gating pair; bitwise the same routing. Row counts whose
+    # tuned router GEMM is not the FlyDSL kernel keep the pair. Default off.
+    "ATOM_MINIMAX_M3_MOE_FRONT_FUSION": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_FRONT_FUSION"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
