@@ -691,6 +691,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # until ROCm/aiter#7967), any other keeps ATOM's mono path; "1": on, or an
     # error naming why not; "0": off.
     "ATOM_DSV41_MONO_HI": lambda: os.getenv("ATOM_DSV41_MONO_HI", "auto"),
+    # MiniMax-M3, prefill sizes (an all-reduce input of at least aiter's ar2s floor, 32 MiB): keep the
+    # residual stream sequence-parallel -- each TP rank holds only the rows it owns in aiter's two-shot
+    # AR + RMSNorm -- so the owner normalizes (and MXFP8-quantizes) its rows and the all-gather carries
+    # the normed output, not the bf16 sum. Normed outputs are bit-identical; below the floor nothing
+    # changes. Needs an aiter with tensor_model_parallel_sp_fused_allreduce_rmsnorm*.
+    "ATOM_M3_PREFILL_SP_AR": lambda: _flag_env("ATOM_M3_PREFILL_SP_AR"),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
