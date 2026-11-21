@@ -697,6 +697,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_MINIMAX_M3_MOE_QUANT_SHARED": lambda: _flag_env(
         "ATOM_MINIMAX_M3_MOE_QUANT_SHARED"
     ),
+    # MiniMax-M3: fold the routed scale and the shared expert's add into the
+    # routed MoE's gather-reduce (aiter `moe_output_epilogue`), one launch in
+    # place of gather-reduce + mul + add. Bitwise the same output; eager paths
+    # (the dual-stream op) only. Default off for A/B.
+    "ATOM_MINIMAX_M3_MOE_GLUE_FUSION": lambda: _flag_env(
+        "ATOM_MINIMAX_M3_MOE_GLUE_FUSION"
+    ),
     # Token-bucket TR graphs for prefill (`atom/utils/region_graph.py`): the
     # comma-separated token counts to record. A prefill longer than the largest
     # runs eagerly; empty records none. The default tops out at 3072 because
